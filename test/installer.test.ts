@@ -7,6 +7,7 @@ import { after, before, describe, it } from "node:test";
 
 const INSTALL_SCRIPT = path.resolve(process.cwd(), "scripts", "install.mjs");
 const INSTALL_SH = path.resolve(process.cwd(), "install.sh");
+const INSTALL_PS1 = path.resolve(process.cwd(), "install.ps1");
 
 describe("installer", () => {
   let fakeHome: string;
@@ -155,5 +156,17 @@ describe("installer", () => {
         { env, stdio: "pipe" },
       );
     });
+  });
+
+  it("keeps install.ps1 safe for Windows PowerShell 5.1 irm | iex and single-arg splatting", async () => {
+    const ps1 = await fs.readFile(INSTALL_PS1, "utf8");
+    // Pure ASCII avoids Windows PowerShell 5.1 non-BOM UTF-8/CP936 misparsing
+    assert.ok(/^[\x00-\x7f]*$/.test(ps1), "install.ps1 must stay pure ASCII");
+    // Never splat a potentially unwrapped 1-element $forwardArgs directly after $installer
+    assert.doesNotMatch(ps1, /& node\s+\$\w+\s+@forwardArgs/);
+    assert.doesNotMatch(ps1, /& node\s+\(Join-Path[^)]+\)\s+@forwardArgs/);
+    // Must guard exit so `irm ... | iex` does not close the user's interactive terminal
+    assert.match(ps1, /if \(\$__agyFastWasFile\)\s*\{[\s\S]*exit \$__agyFastFinalExit/);
+    assert.match(ps1, /System\.Collections\.Generic\.List\[string\]/);
   });
 });

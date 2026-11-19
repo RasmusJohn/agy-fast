@@ -30,7 +30,10 @@ const OPTIONAL_DOC_FILES = [
 ];
 
 function getGlobalPluginDir() {
-  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  const home =
+    process.platform === "win32"
+      ? process.env.USERPROFILE || process.env.HOME || os.homedir()
+      : process.env.HOME || process.env.USERPROFILE || os.homedir();
   return path.join(home, ".gemini", "config", "plugins", PLUGIN_NAME);
 }
 
@@ -134,11 +137,43 @@ function checkNodeVersion() {
   return process.versions.node;
 }
 
+function spawnCliSync(bin, args, opts = {}) {
+  const baseOpts = { windowsHide: true, ...opts };
+  const direct = spawnSync(bin, args, baseOpts);
+  if (process.platform !== "win32" || direct.error?.code !== "ENOENT") {
+    return direct;
+  }
+  const whereRes = spawnSync("where.exe", [bin], {
+    encoding: "utf8",
+    timeout: 2000,
+    windowsHide: true,
+  });
+  if (whereRes.error || whereRes.status !== 0) {
+    return direct;
+  }
+  const candidates = (whereRes.stdout || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const resolved = candidates.find((p) => /\.(exe|cmd|bat)$/i.test(p));
+  if (!resolved) {
+    return direct;
+  }
+  if (/\.exe$/i.test(resolved)) {
+    return spawnSync(resolved, args, baseOpts);
+  }
+  const quoteWin = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  const cmdLine = [quoteWin(resolved), ...args.map(quoteWin)].join(" ");
+  return spawnSync("cmd.exe", ["/d", "/s", "/c", `"${cmdLine}"`], {
+    ...baseOpts,
+    windowsVerbatimArguments: true,
+  });
+}
+
 function hasCommand(bin, args = ["--version"]) {
-  const res = spawnSync(bin, args, {
+  const res = spawnCliSync(bin, args, {
     stdio: "ignore",
     timeout: 3000,
-    windowsHide: true,
   });
   return !res.error && res.status === 0;
 }
@@ -342,10 +377,9 @@ async function runDoctor(targetDir, quiet = false) {
   report.hookBytes = hookCheck.bytes;
 
   if (hasAgy) {
-    const valRes = spawnSync("agy", ["plugin", "validate", "--strict", targetDir], {
+    const valRes = spawnCliSync("agy", ["plugin", "validate", "--strict", targetDir], {
       encoding: "utf8",
       timeout: 10_000,
-      windowsHide: true,
     });
     report.agyValidated = !valRes.error && valRes.status === 0;
   }
@@ -393,7 +427,7 @@ async function runInstall(opts) {
   } else if (opts.useLink) {
     await fs.mkdir(path.dirname(resolvedDst), { recursive: true });
     if (await pathExists(resolvedDst)) {
-      await fs.rm(resolvedDst, { recursive: true, force: true });
+      await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
     const linkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(resolvedSrc, resolvedDst, linkType);
@@ -403,7 +437,7 @@ async function runInstall(opts) {
   } else {
     // Preserve clean target directory when re-installing / upgrading
     if (await pathExists(resolvedDst)) {
-      await fs.rm(resolvedDst, { recursive: true, force: true });
+      await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
     await copyRuntimeFiles(resolvedSrc, resolvedDst);
     if (!opts.quiet) {
@@ -414,10 +448,9 @@ async function runInstall(opts) {
   const hasAgy = hasCommand("agy", ["--version"]);
   const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
   if (hasAgy && !opts.skipEnable && isGlobalTarget) {
-    const enableRes = spawnSync("agy", ["plugin", "enable", PLUGIN_NAME], {
+    const enableRes = spawnCliSync("agy", ["plugin", "enable", PLUGIN_NAME], {
       encoding: "utf8",
       timeout: 10_000,
-      windowsHide: true,
     });
     if (!opts.quiet) {
       if (!enableRes.error && enableRes.status === 0) {
@@ -463,14 +496,13 @@ async function runUninstall(opts) {
 
   const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
   if (hasCommand("agy", ["--version"]) && !opts.skipEnable && isGlobalTarget) {
-    spawnSync("agy", ["plugin", "disable", PLUGIN_NAME], {
+    spawnCliSync("agy", ["plugin", "disable", PLUGIN_NAME], {
       stdio: "ignore",
       timeout: 10_000,
-      windowsHide: true,
     });
   }
 
-  await fs.rm(resolvedDst, { recursive: true, force: true });
+  await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   if (!opts.quiet) {
     console.log(`Removed agy-fast from ${resolvedDst}`);
   }
