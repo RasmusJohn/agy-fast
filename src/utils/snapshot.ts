@@ -106,6 +106,35 @@ async function getGitSummary(
   return parts.join("\n");
 }
 
+const SNAPSHOT_COLLAPSE_DIRS = new Set([
+  "tmp",
+  "temp",
+  "output",
+  "outputs",
+  "artifacts",
+  "ssl",
+  "SSL",
+  "playwright-report",
+  "coverage",
+  "logs",
+]);
+
+const MANIFEST_SKIP_SUBDIRS = new Set([
+  "docs",
+  "doc",
+  "assets",
+  "scripts",
+  "test",
+  "tests",
+  "fixtures",
+  "examples",
+  ...SNAPSHOT_COLLAPSE_DIRS,
+]);
+
+function shortEntryName(name: string, maxLen = 28): string {
+  return name.length > maxLen ? `${name.slice(0, maxLen - 3)}...` : name;
+}
+
 async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
   let topEntries;
   try {
@@ -117,11 +146,17 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
   const filteredTop = topEntries
     .filter((e) => {
       if (e.name === ".DS_Store") return false;
-      if (e.isDirectory() && DEFAULT_IGNORE_DIRS.has(e.name)) return false;
+      if (e.isDirectory()) {
+        if (e.name.startsWith(".")) return false;
+        if (DEFAULT_IGNORE_DIRS.has(e.name)) return false;
+      }
       return true;
     })
     .sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      const aCollapse = a.isDirectory() && SNAPSHOT_COLLAPSE_DIRS.has(a.name);
+      const bCollapse = b.isDirectory() && SNAPSHOT_COLLAPSE_DIRS.has(b.name);
+      if (aCollapse !== bCollapse) return aCollapse ? 1 : -1;
       return a.name.localeCompare(b.name);
     });
 
@@ -134,7 +169,13 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
   const subResults = await Promise.all(
     shownTop.map(async (entry) => {
       if (!entry.isDirectory()) {
-        return { name: entry.name, isDir: false, children: [] as string[], more: 0 };
+        return {
+          name: shortEntryName(entry.name),
+          isDir: false,
+          collapsedCount: null as number | null,
+          children: [] as string[],
+          more: 0,
+        };
       }
       try {
         const sub = await fs.readdir(path.join(workspaceDir, entry.name), {
@@ -144,30 +185,51 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
           .filter(
             (s) =>
               s.name !== ".DS_Store" &&
-              !(s.isDirectory() && DEFAULT_IGNORE_DIRS.has(s.name)),
+              !(s.isDirectory() && (s.name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(s.name))),
           )
           .sort((a, b) => {
             if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
             return a.name.localeCompare(b.name);
           });
-        const maxSub = 8;
-        const children = valid
-          .slice(0, maxSub)
-          .map((s) => (s.isDirectory() ? `${s.name}/` : s.name));
+        if (SNAPSHOT_COLLAPSE_DIRS.has(entry.name)) {
+          return {
+            name: `${entry.name}/`,
+            isDir: true,
+            collapsedCount: valid.length,
+            children: [] as string[],
+            more: 0,
+          };
+        }
+        const maxSub = 6;
+        const children = valid.slice(0, maxSub).map((s) => {
+          const base = shortEntryName(s.name);
+          return s.isDirectory() ? `${base}/` : base;
+        });
         return {
           name: `${entry.name}/`,
           isDir: true,
+          collapsedCount: null as number | null,
           children,
           more: Math.max(0, valid.length - maxSub),
         };
       } catch {
-        return { name: `${entry.name}/`, isDir: true, children: [], more: 0 };
+        return {
+          name: `${entry.name}/`,
+          isDir: true,
+          collapsedCount: null as number | null,
+          children: [],
+          more: 0,
+        };
       }
     }),
   );
 
   for (const item of subResults) {
-    if (!item.isDir || item.children.length === 0) {
+    if (!item.isDir) {
+      lines.push(`  ${item.name}`);
+    } else if (item.collapsedCount !== null) {
+      lines.push(`  ${item.name} (${item.collapsedCount} entries)`);
+    } else if (item.children.length === 0) {
       lines.push(`  ${item.name}`);
     } else {
       const more = item.more > 0 ? `, +${item.more}` : "";
@@ -182,20 +244,25 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
   return `Layout (2 levels):\n${lines.join("\n")}`;
 }
 
-async function getProjectManifestSummary(workspaceDir: string): Promise<string | null> {
+async function detectManifestsInDir(
+  dirPath: string,
+  prefix: string,
+): Promise<string[]> {
   const hints: string[] = [];
 
   await Promise.all([
     // package.json
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(workspaceDir, "package.json"), "utf8");
+        const raw = await fs.readFile(path.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw) as {
           name?: string;
           scripts?: Record<string, string>;
         };
-        const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 15) : [];
-        const label = pkg.name ? `package.json (${pkg.name})` : "package.json";
+        const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
+        const label = pkg.name
+          ? `${prefix}package.json (${pkg.name})`
+          : `${prefix}package.json`;
         hints.push(
           scriptNames.length > 0
             ? `${label} scripts: ${scriptNames.join(", ")}`
@@ -206,17 +273,18 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
       }
     })(),
 
-    // Makefile
+    // Makefile (root only to avoid noisy nested Makefiles)
     (async () => {
+      if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
         try {
-          const raw = await fs.readFile(path.join(workspaceDir, name), "utf8");
+          const raw = await fs.readFile(path.join(dirPath, name), "utf8");
           const targets: string[] = [];
           for (const line of raw.split(/\r?\n/)) {
             const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
             if (m && m[1] && !m[1].startsWith(".")) {
               if (!targets.includes(m[1])) targets.push(m[1]);
-              if (targets.length >= 12) break;
+              if (targets.length >= 10) break;
             }
           }
           hints.push(
@@ -231,10 +299,37 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
       }
     })(),
 
+    // pom.xml (Maven)
+    (async () => {
+      try {
+        const raw = await fs.readFile(path.join(dirPath, "pom.xml"), "utf8");
+        const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
+        const m = /<artifactId>\s*([^<\s]+)\s*<\/artifactId>/i.exec(stripped);
+        hints.push(
+          m?.[1] ? `${prefix}pom.xml (${m[1]}, maven)` : `${prefix}pom.xml (maven)`,
+        );
+      } catch {
+        // not present
+      }
+    })(),
+
+    // build.gradle / build.gradle.kts
+    (async () => {
+      for (const name of ["build.gradle.kts", "build.gradle"]) {
+        try {
+          await fs.access(path.join(dirPath, name));
+          hints.push(`${prefix}${name} (gradle)`);
+          break;
+        } catch {
+          // not present
+        }
+      }
+    })(),
+
     // pyproject.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(workspaceDir, "pyproject.toml"), "utf8");
+        const raw = await fs.readFile(path.join(dirPath, "pyproject.toml"), "utf8");
         const tools: string[] = [];
         if (/\[tool\.pytest/.test(raw)) tools.push("pytest");
         if (/\[tool\.ruff/.test(raw)) tools.push("ruff");
@@ -243,8 +338,8 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
         if (/\[tool\.uv/.test(raw)) tools.push("uv");
         hints.push(
           tools.length > 0
-            ? `pyproject.toml (${tools.join(", ")})`
-            : "pyproject.toml",
+            ? `${prefix}pyproject.toml (${tools.join(", ")})`
+            : `${prefix}pyproject.toml`,
         );
       } catch {
         // not present
@@ -254,9 +349,11 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
     // Cargo.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(workspaceDir, "Cargo.toml"), "utf8");
+        const raw = await fs.readFile(path.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
-        hints.push(isWorkspace ? "Cargo.toml (workspace)" : "Cargo.toml");
+        hints.push(
+          isWorkspace ? `${prefix}Cargo.toml (workspace)` : `${prefix}Cargo.toml`,
+        );
       } catch {
         // not present
       }
@@ -265,18 +362,51 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
     // go.mod
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(workspaceDir, "go.mod"), "utf8");
+        const raw = await fs.readFile(path.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
-        hints.push(m?.[1] ? `go.mod (${m[1]})` : "go.mod");
+        hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
         // not present
       }
     })(),
   ]);
 
-  if (hints.length === 0) return null;
-  hints.sort();
-  return `Project:\n${hints.map((h) => `  - ${h}`).join("\n")}`;
+  return hints;
+}
+
+async function getProjectManifestSummary(workspaceDir: string): Promise<string | null> {
+  const rootHints = await detectManifestsInDir(workspaceDir, "");
+  const allHints = [...rootHints];
+
+  // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/)
+  try {
+    const entries = await fs.readdir(workspaceDir, { withFileTypes: true });
+    const subdirs = entries
+      .filter(
+        (e) =>
+          e.isDirectory() &&
+          !e.name.startsWith(".") &&
+          !DEFAULT_IGNORE_DIRS.has(e.name) &&
+          !MANIFEST_SKIP_SUBDIRS.has(e.name),
+      )
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 8);
+
+    const nested = await Promise.all(
+      subdirs.map((d) =>
+        detectManifestsInDir(path.join(workspaceDir, d.name), `${d.name}/`),
+      ),
+    );
+    for (const list of nested) {
+      allHints.push(...list);
+    }
+  } catch {
+    // ignore
+  }
+
+  if (allHints.length === 0) return null;
+  allHints.sort();
+  return `Project:\n${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
 
 function fitSectionToChars(

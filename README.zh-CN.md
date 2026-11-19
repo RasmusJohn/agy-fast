@@ -150,9 +150,9 @@ node scripts/install.mjs install --project /path/to/your-repo
 
 ### 4 个核心 MCP 工具
 
-1. **`batch_search`**：单次并发执行最多 20 条混合查询（`text`、`regex`、`glob` 与只读 `git` 子命令 `status`/`diff`/`log`/`show`/`branch`/`rev-parse`/`ls-files` 等）。优先调用 `rg`，无 `rg` 自动回退 Node.js；严格禁止写操作和危险 git 参数；按总字符预算截断。
-2. **`apply_edits`**：单次原子执行单文件多处或跨文件修改（先在内存中校验全部文件与修改块的匹配及重叠，任一失败则 0 文件修改）。保留 CRLF 换行符、文件权限与软链接，支持指定行号范围（`startLine`/`endLine`）、新建文件（`create`）、`dryRun` 预检查与可选内联 `verify` 校验命令。
-3. **`read_slices`**：单次请求同时支持提取多语言符号大纲（TS/JS、Python、Go、Rust、Java/Kotlin/C#/C/C++/Swift、Shell、Markdown、JSON/YAML 的精确起止行号）与多文件精确行段批量读取，避免将大文件全文写入上下文。
+1. **`batch_search`**：单次并发执行最多 20 条混合查询（`text`、`regex`、`glob` 与只读 `git` 子命令 `status`/`diff`/`log`/`show`/`branch`/`rev-parse`/`ls-files` 等，支持按条传 `path` 跨目录/跨仓查询）。优先调用 `rg`，无 `rg` 自动回退 Node.js；默认按 UTF-8 字节预算封顶（`≤ 8.8 KB`），避免结果落盘成临时文件而多出额外轮次。
+2. **`apply_edits`**：单次原子执行单文件多处或跨文件修改（先在内存中校验匹配与重叠，失配时自动返回最相近代码行片段；超大批量可传 `bestEffort: true` 保留成功文件并仅重试失败文件）。保留 CRLF 换行符、文件权限与软链接，支持 `startLine`/`endLine`、新建/覆写（`create`/`overwrite`）、`dryRun` 与可选内联 `verify` 校验命令。
+3. **`read_slices`**：单次请求同时支持提取多语言符号大纲（TS/JS、Python、Go、Rust、Java/Kotlin/C#/C/C++/Swift、Shell、Markdown、JSON/YAML 的精确起止行号）与多文件精确行段批量读取，避免盲读大文件导致上下文膨胀。
 4. **`run_checks`**：在受控并发池中同时运行多项构建、类型检查、代码规范检查或单元测试；支持超时强杀、ANSI 转义符清理；默认 `compact` 模式通过时仅返回 1 行摘要，失败时提取关键报错与尾部日志。
 
 ---

@@ -912,12 +912,23 @@ export function analyzeTranscriptSessions(
     let prevSingleToolName: string | null = null;
     let prevPlannerMs: number | null = null;
     let prevTurnHadUserInputBetween = false;
+    let prevTurnHadCalls = false;
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]!;
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
+        prevTurnHadCalls = false;
+        continue;
+      }
+      if (step.type === "SYSTEM_MESSAGE") {
+        // An idle turn (calls=0) woken up later by an async background-task / subagent SYSTEM_MESSAGE
+        // is an external wait, not active LLM latency or an active-turn gap.
+        if (!prevTurnHadCalls) {
+          prevSingleToolName = null;
+          prevTurnHadUserInputBetween = true;
+        }
         continue;
       }
       if (step.type !== "PLANNER_RESPONSE") continue;
@@ -1010,12 +1021,15 @@ export function analyzeTranscriptSessions(
         prevSingleToolName = null;
       }
 
+      prevTurnHadCalls = calls.length > 0;
+
       // Collect following tool/generic steps before next PLANNER_RESPONSE or USER_INPUT
       const genericTimes: number[] = [];
       let nextPlannerMs: number | null = null;
       for (let j = i + 1; j < steps.length; j++) {
         const nxt = steps[j]!;
         if (nxt.type === "USER_INPUT") break;
+        if (nxt.type === "SYSTEM_MESSAGE" && calls.length === 0) break;
         if (nxt.type === "PLANNER_RESPONSE") {
           nextPlannerMs = parseTimeMs(nxt.created_at);
           break;

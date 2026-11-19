@@ -696,11 +696,20 @@ function analyzeTranscriptSessions(sessions) {
     let prevSingleToolName = null;
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
+    let prevTurnHadCalls = false;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
+        prevTurnHadCalls = false;
+        continue;
+      }
+      if (step.type === "SYSTEM_MESSAGE") {
+        if (!prevTurnHadCalls) {
+          prevSingleToolName = null;
+          prevTurnHadUserInputBetween = true;
+        }
         continue;
       }
       if (step.type !== "PLANNER_RESPONSE") continue;
@@ -778,11 +787,13 @@ function analyzeTranscriptSessions(sessions) {
       } else {
         prevSingleToolName = null;
       }
+      prevTurnHadCalls = calls.length > 0;
       const genericTimes = [];
       let nextPlannerMs = null;
       for (let j = i + 1; j < steps.length; j++) {
         const nxt = steps[j];
         if (nxt.type === "USER_INPUT") break;
+        if (nxt.type === "SYSTEM_MESSAGE" && calls.length === 0) break;
         if (nxt.type === "PLANNER_RESPONSE") {
           nextPlannerMs = parseTimeMs(nxt.created_at);
           break;

@@ -323,4 +323,74 @@ describe("apply_edits", () => {
       await fs.chmod(lockedFile, 0o644);
     }
   });
+
+  it("includes closest-match line snippets when target misses without startLine/endLine and supports bestEffort partial commits", async () => {
+    const okFile = path.join(tmpDir, "be-ok.java");
+    const missFile = path.join(tmpDir, "be-miss.java");
+    await fs.writeFile(okFile, "public class Ok {\n  int value = 1;\n}\n", "utf8");
+    await fs.writeFile(
+      missFile,
+      [
+        "public class ShopIncome {",
+        "  public static String label(String source) {",
+        "    return switch (source) {",
+        '      case "ERP" -> "实付";',
+        '      case "EST" -> "估算";',
+        '      default -> "未知";',
+        "    };",
+        "  }",
+        "}",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // Without startLine/endLine, atomic mode still reports closest match snippet
+    const atomicMiss = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "be-miss.java",
+          hunks: [
+            {
+              target: '    return switch (source) {\n      case "ERP" -> "WRONG";\n    };',
+              replacement: "    return source;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(atomicMiss.isError, true);
+    assert.match(atomicMiss.text, /Closest match near line 3/);
+    assert.match(atomicMiss.text, /case "ERP" -> "实付"/);
+
+    // bestEffort: true writes valid files, keeps failed file intact with snippet, and skips verify
+    const partial = await runApplyEdits({
+      cwd: tmpDir,
+      bestEffort: true,
+      verify: `${JSON.stringify(process.execPath)} -e "console.log('SHOULD_NOT_RUN')"`,
+      edits: [
+        {
+          path: "be-ok.java",
+          hunks: [{ target: "int value = 1;", replacement: "int value = 2;" }],
+        },
+        {
+          path: "be-miss.java",
+          hunks: [
+            {
+              target: '    return switch (source) {\n      case "ERP" -> "WRONG";\n    };',
+              replacement: "    return source;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(partial.isError, true);
+    assert.match(partial.text, /Partial edit applied \(1\/2 file\(s\) written; 1 file\(s\) failed/);
+    assert.match(partial.text, /be-ok\.java: updated/);
+    assert.match(partial.text, /Closest match near line 3/);
+    assert.match(partial.text, /Verify skipped/);
+    assert.doesNotMatch(partial.text, /SHOULD_NOT_RUN/);
+    assert.equal(await fs.readFile(okFile, "utf8"), "public class Ok {\n  int value = 2;\n}\n");
+    assert.match(await fs.readFile(missFile, "utf8"), /case "ERP" -> "实付"/);
+  });
 });

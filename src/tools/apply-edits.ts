@@ -2,7 +2,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runShellCommandAsync } from "../utils/exec-utils.js";
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
-import { formatCompactCommandOutput } from "../utils/output-filter.js";
+import {
+  DEFAULT_INLINE_MAX_BYTES,
+  formatCompactCommandOutput,
+  truncateWithByteNotice,
+} from "../utils/output-filter.js";
 
 export interface EditHunk {
   target: string;
@@ -29,6 +33,7 @@ export interface ApplyEditsInput {
   cwd?: string;
   edits: FileEdit[];
   dryRun?: boolean;
+  bestEffort?: boolean;
   verify?: string | VerifySpec;
   verifyTimeoutSec?: number;
   maxVerifyChars?: number;
@@ -126,9 +131,129 @@ function formatNearbyLines(
   const to = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
   const snippet: string[] = [];
   for (let ln = from; ln <= to; ln++) {
-    snippet.push(`    ${ln}: ${lines[ln - 1] ?? ""}`);
+    const lineText = lines[ln - 1] ?? "";
+    snippet.push(
+      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`,
+    );
   }
   return `\n  Nearby lines (${from}-${to}):\n${snippet.join("\n")}`;
+}
+
+function extractLineTokens(trimmedLine: string): string[] {
+  const tokens = trimmedLine.match(/[A-Za-z0-9_$]{3,}|[\u4e00-\u9fff]{2,}/g);
+  if (tokens && tokens.length > 0) return tokens;
+  return trimmedLine
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+}
+
+/**
+ * When target text is not found and no startLine/endLine was provided,
+ * locate the closest matching region in the file so the caller can fix the
+ * hunk immediately without an extra read_file round-trip or blind retry.
+ */
+function findClosestRegionSnippet(
+  normalizedContent: string,
+  normTarget: string,
+): string {
+  const fileLines = normalizedContent.split("\n");
+  if (fileLines.length === 0) return "";
+
+  const targetLines = normTarget
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (targetLines.length === 0) return "";
+
+  const firstAnchor =
+    targetLines.find((l) => l.length >= 6) ?? targetLines[0]!;
+  let longestAnchor = targetLines[0]!;
+  for (const tl of targetLines) {
+    if (tl.length > longestAnchor.length) longestAnchor = tl;
+  }
+  const anchors = [firstAnchor];
+  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
+  const lastAnchor = targetLines[targetLines.length - 1]!;
+  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
+    anchors.push(lastAnchor);
+  }
+
+  const primaryTokens = new Set(extractLineTokens(firstAnchor));
+  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  const trimmedFileLines = fileLines.map((l) => l.trim());
+
+  let bestIdx = -1;
+  let bestScore = 0;
+
+  for (let i = 0; i < trimmedFileLines.length; i++) {
+    const line = trimmedFileLines[i]!;
+    if (!line) continue;
+
+    let score = 0;
+    if (line === firstAnchor) {
+      score += 10;
+    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
+      score += 6;
+    } else if (primaryTokens.size > 0) {
+      const lineTokens = extractLineTokens(line);
+      let hits = 0;
+      for (const tok of lineTokens) {
+        if (primaryTokens.has(tok)) hits += 1;
+      }
+      if (hits >= 2 || (hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size)) {
+        score += 4 * (hits / primaryTokens.size);
+      }
+    }
+
+    if (longestAnchor !== firstAnchor) {
+      if (line === longestAnchor) {
+        score += 8;
+      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
+        score += 5;
+      } else if (longestTokens.size >= 2) {
+        const lineTokens = extractLineTokens(line);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (longestTokens.has(tok)) hits += 1;
+        }
+        if (hits >= 2) {
+          score += 3 * (hits / longestTokens.size);
+        }
+      }
+    }
+
+    // Bonus when nearby subsequent lines also match subsequent target lines
+    if (score >= 2 && targetLines.length > 1) {
+      const lookahead = Math.min(targetLines.length, 6);
+      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
+        const nextLine = trimmedFileLines[i + k]!;
+        const tgtLine = targetLines[k]!;
+        if (nextLine && tgtLine && (nextLine === tgtLine || (tgtLine.length >= 8 && nextLine.includes(tgtLine)))) {
+          score += 3;
+        }
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  if (bestIdx < 0 || bestScore < 2.5) return "";
+
+  const span = Math.min(Math.max(targetLines.length, 4), 8);
+  const from = Math.max(1, bestIdx + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const snippet: string[] = [];
+  for (let ln = from; ln <= to; ln++) {
+    const lineText = fileLines[ln - 1] ?? "";
+    snippet.push(
+      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`,
+    );
+  }
+  return `\n  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):\n${snippet.join("\n")}`;
 }
 
 function planHunksForContent(
@@ -182,15 +307,13 @@ function planHunksForContent(
     }
 
     if (foundOffsets.length === 0) {
-      const rangeNote =
-        hunk.startLine !== undefined || hunk.endLine !== undefined
-          ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}`
-          : "";
-      const nearby = formatNearbyLines(
-        normalizedContent,
-        hunk.startLine,
-        hunk.endLine,
-      );
+      const hasRange = hunk.startLine !== undefined || hunk.endLine !== undefined;
+      const rangeNote = hasRange
+        ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}`
+        : "";
+      const nearby = hasRange
+        ? formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine)
+        : findClosestRegionSnippet(normalizedContent, normTarget);
       errors.push(
         `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${nearby}`,
       );
@@ -490,14 +613,22 @@ export async function runApplyEdits(
     });
   }
 
-  if (errors.length > 0) {
+  const bestEffort = Boolean(input.bestEffort);
+
+  if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
+    const prefix = bestEffort
+      ? "Edit aborted (0 files modified):"
+      : "Atomic edit aborted (0 files modified):";
     return {
-      text: `Atomic edit aborted (0 files modified):\n- ${errors.join("\n- ")}`,
+      text: truncateWithByteNotice(
+        `${prefix}\n- ${errors.join("\n- ")}`,
+        DEFAULT_INLINE_MAX_BYTES,
+      ),
       isError: true,
     };
   }
 
-  // Phase 2: write atomically (unless dryRun)
+  // Phase 2: write valid planned files (unless dryRun)
   if (!input.dryRun) {
     try {
       await commitPlannedWrites(plans);
@@ -511,9 +642,36 @@ export async function runApplyEdits(
 
   const summaryLines = plans.map((p) => {
     const deltaStr = p.lineDelta >= 0 ? `+${p.lineDelta}` : `${p.lineDelta}`;
-    const action = p.created ? "created" : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
+    const action = p.created
+      ? "created"
+      : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
     return `- ${p.relPath}: ${action}, lines ${deltaStr}`;
   });
+
+  if (bestEffort && errors.length > 0) {
+    const totalFiles = mergedByPath.size;
+    const failedFileCount = Math.max(1, totalFiles - plans.length);
+    const partialHeader = input.dryRun
+      ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):`
+      : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed — do NOT re-send applied files):`;
+    const partialParts = [
+      partialHeader,
+      `Applied:\n${summaryLines.join("\n")}`,
+      `Failed (fix only these):\n- ${errors.join("\n- ")}`,
+    ];
+    if (!input.dryRun && input.verify) {
+      partialParts.push(
+        "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify.",
+      );
+    }
+    return {
+      text: truncateWithByteNotice(
+        partialParts.join("\n\n"),
+        DEFAULT_INLINE_MAX_BYTES,
+      ),
+      isError: true,
+    };
+  }
 
   const header = input.dryRun
     ? `Dry run validated ${plans.length} file(s) (0 files modified):`
@@ -564,5 +722,10 @@ export async function runApplyEdits(
     }
   }
 
-  return { text: parts.join("\n"), isError: false };
+  const outText = parts.join("\n");
+  const finalText =
+    input.maxVerifyChars === undefined
+      ? truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES)
+      : outText;
+  return { text: finalText, isError: false };
 }

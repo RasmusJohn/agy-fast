@@ -8,7 +8,10 @@ import {
   toPosixPath,
   walkFiles,
 } from "../utils/fs-utils.js";
-import { fitSectionsToBudget } from "../utils/output-filter.js";
+import {
+  DEFAULT_INLINE_MAX_BYTES,
+  fitSectionsToByteBudget,
+} from "../utils/output-filter.js";
 
 export type SearchQueryType = "text" | "regex" | "glob" | "git";
 
@@ -800,7 +803,9 @@ export async function runBatchSearch(
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
 
-  const maxChars = clampInt(input.maxChars ?? 12_000, 500, 60_000);
+  const maxChars = clampInt(input.maxChars ?? 8_500, 500, 60_000);
+  const maxBytes =
+    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
   const needsTextSearch = input.queries.some(
     (q) => q.type === "text" || q.type === "regex",
   );
@@ -811,8 +816,11 @@ export async function runBatchSearch(
     input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
   );
 
-  // Allocate budget fairly across queries via water-filling within maxChars
-  return { text: fitSectionsToBudget(sections, maxChars, "\n\n"), isError: false };
+  // Allocate budget fairly across queries via water-filling within maxChars & inline UTF-8 byte ceiling
+  return {
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    isError: false,
+  };
 }
 
 function clampInt(val: number, min: number, max: number): number {

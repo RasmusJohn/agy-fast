@@ -24,6 +24,58 @@ export function normalizeTerminalOutput(raw: string): string {
     .trimEnd();
 }
 
+/**
+ * Antigravity spills call_mcp_tool responses over ~10 KB UTF-8 to disk
+ * (`The output was large and was saved to: ...`), forcing an extra LLM turn
+ * to read_file(output.txt). Keeping default tool responses <= 8,800 UTF-8 bytes
+ * guarantees inline delivery with headroom for timestamp/JSON wrappers.
+ */
+export const DEFAULT_INLINE_MAX_BYTES = 8_800;
+
+export function sliceUtf8Bytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let bytes = 0;
+  let endIndex = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i)!;
+    const unitLen = cp > 0xffff ? 2 : 1;
+    const chBytes = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+    if (bytes + chBytes > maxBytes) break;
+    bytes += chBytes;
+    i += unitLen;
+    endIndex = i;
+  }
+  return text.slice(0, endIndex);
+}
+
+export function truncateWithByteNotice(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= maxBytes) return text;
+
+  if (maxBytes < 56) {
+    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
+    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  }
+
+  const maxNoticeBytes = Buffer.byteLength(
+    `\n... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
+    "utf8",
+  );
+  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  let slice = sliceUtf8Bytes(text, cutoffBytes);
+  const lastNewline = slice.lastIndexOf("\n");
+  if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
+    slice = slice.slice(0, lastNewline);
+  }
+  const shownBytes = Buffer.byteLength(slice, "utf8");
+  const result = `${slice}\n... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
+  return Buffer.byteLength(result, "utf8") <= maxBytes
+    ? result
+    : sliceUtf8Bytes(result, maxBytes);
+}
+
 export function truncateWithNotice(text: string, maxChars: number): string {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
@@ -91,6 +143,62 @@ export function fitSectionsToBudget(
     .map((sec, idx) => truncateWithNotice(sec, budgets[idx] ?? 0))
     .join(separator);
   return fitted.length <= maxChars ? fitted : truncateWithNotice(fitted, maxChars);
+}
+
+/**
+ * Fits sections within both a character budget and an optional UTF-8 byte
+ * budget (water-filling by UTF-8 byte size when CJK/multi-byte characters
+ * push the joined string over maxBytes).
+ */
+export function fitSectionsToByteBudget(
+  sections: string[],
+  maxChars: number,
+  maxBytes?: number,
+  separator = "\n\n",
+): string {
+  const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+  if (maxBytes === undefined || Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
+    return charFitted;
+  }
+
+  const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
+  if (sepBytes >= maxBytes) {
+    return truncateWithByteNotice(charFitted, maxBytes);
+  }
+
+  let remainingBytes = maxBytes - sepBytes;
+  const byteBudgets = new Array<number>(sections.length).fill(0);
+  const order = sections
+    .map((s, idx) => ({ idx, bytes: Buffer.byteLength(s, "utf8") }))
+    .sort((a, b) => a.bytes - b.bytes);
+
+  for (let i = 0; i < order.length; i++) {
+    const remainingCount = order.length - i;
+    const share = Math.floor(remainingBytes / remainingCount);
+    const item = order[i]!;
+    if (item.bytes <= share) {
+      byteBudgets[item.idx] = item.bytes;
+      remainingBytes -= item.bytes;
+    } else {
+      for (let j = i; j < order.length; j++) {
+        const rem = order.length - j;
+        const alloc = Math.floor(remainingBytes / rem);
+        byteBudgets[order[j]!.idx] = alloc;
+        remainingBytes -= alloc;
+      }
+      break;
+    }
+  }
+
+  let fitted = sections
+    .map((sec, idx) => truncateWithByteNotice(sec, byteBudgets[idx] ?? 0))
+    .join(separator);
+  if (fitted.length > maxChars) {
+    fitted = truncateWithNotice(fitted, maxChars);
+  }
+  return Buffer.byteLength(fitted, "utf8") <= maxBytes
+    ? fitted
+    : truncateWithByteNotice(fitted, maxBytes);
 }
 
 const ERROR_LINE_PATTERN =

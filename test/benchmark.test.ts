@@ -756,5 +756,43 @@ describe("benchmark analyzer & CLI", () => {
     });
     assert.equal(directSplit.withAgyFast.sessions, 1);
     assert.equal(directSplit.withoutAgyFast.sessions, 1);
+
+    // Async idle wait (calls=0 followed by delayed SYSTEM_MESSAGE callback) must NOT be counted as llmTimeSec or >60s gap
+    const asyncWaitSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T08:05:00Z",
+          output_tokens: 200,
+          tool_calls: [],
+          content: "Waiting for background task...",
+        }),
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-19T08:09:30Z",
+          content: "Background task finished",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T08:09:30Z",
+          output_tokens: 300,
+          tool_calls: [{ name: "read_file", args: { Path: "/repo/a.ts" } }],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T08:09:38Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T08:09:39Z",
+          output_tokens: 100,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+    const asyncMetrics = analyzeTranscriptSessions([asyncWaitSteps]);
+    assert.equal(asyncMetrics.llmTimeSec, 8); // NOT 278s (270s async sleep excluded)
+    assert.equal(asyncMetrics.toolExecTimeSec, 1);
+    assert.equal(asyncMetrics.over60sGapRatio, 0);
   });
 });

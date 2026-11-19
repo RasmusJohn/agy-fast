@@ -73,7 +73,7 @@ export function createAgyFastServer(): McpStdioServer {
             type: "integer",
             minimum: 500,
             maximum: 60000,
-            description: "Total character cap for combined results (default 12000).",
+            description: "Total character cap for combined results (default 8500, inline UTF-8 capped <= 8800 bytes).",
           },
         },
         required: ["queries"],
@@ -144,6 +144,11 @@ export function createAgyFastServer(): McpStdioServer {
             type: "boolean",
             description: "Validate all hunks without writing files (default false).",
           },
+          bestEffort: {
+            type: "boolean",
+            description:
+              "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing).",
+          },
           verify: {
             type: "string",
             description:
@@ -208,7 +213,7 @@ export function createAgyFastServer(): McpStdioServer {
             type: "integer",
             minimum: 1000,
             maximum: 80000,
-            description: "Total character cap across all outlines and slices (default 24000).",
+            description: "Total character cap across all outlines and slices (default 8500, inline UTF-8 capped <= 8800 bytes).",
           },
         },
       },
@@ -262,7 +267,7 @@ export function createAgyFastServer(): McpStdioServer {
             type: "integer",
             minimum: 500,
             maximum: 60000,
-            description: "Total character cap (default 12000).",
+            description: "Total character cap (default 8000, inline UTF-8 capped <= 8800 bytes).",
           },
         },
         required: ["commands"],

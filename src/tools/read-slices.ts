@@ -1,6 +1,9 @@
 import path from "node:path";
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
-import { fitSectionsToBudget } from "../utils/output-filter.js";
+import {
+  DEFAULT_INLINE_MAX_BYTES,
+  fitSectionsToByteBudget,
+} from "../utils/output-filter.js";
 
 export interface SliceRequest {
   path: string;
@@ -827,8 +830,10 @@ export async function runReadSlices(
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const maxChars = Math.max(
     1000,
-    Math.min(80_000, Math.trunc(input.maxChars ?? 24_000)),
+    Math.min(80_000, Math.trunc(input.maxChars ?? 8_500)),
   );
+  const maxBytes =
+    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
 
   const fileCache = new Map<string, { lines: string[]; size: number }>();
   async function loadLines(absPath: string): Promise<{ lines: string[]; size: number }> {
@@ -941,5 +946,8 @@ export async function runReadSlices(
     sections.push(...sliceResults);
   }
 
-  return { text: fitSectionsToBudget(sections, maxChars, "\n\n"), isError: false };
+  return {
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    isError: false,
+  };
 }

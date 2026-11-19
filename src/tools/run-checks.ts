@@ -2,9 +2,11 @@ import { promises as fs } from "node:fs";
 import { runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
 import { resolvePath } from "../utils/fs-utils.js";
 import {
-  fitSectionsToBudget,
+  DEFAULT_INLINE_MAX_BYTES,
+  fitSectionsToByteBudget,
   formatCompactCommandOutput,
   normalizeTerminalOutput,
+  truncateWithByteNotice,
   truncateWithNotice,
 } from "../utils/output-filter.js";
 
@@ -88,7 +90,9 @@ export async function runChecks(
   const concurrency = clampInt(input.concurrency ?? 4, 1, 8);
   const defaultTimeoutSec = clampInt(input.timeoutSec ?? 60, 1, 300);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt(input.maxChars ?? 12_000, 500, 60_000);
+  const maxChars = clampInt(input.maxChars ?? 8_000, 500, 60_000);
+  const maxBytes =
+    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
 
   const normalized: NormalizedCommand[] = [];
   for (let i = 0; i < input.commands.length; i++) {
@@ -204,11 +208,23 @@ export async function runChecks(
   });
 
   const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const fittedBlocks = fitSectionsToBudget(blocks, bodyBudget, "\n\n");
-  const text = truncateWithNotice(
+  const bodyByteBudget =
+    maxBytes !== undefined
+      ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2)
+      : undefined;
+  const fittedBlocks = fitSectionsToByteBudget(
+    blocks,
+    bodyBudget,
+    bodyByteBudget,
+    "\n\n",
+  );
+  let text = truncateWithNotice(
     `${summaryHeader}\n\n${fittedBlocks}`,
     maxChars,
   );
+  if (maxBytes !== undefined) {
+    text = truncateWithByteNotice(text, maxBytes);
+  }
   return { text, isError: false };
 }
 

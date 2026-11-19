@@ -203,4 +203,48 @@ describe("session-start hook", () => {
       await fs.rm(dirtyDir, { recursive: true, force: true });
     }
   });
+
+  it("detects multi-module subproject manifests (pom.xml + web/package.json) and collapses noisy tmp/output dirs", async () => {
+    const monoDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hook-mono-"));
+    try {
+      await fs.mkdir(path.join(monoDir, ".claude", "memory"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "server", "src"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "web", "src"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "output"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "tmp"), { recursive: true });
+
+      await fs.writeFile(
+        path.join(monoDir, "server", "pom.xml"),
+        "<project><parent><artifactId>spring-boot-starter-parent</artifactId></parent><artifactId>autocard-server</artifactId></project>\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(monoDir, "web", "package.json"),
+        JSON.stringify({ name: "autocard-web", scripts: { dev: "vite", build: "vite build", test: "node --test" } }),
+        "utf8",
+      );
+      for (let i = 0; i < 15; i++) {
+        await fs.writeFile(
+          path.join(monoDir, "output", `很长的中文交付报告文件名_${i}_20261119.docx`),
+          "x",
+          "utf8",
+        );
+        await fs.writeFile(path.join(monoDir, "tmp", `scratch_temp_file_${i}.txt`), "x", "utf8");
+      }
+
+      const res = await runHook(JSON.stringify({ cwd: monoDir, workspacePaths: [monoDir] }));
+      assert.equal(res.code, 0);
+      const parsed = JSON.parse(res.stdout);
+      const msg: string = parsed?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.ok(msg.length <= 1500, `Snapshot exceeded 1500 chars: ${msg.length}`);
+      assert.match(msg, /server\/pom\.xml \(autocard-server, maven\)/);
+      assert.match(msg, /web\/package\.json \(autocard-web\) scripts: dev, build, test/);
+      assert.match(msg, /web\//);
+      assert.match(msg, /output\/ \(15 entries\)/);
+      assert.match(msg, /tmp\/ \(15 entries\)/);
+      assert.doesNotMatch(msg, /\.claude\//);
+    } finally {
+      await fs.rm(monoDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -311,5 +311,28 @@ describe("batch_search", () => {
       `Expected <= 500 chars, got ${tinyBudget.text.length}`,
     );
     assert.match(tinyBudget.text, /## Query 6/);
+
+    // Default call with heavy multi-byte UTF-8 matches must stay <= 8,800 UTF-8 bytes to avoid host spill-to-disk
+    const cjkFile = path.join(tmpDir, "cjk-heavy.txt");
+    const cjkLines = Array.from(
+      { length: 120 },
+      (_, i) => `第${i + 1}行：中文测试数据_CJK_MATCH_锚点_用于验证默认内联字节上限不触发落盘_${"测试内容".repeat(12)}`,
+    );
+    await fs.writeFile(cjkFile, cjkLines.join("\n"), "utf8");
+    const cjkRes = await runBatchSearch({
+      cwd: tmpDir,
+      queries: [
+        { type: "text", pattern: "CJK_MATCH", path: "cjk-heavy.txt", maxResults: 120 },
+        { type: "text", pattern: "getUsers", path: "src/api/routes.ts" },
+      ],
+    });
+    assert.equal(cjkRes.isError, false);
+    const cjkBytes = Buffer.byteLength(cjkRes.text, "utf8");
+    assert.ok(
+      cjkBytes <= 8_800,
+      `Expected default batch_search UTF-8 bytes <= 8800, got ${cjkBytes}`,
+    );
+    assert.match(cjkRes.text, /## Query 2/);
+    assert.match(cjkRes.text, /getUsers/);
   });
 });

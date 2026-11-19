@@ -640,6 +640,47 @@ function normalizeTerminalOutput(raw) {
     return parts[parts.length - 1] ?? "";
   }).join("\n").trimEnd();
 }
+var DEFAULT_INLINE_MAX_BYTES = 8800;
+function sliceUtf8Bytes(text, maxBytes) {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let bytes = 0;
+  let endIndex = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    const unitLen = cp > 65535 ? 2 : 1;
+    const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
+    if (bytes + chBytes > maxBytes) break;
+    bytes += chBytes;
+    i += unitLen;
+    endIndex = i;
+  }
+  return text.slice(0, endIndex);
+}
+function truncateWithByteNotice(text, maxBytes) {
+  if (maxBytes <= 0) return "";
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= maxBytes) return text;
+  if (maxBytes < 56) {
+    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
+    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  }
+  const maxNoticeBytes = Buffer.byteLength(
+    `
+... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
+    "utf8"
+  );
+  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  let slice = sliceUtf8Bytes(text, cutoffBytes);
+  const lastNewline = slice.lastIndexOf("\n");
+  if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
+    slice = slice.slice(0, lastNewline);
+  }
+  const shownBytes = Buffer.byteLength(slice, "utf8");
+  const result = `${slice}
+... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
+  return Buffer.byteLength(result, "utf8") <= maxBytes ? result : sliceUtf8Bytes(result, maxBytes);
+}
 function truncateWithNotice(text, maxChars) {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
@@ -689,6 +730,41 @@ function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
   }
   const fitted = sections.map((sec, idx) => truncateWithNotice(sec, budgets[idx] ?? 0)).join(separator);
   return fitted.length <= maxChars ? fitted : truncateWithNotice(fitted, maxChars);
+}
+function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n") {
+  const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+  if (maxBytes === void 0 || Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
+    return charFitted;
+  }
+  const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
+  if (sepBytes >= maxBytes) {
+    return truncateWithByteNotice(charFitted, maxBytes);
+  }
+  let remainingBytes = maxBytes - sepBytes;
+  const byteBudgets = new Array(sections.length).fill(0);
+  const order = sections.map((s, idx) => ({ idx, bytes: Buffer.byteLength(s, "utf8") })).sort((a, b) => a.bytes - b.bytes);
+  for (let i = 0; i < order.length; i++) {
+    const remainingCount = order.length - i;
+    const share = Math.floor(remainingBytes / remainingCount);
+    const item = order[i];
+    if (item.bytes <= share) {
+      byteBudgets[item.idx] = item.bytes;
+      remainingBytes -= item.bytes;
+    } else {
+      for (let j = i; j < order.length; j++) {
+        const rem = order.length - j;
+        const alloc = Math.floor(remainingBytes / rem);
+        byteBudgets[order[j].idx] = alloc;
+        remainingBytes -= alloc;
+      }
+      break;
+    }
+  }
+  let fitted = sections.map((sec, idx) => truncateWithByteNotice(sec, byteBudgets[idx] ?? 0)).join(separator);
+  if (fitted.length > maxChars) {
+    fitted = truncateWithNotice(fitted, maxChars);
+  }
+  return Buffer.byteLength(fitted, "utf8") <= maxBytes ? fitted : truncateWithByteNotice(fitted, maxBytes);
 }
 var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b)/i;
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
@@ -798,10 +874,103 @@ function formatNearbyLines(text, startLine, endLine) {
   const to = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
-    snippet.push(`    ${ln}: ${lines[ln - 1] ?? ""}`);
+    const lineText = lines[ln - 1] ?? "";
+    snippet.push(
+      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`
+    );
   }
   return `
   Nearby lines (${from}-${to}):
+${snippet.join("\n")}`;
+}
+function extractLineTokens(trimmedLine) {
+  const tokens = trimmedLine.match(/[A-Za-z0-9_$]{3,}|[\u4e00-\u9fff]{2,}/g);
+  if (tokens && tokens.length > 0) return tokens;
+  return trimmedLine.split(/\s+/).map((s) => s.trim()).filter((s) => s.length >= 2);
+}
+function findClosestRegionSnippet(normalizedContent, normTarget) {
+  const fileLines = normalizedContent.split("\n");
+  if (fileLines.length === 0) return "";
+  const targetLines = normTarget.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (targetLines.length === 0) return "";
+  const firstAnchor = targetLines.find((l) => l.length >= 6) ?? targetLines[0];
+  let longestAnchor = targetLines[0];
+  for (const tl of targetLines) {
+    if (tl.length > longestAnchor.length) longestAnchor = tl;
+  }
+  const anchors = [firstAnchor];
+  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
+  const lastAnchor = targetLines[targetLines.length - 1];
+  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
+    anchors.push(lastAnchor);
+  }
+  const primaryTokens = new Set(extractLineTokens(firstAnchor));
+  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  const trimmedFileLines = fileLines.map((l) => l.trim());
+  let bestIdx = -1;
+  let bestScore = 0;
+  for (let i = 0; i < trimmedFileLines.length; i++) {
+    const line = trimmedFileLines[i];
+    if (!line) continue;
+    let score = 0;
+    if (line === firstAnchor) {
+      score += 10;
+    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
+      score += 6;
+    } else if (primaryTokens.size > 0) {
+      const lineTokens = extractLineTokens(line);
+      let hits = 0;
+      for (const tok of lineTokens) {
+        if (primaryTokens.has(tok)) hits += 1;
+      }
+      if (hits >= 2 || hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size) {
+        score += 4 * (hits / primaryTokens.size);
+      }
+    }
+    if (longestAnchor !== firstAnchor) {
+      if (line === longestAnchor) {
+        score += 8;
+      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
+        score += 5;
+      } else if (longestTokens.size >= 2) {
+        const lineTokens = extractLineTokens(line);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (longestTokens.has(tok)) hits += 1;
+        }
+        if (hits >= 2) {
+          score += 3 * (hits / longestTokens.size);
+        }
+      }
+    }
+    if (score >= 2 && targetLines.length > 1) {
+      const lookahead = Math.min(targetLines.length, 6);
+      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
+        const nextLine = trimmedFileLines[i + k];
+        const tgtLine = targetLines[k];
+        if (nextLine && tgtLine && (nextLine === tgtLine || tgtLine.length >= 8 && nextLine.includes(tgtLine))) {
+          score += 3;
+        }
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx < 0 || bestScore < 2.5) return "";
+  const span = Math.min(Math.max(targetLines.length, 4), 8);
+  const from = Math.max(1, bestIdx + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const snippet = [];
+  for (let ln = from; ln <= to; ln++) {
+    const lineText = fileLines[ln - 1] ?? "";
+    snippet.push(
+      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`
+    );
+  }
+  return `
+  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):
 ${snippet.join("\n")}`;
 }
 function planHunksForContent(normalizedContent, hunks, displayPath) {
@@ -846,12 +1015,9 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
       pos = found + Math.max(1, normTarget.length);
     }
     if (foundOffsets.length === 0) {
-      const rangeNote = hunk.startLine !== void 0 || hunk.endLine !== void 0 ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}` : "";
-      const nearby = formatNearbyLines(
-        normalizedContent,
-        hunk.startLine,
-        hunk.endLine
-      );
+      const hasRange = hunk.startLine !== void 0 || hunk.endLine !== void 0;
+      const rangeNote = hasRange ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}` : "";
+      const nearby = hasRange ? formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine) : findClosestRegionSnippet(normalizedContent, normTarget);
       errors.push(
         `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${nearby}`
       );
@@ -1097,10 +1263,15 @@ async function runApplyEdits(input) {
       created: false
     });
   }
-  if (errors.length > 0) {
+  const bestEffort = Boolean(input.bestEffort);
+  if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
+    const prefix = bestEffort ? "Edit aborted (0 files modified):" : "Atomic edit aborted (0 files modified):";
     return {
-      text: `Atomic edit aborted (0 files modified):
+      text: truncateWithByteNotice(
+        `${prefix}
 - ${errors.join("\n- ")}`,
+        DEFAULT_INLINE_MAX_BYTES
+      ),
       isError: true
     };
   }
@@ -1119,6 +1290,30 @@ async function runApplyEdits(input) {
     const action = p.created ? "created" : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
     return `- ${p.relPath}: ${action}, lines ${deltaStr}`;
   });
+  if (bestEffort && errors.length > 0) {
+    const totalFiles = mergedByPath.size;
+    const failedFileCount = Math.max(1, totalFiles - plans.length);
+    const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
+    const partialParts = [
+      partialHeader,
+      `Applied:
+${summaryLines.join("\n")}`,
+      `Failed (fix only these):
+- ${errors.join("\n- ")}`
+    ];
+    if (!input.dryRun && input.verify) {
+      partialParts.push(
+        "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify."
+      );
+    }
+    return {
+      text: truncateWithByteNotice(
+        partialParts.join("\n\n"),
+        DEFAULT_INLINE_MAX_BYTES
+      ),
+      isError: true
+    };
+  }
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
   const parts = [`${header}
 ${summaryLines.join("\n")}`];
@@ -1157,7 +1352,9 @@ ${formatted}`
       );
     }
   }
-  return { text: parts.join("\n"), isError: false };
+  const outText = parts.join("\n");
+  const finalText = input.maxVerifyChars === void 0 ? truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES) : outText;
+  return { text: finalText, isError: false };
 }
 
 // src/tools/batch-search.ts
@@ -1809,7 +2006,8 @@ async function runBatchSearch(input, options = {}) {
   } catch {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
-  const maxChars = clampInt(input.maxChars ?? 12e3, 500, 6e4);
+  const maxChars = clampInt(input.maxChars ?? 8500, 500, 6e4);
+  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
   const needsTextSearch = input.queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
@@ -1817,7 +2015,10 @@ async function runBatchSearch(input, options = {}) {
   const sections = await Promise.all(
     input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
   );
-  return { text: fitSectionsToBudget(sections, maxChars, "\n\n"), isError: false };
+  return {
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    isError: false
+  };
 }
 function clampInt(val, min, max) {
   if (!Number.isFinite(val)) return min;
@@ -2530,8 +2731,9 @@ async function runReadSlices(input) {
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const maxChars = Math.max(
     1e3,
-    Math.min(8e4, Math.trunc(input.maxChars ?? 24e3))
+    Math.min(8e4, Math.trunc(input.maxChars ?? 8500))
   );
+  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
   const fileCache = /* @__PURE__ */ new Map();
   async function loadLines(absPath) {
     const cached = fileCache.get(absPath);
@@ -2631,7 +2833,10 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     sections.push(...sliceResults);
   }
-  return { text: fitSectionsToBudget(sections, maxChars, "\n\n"), isError: false };
+  return {
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    isError: false
+  };
 }
 
 // src/tools/run-checks.ts
@@ -2675,7 +2880,8 @@ async function runChecks(input) {
   const concurrency = clampInt2(input.concurrency ?? 4, 1, 8);
   const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, 300);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt2(input.maxChars ?? 12e3, 500, 6e4);
+  const maxChars = clampInt2(input.maxChars ?? 8e3, 500, 6e4);
+  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
   const normalized = [];
   for (let i = 0; i < input.commands.length; i++) {
     const raw = input.commands[i];
@@ -2767,13 +2973,22 @@ $ ${spec.command}
 ${body}`;
   });
   const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const fittedBlocks = fitSectionsToBudget(blocks, bodyBudget, "\n\n");
-  const text = truncateWithNotice(
+  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
+  const fittedBlocks = fitSectionsToByteBudget(
+    blocks,
+    bodyBudget,
+    bodyByteBudget,
+    "\n\n"
+  );
+  let text = truncateWithNotice(
     `${summaryHeader}
 
 ${fittedBlocks}`,
     maxChars
   );
+  if (maxBytes !== void 0) {
+    text = truncateWithByteNotice(text, maxBytes);
+  }
   return { text, isError: false };
 }
 function clampInt2(val, min, max) {
@@ -2847,7 +3062,7 @@ function createAgyFastServer() {
             type: "integer",
             minimum: 500,
             maximum: 6e4,
-            description: "Total character cap for combined results (default 12000)."
+            description: "Total character cap for combined results (default 8500, inline UTF-8 capped <= 8800 bytes)."
           }
         },
         required: ["queries"]
@@ -2916,6 +3131,10 @@ function createAgyFastServer() {
             type: "boolean",
             description: "Validate all hunks without writing files (default false)."
           },
+          bestEffort: {
+            type: "boolean",
+            description: "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
+          },
           verify: {
             type: "string",
             description: "Optional shell command run right after writing (e.g. 'npm run typecheck')."
@@ -2977,7 +3196,7 @@ function createAgyFastServer() {
             type: "integer",
             minimum: 1e3,
             maximum: 8e4,
-            description: "Total character cap across all outlines and slices (default 24000)."
+            description: "Total character cap across all outlines and slices (default 8500, inline UTF-8 capped <= 8800 bytes)."
           }
         }
       }
@@ -3029,7 +3248,7 @@ function createAgyFastServer() {
             type: "integer",
             minimum: 500,
             maximum: 6e4,
-            description: "Total character cap (default 12000)."
+            description: "Total character cap (default 8000, inline UTF-8 capped <= 8800 bytes)."
           }
         },
         required: ["commands"]
