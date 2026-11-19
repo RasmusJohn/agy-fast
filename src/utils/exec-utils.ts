@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export interface ExecResult {
   exitCode: number | null;
@@ -19,6 +19,102 @@ export interface ExecOptions {
 }
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MiB
+
+const WINDOWS_CODEPAGE_LABELS: Record<number, string> = {
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1252: "windows-1252",
+  1251: "windows-1251",
+  1250: "windows-1250",
+  1254: "windows-1254",
+  1256: "windows-1256",
+  65001: "utf-8",
+};
+
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+let cachedWindowsFallbackEncoding: string | null | undefined;
+const fallbackDecoderCache = new Map<string, TextDecoder>();
+
+function stripTrailingIncompleteUtf8(buf: Buffer): Buffer {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i]! & 0xc0) === 0x80) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i]!;
+  if ((lead & 0x80) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 0xe0) === 0xc0) expectedLen = 2;
+  else if ((lead & 0xf0) === 0xe0) expectedLen = 3;
+  else if ((lead & 0xf8) === 0xf0) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+
+function getWindowsFallbackEncoding(): string | null {
+  if (cachedWindowsFallbackEncoding !== undefined) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const res = spawnSync("chcp.com", [], {
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true,
+    });
+    const match = /(\d{3,5})/.exec(res.stdout || "");
+    if (match) {
+      const cp = Number.parseInt(match[1]!, 10);
+      const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+      if (mapped && mapped !== "utf-8") {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+    // Ignore probe errors and fall back to UTF-8
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+
+/**
+ * Decodes child-process stdout/stderr buffers as UTF-8 first, falling back to
+ * the Windows active console codepage (e.g. `gb18030` for CP936) only when
+ * non-UTF-8 bytes are present.
+ */
+export function decodeProcessOutput(
+  buf: Buffer,
+  truncated = false,
+  fallbackEncoding?: string,
+): string {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label =
+      fallbackEncoding ??
+      (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 
 function killChildTree(pid: number | undefined, detached: boolean): void {
   if (!pid) return;
@@ -271,8 +367,8 @@ function spawnAndCollect(
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), truncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), truncated),
         truncated,
         error,
       });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
 import {
+  decodeProcessOutput,
   formatPowerShellCommand,
   needsPowerShellOnWindows,
   resetWindowsShellCache,
@@ -194,6 +195,19 @@ describe("run_checks", () => {
     }
   });
 
+  it("decodes UTF-8, truncated UTF-8 tails, and legacy codepage buffers cleanly", () => {
+    const utf8 = Buffer.from("中文 UTF-8 输出 OK", "utf8");
+    assert.equal(decodeProcessOutput(utf8, false, "gb18030"), "中文 UTF-8 输出 OK");
+
+    // Simulate maxOutputBytes cutting a 3-byte UTF-8 character mid-sequence
+    const midCut = Buffer.concat([Buffer.from("中文", "utf8"), Buffer.from([0xe8, 0xbe])]);
+    assert.equal(decodeProcessOutput(midCut, true, "gb18030"), "中文");
+
+    // GBK bytes for "'x' 不是"
+    const gbk = Buffer.from("27782720b2bbcac7", "hex");
+    assert.equal(decodeProcessOutput(gbk, false, "gb18030"), "'x' 不是");
+  });
+
   if (process.platform === "win32") {
     it("executes PowerShell $env: variables and cmdlets cleanly on Windows", async () => {
       const prev = process.env.AGY_FAST_PWSH_TEST;
@@ -210,11 +224,16 @@ describe("run_checks", () => {
               name: "win-ps-cmdlet",
               command: "Write-Output $env:AGY_FAST_PWSH_TEST",
             },
+            {
+              name: "win-missing-cmd-encoding",
+              command: "agy_fast_nonexistent_cmd_xyz --version",
+            },
           ],
         });
         assert.equal(res.isError, false);
-        assert.match(res.text, /Checks: 2\/2 passed/);
+        assert.match(res.text, /Checks: 2\/3 passed, 1 failed/);
         assert.match(res.text, /pwsh_env_expanded_ok/);
+        assert.doesNotMatch(res.text, /\uFFFD/);
       } finally {
         if (prev === undefined) {
           delete process.env.AGY_FAST_PWSH_TEST;

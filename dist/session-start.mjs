@@ -11,8 +11,87 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1252: "windows-1252",
+  1251: "windows-1251",
+  1250: "windows-1250",
+  1254: "windows-1254",
+  1256: "windows-1256",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const res = spawnSync("chcp.com", [], {
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    const match = /(\d{3,5})/.exec(res.stdout || "");
+    if (match) {
+      const cp = Number.parseInt(match[1], 10);
+      const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+      if (mapped && mapped !== "utf-8") {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -109,8 +188,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), truncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), truncated),
         truncated,
         error
       });
