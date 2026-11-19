@@ -91,6 +91,37 @@ Paste this prompt into Antigravity:
 Clone https://github.com/INK-Q/agy-fast.git to ~/.gemini/config/plugins/agy-fast, run `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor`, and enable the agy-fast plugin.
 ```
 
+### Update to Latest Version
+
+Updating is idempotent and does **not** require `npm install` (pre-built `dist/*.mjs` bundles are included):
+
+- **Installed via One-Command Installer (recommended)** — re-run the same one-liner to pull the latest `main`, overwrite runtime files, and run `doctor`:
+  ```bash
+  # macOS / Linux
+  curl -fsSL https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.sh | sh
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
+  ```
+- **Installed via Direct `git clone` into `~/.gemini/config/plugins/agy-fast`**:
+  ```bash
+  # macOS / Linux
+  git -C ~/.gemini/config/plugins/agy-fast pull --ff-only && node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  git -C "$env:USERPROFILE\.gemini\config\plugins\agy-fast" pull --ff-only; node "$env:USERPROFILE\.gemini\config\plugins\agy-fast\scripts\install.mjs" doctor
+  ```
+- **Installed from a Local Clone or Per-Project (`--project`)**:
+  ```bash
+  cd agy-fast && git pull --ff-only
+  node scripts/install.mjs install                     # global install
+  # or: node scripts/install.mjs install --project /path/to/your-repo
+  ```
+
+> **Applying updates**: Start a new session in Antigravity CLI (`agy`), or reload/restart Antigravity Desktop / IDE so the persistent MCP server reloads the updated `dist/*.mjs` bundles and `rules/AGENTS.md`.
+
 ### Verify / Uninstall
 
 ```bash
@@ -136,6 +167,9 @@ node dist/benchmark.mjs analyze --local
 
 # Analyze only the 10 most recently modified local transcripts
 node dist/benchmark.mjs analyze --local --recent 10
+
+# Slice resumed & new sessions since plugin install and compare With vs. Without agy-fast
+node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --split-usage
 
 # Compare two task runs (without vs. with agy-fast)
 node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after ./run-after/transcript.jsonl

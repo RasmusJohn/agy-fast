@@ -607,8 +607,61 @@ function parseTranscriptJsonl(content) {
   }
   return steps;
 }
+function extractAgyFastToolName(call) {
+  const name = call.name ?? "";
+  if (name === "call_mcp_tool") {
+    const callArgs = getCallArgs(call);
+    const serverName = unwrapJsonString(
+      callArgs?.ServerName ?? callArgs?.serverName ?? callArgs?.server_name ?? ""
+    );
+    const toolName = unwrapJsonString(
+      callArgs?.ToolName ?? callArgs?.toolName ?? callArgs?.tool_name ?? ""
+    );
+    const isFastServer = !serverName || /(?:^|[_:/-])fast$/i.test(serverName) || /agy-fast/i.test(serverName);
+    const m2 = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
+    return m2?.[1] ?? null;
+  }
+  const m = AGY_FAST_TOOL_RE.exec(name);
+  return m?.[1] ?? null;
+}
+function sessionHasStartupSnapshot(steps) {
+  for (const step of steps) {
+    if (typeof step.content !== "string") continue;
+    if (!step.content.includes("[agy-fast startup snapshot]")) continue;
+    if (step.type === "SYSTEM_MESSAGE") return true;
+    if (step.type === "USER_INPUT" && step.content.includes("SessionStart")) {
+      return true;
+    }
+  }
+  return false;
+}
+function sessionUsesAgyFast(steps) {
+  for (const step of steps) {
+    if (step.type !== "PLANNER_RESPONSE" || !Array.isArray(step.tool_calls)) {
+      continue;
+    }
+    for (const call of step.tool_calls) {
+      if (extractAgyFastToolName(call) !== null) return true;
+    }
+  }
+  return false;
+}
+function filterStepsByTime(steps, sinceMs, untilMs) {
+  if (sinceMs === void 0 && untilMs === void 0) return steps;
+  const out = [];
+  for (const step of steps) {
+    const ms = parseTimeMs(step.created_at);
+    if (ms === null) continue;
+    if (sinceMs !== void 0 && ms < sinceMs) continue;
+    if (untilMs !== void 0 && ms > untilMs) continue;
+    out.push(step);
+  }
+  return out;
+}
 function analyzeTranscriptSessions(sessions) {
   let validSessions = 0;
+  let sessionsWithAgyFast = 0;
+  let sessionsWithSnapshot = 0;
   let llmTurns = 0;
   let toolTurns = 0;
   let singleToolTurns = 0;
@@ -639,6 +692,7 @@ function analyzeTranscriptSessions(sessions) {
   for (const steps of sessions) {
     if (steps.length === 0) continue;
     let hasPlanner = false;
+    let sessionFastCalls = 0;
     let prevSingleToolName = null;
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
@@ -713,22 +767,11 @@ function analyzeTranscriptSessions(sessions) {
             if (isReadonlySearchShell(cmd)) {
               readonlySearchRunCommandCalls += 1;
             }
-          } else if (name === "call_mcp_tool") {
-            const serverName = unwrapJsonString(
-              callArgs?.ServerName ?? callArgs?.serverName ?? callArgs?.server_name ?? ""
-            );
-            const toolName = unwrapJsonString(
-              callArgs?.ToolName ?? callArgs?.toolName ?? callArgs?.tool_name ?? ""
-            );
-            const isFastServer = !serverName || /(?:^|[_:/-])fast$/i.test(serverName) || /agy-fast/i.test(serverName);
-            const m = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
-            if (m && m[1] && agyFastToolCalls[m[1]] !== void 0) {
-              agyFastToolCalls[m[1]] = (agyFastToolCalls[m[1]] ?? 0) + 1;
-            }
           } else {
-            const m = AGY_FAST_TOOL_RE.exec(name);
-            if (m && m[1] && agyFastToolCalls[m[1]] !== void 0) {
-              agyFastToolCalls[m[1]] = (agyFastToolCalls[m[1]] ?? 0) + 1;
+            const fastTool = extractAgyFastToolName(call);
+            if (fastTool && agyFastToolCalls[fastTool] !== void 0) {
+              agyFastToolCalls[fastTool] = (agyFastToolCalls[fastTool] ?? 0) + 1;
+              sessionFastCalls += 1;
             }
           }
         }
@@ -777,10 +820,16 @@ function analyzeTranscriptSessions(sessions) {
         }
       }
     }
-    if (hasPlanner) validSessions += 1;
+    if (hasPlanner) {
+      validSessions += 1;
+      if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
+      if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
+    }
   }
   return {
     sessions: validSessions,
+    sessionsWithAgyFast,
+    sessionsWithSnapshot,
     llmTurns,
     toolTurns,
     totalToolCalls,
@@ -957,10 +1006,19 @@ async function sortFilesByRecentMtime(files) {
   );
   return withMtime.map((x) => x.file);
 }
-async function analyzePaths(inputs, options = {}) {
-  const recent = options.recent;
+async function loadFilteredSessions(inputs, options = {}) {
+  const { recent, sinceMs, untilMs } = options;
   if (recent !== void 0 && (!Number.isSafeInteger(recent) || recent < 1)) {
     throw new RangeError("recent must be a positive integer");
+  }
+  if (sinceMs !== void 0 && !Number.isFinite(sinceMs)) {
+    throw new RangeError("sinceMs must be a valid finite timestamp");
+  }
+  if (untilMs !== void 0 && !Number.isFinite(untilMs)) {
+    throw new RangeError("untilMs must be a valid finite timestamp");
+  }
+  if (sinceMs !== void 0 && untilMs !== void 0 && sinceMs > untilMs) {
+    throw new RangeError("sinceMs must be less than or equal to untilMs");
   }
   const files = await collectTranscriptFiles(inputs);
   const orderedFiles = recent !== void 0 ? await sortFilesByRecentMtime(files) : files;
@@ -968,18 +1026,36 @@ async function analyzePaths(inputs, options = {}) {
   for (const file of orderedFiles) {
     try {
       const content = await fs.readFile(file, "utf8");
-      const steps = parseTranscriptJsonl(content);
-      if (recent !== void 0) {
-        if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
-        sessions.push(steps);
-        if (sessions.length >= recent) break;
-      } else {
-        sessions.push(steps);
-      }
+      const rawSteps = parseTranscriptJsonl(content);
+      const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
+      if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
+      sessions.push(steps);
+      if (recent !== void 0 && sessions.length >= recent) break;
     } catch {
     }
   }
+  return sessions;
+}
+async function analyzePaths(inputs, options = {}) {
+  const sessions = await loadFilteredSessions(inputs, options);
   return analyzeTranscriptSessions(sessions);
+}
+async function analyzePathsByUsage(inputs, options = {}) {
+  const sessions = await loadFilteredSessions(inputs, options);
+  const withFastSessions = [];
+  const withoutFastSessions = [];
+  for (const s of sessions) {
+    if (sessionUsesAgyFast(s)) {
+      withFastSessions.push(s);
+    } else {
+      withoutFastSessions.push(s);
+    }
+  }
+  return {
+    overall: analyzeTranscriptSessions(sessions),
+    withAgyFast: analyzeTranscriptSessions(withFastSessions),
+    withoutAgyFast: analyzeTranscriptSessions(withoutFastSessions)
+  };
 }
 function formatMetricsMarkdown(m) {
   const fastTotal = Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
@@ -991,6 +1067,7 @@ function formatMetricsMarkdown(m) {
     "| Metric | Value |",
     "| :--- | ---: |",
     `| Sessions | ${m.sessions} |`,
+    `| Sessions using agy-fast | ${m.sessionsWithAgyFast}/${m.sessions} (snapshot: ${m.sessionsWithSnapshot}) |`,
     `| LLM turns | ${m.llmTurns} |`,
     `| Tool calls | ${m.totalToolCalls} |`,
     `| Active time (s) | ${m.activeTimeSec.toFixed(1)} |`,
@@ -1009,27 +1086,53 @@ function formatMetricsMarkdown(m) {
     `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`
   ].join("\n");
 }
+function formatDelta(before, after) {
+  if (before === 0) return after === 0 ? "0.0%" : "n/a";
+  const d = (after - before) / before * 100;
+  return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`;
+}
 function formatCompareMarkdown(before, after) {
-  const delta = (b, a) => {
-    if (b === 0) return a === 0 ? "0.0%" : "n/a";
-    const d = (a - b) / b * 100;
-    return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`;
-  };
   return [
     "# agy-fast A/B Comparison",
     "",
     "| Metric | Before | After | Change |",
     "| :--- | ---: | ---: | ---: |",
     `| Sessions | ${before.sessions} | ${after.sessions} | - |`,
-    `| LLM turns | ${before.llmTurns} | ${after.llmTurns} | ${delta(before.llmTurns, after.llmTurns)} |`,
-    `| Tool calls | ${before.totalToolCalls} | ${after.totalToolCalls} | ${delta(before.totalToolCalls, after.totalToolCalls)} |`,
-    `| Active time (s) | ${before.activeTimeSec.toFixed(1)} | ${after.activeTimeSec.toFixed(1)} | ${delta(before.activeTimeSec, after.activeTimeSec)} |`,
-    `| Tool execution time (s) | ${before.toolExecTimeSec.toFixed(1)} | ${after.toolExecTimeSec.toFixed(1)} | ${delta(before.toolExecTimeSec, after.toolExecTimeSec)} |`,
-    `| Effective throughput (tok/s) | ${before.effectiveTps.toFixed(1)} | ${after.effectiveTps.toFixed(1)} | ${delta(before.effectiveTps, after.effectiveTps)} |`,
-    `| Single-tool turn ratio | ${pct(before.singleToolTurnRatio)} | ${pct(after.singleToolTurnRatio)} | ${delta(before.singleToolTurnRatio, after.singleToolTurnRatio)} |`,
-    `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${delta(before.avgContextTokens, after.avgContextTokens)} |`,
-    `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${delta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
-    `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${delta(before.over60sGapRatio, after.over60sGapRatio)} |`
+    `| LLM turns | ${before.llmTurns} | ${after.llmTurns} | ${formatDelta(before.llmTurns, after.llmTurns)} |`,
+    `| Tool calls | ${before.totalToolCalls} | ${after.totalToolCalls} | ${formatDelta(before.totalToolCalls, after.totalToolCalls)} |`,
+    `| Active time (s) | ${before.activeTimeSec.toFixed(1)} | ${after.activeTimeSec.toFixed(1)} | ${formatDelta(before.activeTimeSec, after.activeTimeSec)} |`,
+    `| Tool execution time (s) | ${before.toolExecTimeSec.toFixed(1)} | ${after.toolExecTimeSec.toFixed(1)} | ${formatDelta(before.toolExecTimeSec, after.toolExecTimeSec)} |`,
+    `| Effective throughput (tok/s) | ${before.effectiveTps.toFixed(1)} | ${after.effectiveTps.toFixed(1)} | ${formatDelta(before.effectiveTps, after.effectiveTps)} |`,
+    `| Single-tool turn ratio | ${pct(before.singleToolTurnRatio)} | ${pct(after.singleToolTurnRatio)} | ${formatDelta(before.singleToolTurnRatio, after.singleToolTurnRatio)} |`,
+    `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
+    `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
+    `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`
+  ].join("\n");
+}
+function formatUsageSplitMarkdown(split) {
+  const { overall, withoutAgyFast: wo, withAgyFast: wf } = split;
+  const editRed = (m) => m.editFileCalls > 0 ? m.redundantSameTurnEditFileCalls / m.editFileCalls : 0;
+  const roShell = (m) => m.runCommandCalls > 0 ? m.readonlySearchRunCommandCalls / m.runCommandCalls : 0;
+  const fastSum = (m) => Object.values(m.agyFastToolCalls).reduce((a, b) => a + b, 0);
+  return [
+    "# agy-fast Usage Split Benchmark",
+    "",
+    "| Metric | Overall | Without agy-fast | With agy-fast | With vs Without |",
+    "| :--- | ---: | ---: | ---: | ---: |",
+    `| Sessions | ${overall.sessions} | ${wo.sessions} | ${wf.sessions} | - |`,
+    `| Sessions with snapshot | ${overall.sessionsWithSnapshot} | ${wo.sessionsWithSnapshot} | ${wf.sessionsWithSnapshot} | - |`,
+    `| LLM turns | ${overall.llmTurns} | ${wo.llmTurns} | ${wf.llmTurns} | - |`,
+    `| Tool calls | ${overall.totalToolCalls} | ${wo.totalToolCalls} | ${wf.totalToolCalls} | - |`,
+    `| Active time (s) | ${overall.activeTimeSec.toFixed(1)} | ${wo.activeTimeSec.toFixed(1)} | ${wf.activeTimeSec.toFixed(1)} | - |`,
+    `| Multi-tool stream wait (s) | ${overall.streamWaitSec.toFixed(1)} | ${wo.streamWaitSec.toFixed(1)} | ${wf.streamWaitSec.toFixed(1)} | - |`,
+    `| Effective throughput (tok/s) | ${overall.effectiveTps.toFixed(1)} | ${wo.effectiveTps.toFixed(1)} | ${wf.effectiveTps.toFixed(1)} | ${formatDelta(wo.effectiveTps, wf.effectiveTps)} |`,
+    `| Single-tool turn ratio | ${pct(overall.singleToolTurnRatio)} | ${pct(wo.singleToolTurnRatio)} | ${pct(wf.singleToolTurnRatio)} | ${formatDelta(wo.singleToolTurnRatio, wf.singleToolTurnRatio)} |`,
+    `| Redundant same-turn edit_file ratio | ${pct(editRed(overall))} | ${pct(editRed(wo))} | ${pct(editRed(wf))} | ${formatDelta(editRed(wo), editRed(wf))} |`,
+    `| Read-only search shell ratio | ${pct(roShell(overall))} | ${pct(roShell(wo))} | ${pct(roShell(wf))} | ${formatDelta(roShell(wo), roShell(wf))} |`,
+    `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
+    `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
+    `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
+    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`
   ].join("\n");
 }
 
@@ -1052,18 +1155,28 @@ function parsePositiveInt(raw) {
   if (!Number.isSafeInteger(n) || n < 1) return null;
   return n;
 }
+function parseIsoTimestamp(raw, endOfDayIfDateOnly = false) {
+  const trimmed = raw.trim();
+  if (!trimmed || !/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(trimmed)) return null;
+  const normalized = endOfDayIfDateOnly && /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? `${trimmed}T23:59:59.999Z` : trimmed;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
 function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node dist/benchmark.mjs analyze <path...> [--recent <N>] [--json]",
-      "  node dist/benchmark.mjs analyze --local [--recent <N>] [--json]",
+      "  node dist/benchmark.mjs analyze <path...> [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
+      "  node dist/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
       "  node dist/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
-      "  --local       Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
-      "  --recent <N>  Analyze only the N most recently modified transcripts",
-      "  --json        Output raw JSON metrics"
+      "  --local        Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
+      "  --recent <N>   Analyze only the N most recently modified transcripts",
+      "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
+      "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
+      "  --split-usage  Split metrics into sessions with vs. without agy-fast tool calls",
+      "  --json         Output raw JSON metrics"
     ].join("\n") + "\n"
   );
 }
@@ -1078,6 +1191,9 @@ async function main(argv) {
     const targets = [];
     const explicitTargets = [];
     let recent;
+    let sinceMs;
+    let untilMs;
+    let splitUsage = false;
     let asJson = false;
     let afterDoubleDash = false;
     for (let i = 1; i < args.length; i++) {
@@ -1088,6 +1204,10 @@ async function main(argv) {
       }
       if (!afterDoubleDash && a === "--json") {
         asJson = true;
+        continue;
+      }
+      if (!afterDoubleDash && a === "--split-usage") {
+        splitUsage = true;
         continue;
       }
       if (!afterDoubleDash && a === "--local") {
@@ -1108,6 +1228,28 @@ async function main(argv) {
         recent = parsed;
         continue;
       }
+      if (!afterDoubleDash && (a === "--since" || a.startsWith("--since="))) {
+        const raw = a === "--since" ? args[++i] : a.slice("--since=".length);
+        const parsed = raw !== void 0 ? parseIsoTimestamp(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --since must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        sinceMs = parsed;
+        continue;
+      }
+      if (!afterDoubleDash && (a === "--until" || a.startsWith("--until="))) {
+        const raw = a === "--until" ? args[++i] : a.slice("--until=".length);
+        const parsed = raw !== void 0 ? parseIsoTimestamp(raw, true) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --until must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        untilMs = parsed;
+        continue;
+      }
       if (!afterDoubleDash && a.startsWith("-")) {
         process.stderr.write(`Error: unknown option: ${a}
 `);
@@ -1122,14 +1264,29 @@ async function main(argv) {
       process.exitCode = 1;
       return;
     }
+    if (sinceMs !== void 0 && untilMs !== void 0 && sinceMs > untilMs) {
+      process.stderr.write("Error: --since must be earlier than or equal to --until\n");
+      process.exitCode = 1;
+      return;
+    }
     if (explicitTargets.length > 0 && !await assertPathsExist(explicitTargets)) {
       process.exitCode = 1;
       return;
     }
-    const metrics = await analyzePaths(
-      targets,
-      recent !== void 0 ? { recent } : {}
-    );
+    const opts = {};
+    if (recent !== void 0) opts.recent = recent;
+    if (sinceMs !== void 0) opts.sinceMs = sinceMs;
+    if (untilMs !== void 0) opts.untilMs = untilMs;
+    if (splitUsage) {
+      const split = await analyzePathsByUsage(targets, opts);
+      process.stdout.write(
+        asJson ? `${JSON.stringify(split, null, 2)}
+` : `${formatUsageSplitMarkdown(split)}
+`
+      );
+      return;
+    }
+    const metrics = await analyzePaths(targets, opts);
     process.stdout.write(
       asJson ? `${JSON.stringify(metrics, null, 2)}
 ` : `${formatMetricsMarkdown(metrics)}

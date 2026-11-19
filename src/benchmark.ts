@@ -3,8 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   analyzePaths,
+  analyzePathsByUsage,
   formatCompareMarkdown,
   formatMetricsMarkdown,
+  formatUsageSplitMarkdown,
+  type AnalyzeOptions,
 } from "./benchmark-core.js";
 
 async function assertPathsExist(paths: string[]): Promise<boolean> {
@@ -26,18 +29,32 @@ function parsePositiveInt(raw: string): number | null {
   return n;
 }
 
+function parseIsoTimestamp(raw: string, endOfDayIfDateOnly = false): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed || !/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(trimmed)) return null;
+  const normalized =
+    endOfDayIfDateOnly && /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+      ? `${trimmed}T23:59:59.999Z`
+      : trimmed;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function printUsage(): void {
   process.stdout.write(
     [
       "Usage:",
-      "  node dist/benchmark.mjs analyze <path...> [--recent <N>] [--json]",
-      "  node dist/benchmark.mjs analyze --local [--recent <N>] [--json]",
+      "  node dist/benchmark.mjs analyze <path...> [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
+      "  node dist/benchmark.mjs analyze --local [--recent <N>] [--since <ISO>] [--until <ISO>] [--split-usage] [--json]",
       "  node dist/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
-      "  --local       Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
-      "  --recent <N>  Analyze only the N most recently modified transcripts",
-      "  --json        Output raw JSON metrics",
+      "  --local        Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
+      "  --recent <N>   Analyze only the N most recently modified transcripts",
+      "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
+      "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
+      "  --split-usage  Split metrics into sessions with vs. without agy-fast tool calls",
+      "  --json         Output raw JSON metrics",
     ].join("\n") + "\n",
   );
 }
@@ -55,6 +72,9 @@ async function main(argv: string[]): Promise<void> {
     const targets: string[] = [];
     const explicitTargets: string[] = [];
     let recent: number | undefined;
+    let sinceMs: number | undefined;
+    let untilMs: number | undefined;
+    let splitUsage = false;
     let asJson = false;
     let afterDoubleDash = false;
     for (let i = 1; i < args.length; i++) {
@@ -65,6 +85,10 @@ async function main(argv: string[]): Promise<void> {
       }
       if (!afterDoubleDash && a === "--json") {
         asJson = true;
+        continue;
+      }
+      if (!afterDoubleDash && a === "--split-usage") {
+        splitUsage = true;
         continue;
       }
       if (!afterDoubleDash && a === "--local") {
@@ -85,6 +109,28 @@ async function main(argv: string[]): Promise<void> {
         recent = parsed;
         continue;
       }
+      if (!afterDoubleDash && (a === "--since" || a.startsWith("--since="))) {
+        const raw = a === "--since" ? args[++i] : a.slice("--since=".length);
+        const parsed = raw !== undefined ? parseIsoTimestamp(raw) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --since must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        sinceMs = parsed;
+        continue;
+      }
+      if (!afterDoubleDash && (a === "--until" || a.startsWith("--until="))) {
+        const raw = a === "--until" ? args[++i] : a.slice("--until=".length);
+        const parsed = raw !== undefined ? parseIsoTimestamp(raw, true) : null;
+        if (parsed === null) {
+          process.stderr.write("Error: --until must be a valid ISO-8601 date or timestamp\n");
+          process.exitCode = 1;
+          return;
+        }
+        untilMs = parsed;
+        continue;
+      }
       if (!afterDoubleDash && a.startsWith("-")) {
         process.stderr.write(`Error: unknown option: ${a}\n`);
         process.exitCode = 1;
@@ -98,14 +144,31 @@ async function main(argv: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
+    if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) {
+      process.stderr.write("Error: --since must be earlier than or equal to --until\n");
+      process.exitCode = 1;
+      return;
+    }
     if (explicitTargets.length > 0 && !(await assertPathsExist(explicitTargets))) {
       process.exitCode = 1;
       return;
     }
-    const metrics = await analyzePaths(
-      targets,
-      recent !== undefined ? { recent } : {},
-    );
+    const opts: AnalyzeOptions = {};
+    if (recent !== undefined) opts.recent = recent;
+    if (sinceMs !== undefined) opts.sinceMs = sinceMs;
+    if (untilMs !== undefined) opts.untilMs = untilMs;
+
+    if (splitUsage) {
+      const split = await analyzePathsByUsage(targets, opts);
+      process.stdout.write(
+        asJson
+          ? `${JSON.stringify(split, null, 2)}\n`
+          : `${formatUsageSplitMarkdown(split)}\n`,
+      );
+      return;
+    }
+
+    const metrics = await analyzePaths(targets, opts);
     process.stdout.write(
       asJson
         ? `${JSON.stringify(metrics, null, 2)}\n`

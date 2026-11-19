@@ -6,6 +6,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   analyzePaths,
+  analyzePathsByUsage,
   analyzeTranscriptSessions,
   collectTranscriptFiles,
   parseTranscriptJsonl,
@@ -586,6 +587,10 @@ describe("benchmark analyzer & CLI", () => {
       ["analyze", recentDir, "--recent", "-2"],
       ["analyze", recentDir, "--recent", "abc"],
       ["analyze", recentDir, "--recent=1.5"],
+      ["analyze", recentDir, "--since"],
+      ["analyze", recentDir, "--since", "not-a-date"],
+      ["analyze", recentDir, "--until", "12345"],
+      ["analyze", recentDir, "--since", "2026-11-20T00:00:00Z", "--until", "2026-11-19T00:00:00Z"],
       ["analyze", recentDir, "--unknown-flag"],
       ["compare", "--before", "--after", fNew],
       ["compare", "--before", fOld, "--after", fNew, "--unknown"],
@@ -596,5 +601,160 @@ describe("benchmark analyzer & CLI", () => {
         });
       });
     }
+  });
+
+  it("supports --since, --until, and --split-usage for resumed sessions and accurate snapshot detection", async () => {
+    const splitDir = path.join(tmpDir, "split-usage-sessions");
+    await fs.mkdir(splitDir, { recursive: true });
+
+    // Resumed session: old pre-plugin steps (Oct 26) + post-plugin steps (Nov 19) using agy-fast
+    // Also includes a GENERIC read_file output containing the literal string "[agy-fast startup snapshot]"
+    // which must NOT be miscounted as a SessionStart hook injection.
+    const resumedFile = path.join(splitDir, "resumed-fast.jsonl");
+    await fs.writeFile(
+      resumedFile,
+      [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-10-26T10:00:00Z",
+          output_tokens: 900,
+          tool_calls: [{ name: "run_command", args: { CommandLine: "rg old src/" } }],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-10-26T10:00:10Z",
+          content: "old output",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T05:30:00Z",
+          output_tokens: 400,
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: '"agy-fast_fast"',
+                ToolName: '"apply_edits"',
+                Arguments: "{}",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T05:30:06Z",
+          content: "source code reading `[agy-fast startup snapshot]` literal",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T05:30:08Z",
+          output_tokens: 200,
+          tool_calls: [],
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // Post-plugin session that got SessionStart snapshot but made 0 agy-fast calls (e.g. /boost subagent)
+    const snapOnlyFile = path.join(splitDir, "snapshot-no-fast.jsonl");
+    await fs.writeFile(
+      snapOnlyFile,
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-19T05:05:00Z",
+          content: "The following system message was injected by a SessionStart hook:\n[agy-fast startup snapshot] Workspace: /repo",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T05:05:02Z",
+          output_tokens: 300,
+          tool_calls: [
+            { name: "edit_file", args: { Path: "/repo/a.ts" } },
+            { name: "edit_file", args: { Path: "/repo/a.ts" } },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T05:05:10Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T05:05:14Z",
+          output_tokens: 100,
+          tool_calls: [],
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // Pure old session completely before --since
+    const oldOnlyFile = path.join(splitDir, "old-only.jsonl");
+    await fs.writeFile(
+      oldOnlyFile,
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-10-20T08:00:00Z",
+        output_tokens: 777,
+        tool_calls: [],
+      }) + "\n",
+      "utf8",
+    );
+
+    const splitJson = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          BENCHMARK_CLI,
+          "analyze",
+          splitDir,
+          "--since",
+          "2026-11-19T05:00:00Z",
+          "--until",
+          "2026-11-19",
+          "--split-usage",
+          "--json",
+        ],
+        { encoding: "utf8" },
+      ),
+    );
+
+    // old-only excluded, Oct 26 turn in resumed-fast excluded
+    assert.equal(splitJson.overall.sessions, 2);
+    assert.equal(splitJson.overall.sessionsWithAgyFast, 1);
+    assert.equal(splitJson.overall.sessionsWithSnapshot, 1); // only snapOnlyFile, NOT GENERIC read_file
+    assert.equal(splitJson.overall.totalOutputTokens, 1000); // 400+200 + 300+100
+    assert.equal(splitJson.overall.readonlySearchRunCommandCalls, 0); // Oct 26 rg excluded
+
+    assert.equal(splitJson.withAgyFast.sessions, 1);
+    assert.equal(splitJson.withAgyFast.agyFastToolCalls.apply_edits, 1);
+    assert.equal(splitJson.withAgyFast.sessionsWithSnapshot, 0);
+    assert.equal(splitJson.withAgyFast.totalOutputTokens, 600);
+
+    assert.equal(splitJson.withoutAgyFast.sessions, 1);
+    assert.equal(splitJson.withoutAgyFast.sessionsWithSnapshot, 1);
+    assert.equal(splitJson.withoutAgyFast.redundantSameTurnEditFileCalls, 1);
+    assert.equal(splitJson.withoutAgyFast.totalOutputTokens, 400);
+
+    const splitMd = execFileSync(
+      process.execPath,
+      [
+        BENCHMARK_CLI,
+        "analyze",
+        splitDir,
+        "--since=2026-11-19T05:00:00Z",
+        "--split-usage",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.match(splitMd, /# agy-fast Usage Split Benchmark/);
+    assert.match(splitMd, /\| Sessions \| 2 \| 1 \| 1 \| - \|/);
+
+    const directSplit = await analyzePathsByUsage([splitDir], {
+      sinceMs: Date.parse("2026-11-19T05:00:00Z"),
+      untilMs: Date.parse("2026-11-19T23:59:59Z"),
+    });
+    assert.equal(directSplit.withAgyFast.sessions, 1);
+    assert.equal(directSplit.withoutAgyFast.sessions, 1);
   });
 });

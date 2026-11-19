@@ -75,14 +75,32 @@ async function getGitSummary(
   if (statusLines.length === 0) {
     parts.push("Working tree: clean");
   } else {
-    const shown = statusLines.slice(0, 20).map((l) => l.trim());
+    const prefix = `Modified (${statusLines.length}): `;
+    const maxModifiedChars = 260;
+    const maxItems = 8;
+    const shown: string[] = [];
+    let currentLen = prefix.length;
+    for (let i = 0; i < Math.min(statusLines.length, maxItems); i++) {
+      const raw = statusLines[i]!.trim();
+      const item = raw.length > 100 ? `${raw.slice(0, 97)}...` : raw;
+      const sepLen = shown.length > 0 ? 2 : 0;
+      const remainingAfter = statusLines.length - (i + 1);
+      const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
+      if (shown.length > 0 && currentLen + sepLen + item.length + moreReserve > maxModifiedChars) {
+        break;
+      }
+      shown.push(item);
+      currentLen += sepLen + item.length;
+    }
     const more =
-      statusLines.length > 20 ? ` (+${statusLines.length - 20} more)` : "";
-    parts.push(`Modified (${statusLines.length}): ${shown.join(", ")}${more}`);
+      shown.length < statusLines.length
+        ? ` (+${statusLines.length - shown.length} more)`
+        : "";
+    parts.push(`${prefix}${shown.join(", ")}${more}`);
   }
   if (logLines.length > 0) {
     parts.push(
-      `Recent commits:\n${logLines.map((l) => `  - ${l.slice(0, 90)}`).join("\n")}`,
+      `Recent commits:\n${logLines.map((l) => `  - ${l.slice(0, 72)}`).join("\n")}`,
     );
   }
   return parts.join("\n");
@@ -261,6 +279,25 @@ async function getProjectManifestSummary(workspaceDir: string): Promise<string |
   return `Project:\n${hints.map((h) => `  - ${h}`).join("\n")}`;
 }
 
+function fitSectionToChars(
+  section: string,
+  budget: number,
+  marker: string,
+): string {
+  if (budget <= 0) return "";
+  if (section.length <= budget) return section;
+  if (budget <= marker.length + 1) {
+    return section.slice(0, budget);
+  }
+  const cutoff = budget - marker.length - 1;
+  let trimmed = section.slice(0, cutoff);
+  const lastNl = trimmed.lastIndexOf("\n");
+  if (lastNl > 0) {
+    trimmed = trimmed.slice(0, lastNl);
+  }
+  return `${trimmed}\n${marker}`;
+}
+
 export async function buildWorkspaceSnapshot(
   workspaceDir: string,
   options: SnapshotOptions = {},
@@ -281,27 +318,65 @@ export async function buildWorkspaceSnapshot(
     getProjectManifestSummary(workspaceDir),
   ]);
 
-  const sections = [
-    `[agy-fast startup snapshot] Workspace: ${workspaceDir}`,
-    gitSummary,
-    projectSummary,
-    treeSummary,
-  ].filter((s): s is string => Boolean(s));
+  const header = `[agy-fast startup snapshot] Workspace: ${workspaceDir}`;
+  const sections = [header, gitSummary, projectSummary, treeSummary].filter(
+    (s): s is string => Boolean(s),
+  );
 
   if (sections.length <= 1) return null;
 
   const full = sections.join("\n");
   if (full.length <= maxChars) return full;
 
-  const suffix = "\n... [snapshot capped]";
-  if (maxChars <= suffix.length) {
-    return full.slice(0, Math.max(0, maxChars));
+  const suffix = "... [snapshot capped]";
+  if (maxChars <= header.length + suffix.length + 4) {
+    return fitSectionToChars(full, maxChars, suffix);
   }
-  const cutoff = maxChars - suffix.length;
-  let trimmed = full.slice(0, cutoff);
-  const lastNl = trimmed.lastIndexOf("\n");
-  if (lastNl > cutoff * 0.6) {
-    trimmed = trimmed.slice(0, lastNl);
+
+  // Allocate per-section budgets so a large dirty git status cannot erase Project or Layout
+  const remainingAfterHeader = maxChars - header.length;
+  const nonEmptyCount =
+    (gitSummary ? 1 : 0) + (projectSummary ? 1 : 0) + (treeSummary ? 1 : 0);
+  const availableForBodies = remainingAfterHeader - nonEmptyCount; // reserve \n separators
+
+  let projectPart = "";
+  let gitPart = "";
+  let treePart = "";
+  let budgetLeft = availableForBodies;
+
+  if (projectSummary) {
+    const otherPresent = Boolean(gitSummary || treeSummary);
+    const projectCap = otherPresent
+      ? Math.min(projectSummary.length, Math.max(80, Math.floor(availableForBodies * 0.25)))
+      : budgetLeft;
+    projectPart = fitSectionToChars(
+      projectSummary,
+      Math.min(budgetLeft, projectCap),
+      "  ... [project capped]",
+    );
+    budgetLeft -= projectPart.length;
   }
-  return `${trimmed}${suffix}`;
+
+  if (gitSummary && budgetLeft > 0) {
+    const gitCap = treeSummary
+      ? Math.min(gitSummary.length, Math.max(100, Math.floor(budgetLeft * 0.48)))
+      : budgetLeft;
+    gitPart = fitSectionToChars(
+      gitSummary,
+      Math.min(budgetLeft, gitCap),
+      "  ... [git capped]",
+    );
+    budgetLeft -= gitPart.length;
+  }
+
+  if (treeSummary && budgetLeft > 0) {
+    treePart = fitSectionToChars(treeSummary, budgetLeft, suffix);
+    budgetLeft -= treePart.length;
+  }
+
+  const assembled = [header, gitPart, projectPart, treePart]
+    .filter(Boolean)
+    .join("\n");
+  if (assembled.length <= maxChars) return assembled;
+  return fitSectionToChars(assembled, maxChars, suffix);
 }

@@ -141,4 +141,66 @@ describe("session-start hook", () => {
       await fs.rm(unbornDir, { recursive: true, force: true });
     }
   });
+
+  it("preserves Project and Layout sections even when a repo has 50+ long-path modified files", async () => {
+    const dirtyDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hook-dirty-"));
+    try {
+      await fs.mkdir(path.join(dirtyDir, "packages", "service-alpha", "src", "adapters", "very-deep-module"), {
+        recursive: true,
+      });
+      await fs.mkdir(path.join(dirtyDir, "docs"), { recursive: true });
+      await fs.writeFile(
+        path.join(dirtyDir, "package.json"),
+        JSON.stringify({
+          name: "monorepo-heavy",
+          scripts: { build: "tsc", test: "vitest", lint: "eslint ." },
+        }),
+        "utf8",
+      );
+      await fs.writeFile(path.join(dirtyDir, "docs", "README.md"), "# docs\n", "utf8");
+
+      // Create and commit 55 files with long paths, then modify all 55 (reproducing 139-file dirty workspace truncation)
+      const longFiles = Array.from({ length: 55 }, (_, i) =>
+        path.join(
+          dirtyDir,
+          "packages",
+          "service-alpha",
+          "src",
+          "adapters",
+          "very-deep-module",
+          `LongServiceAdapterImplementationFile_${String(i).padStart(2, "0")}.ts`,
+        ),
+      );
+      await Promise.all(
+        longFiles.map((f, i) => fs.writeFile(f, `export const idx = ${i};\n`, "utf8")),
+      );
+
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dirtyDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dirtyDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: dirtyDir });
+      execFileSync("git", ["add", "."], { cwd: dirtyDir });
+      execFileSync("git", ["commit", "-q", "-m", "feat: baseline commit with a fairly descriptive message for testing"], {
+        cwd: dirtyDir,
+      });
+
+      await Promise.all(
+        longFiles.map((f, i) => fs.writeFile(f, `export const idx = ${i + 100};\n`, "utf8")),
+      );
+
+      const res = await runHook(JSON.stringify({ cwd: dirtyDir, workspacePaths: [dirtyDir] }));
+      assert.equal(res.code, 0);
+      const parsed = JSON.parse(res.stdout);
+      const msg: string = parsed?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.equal(typeof msg, "string");
+      assert.ok(msg.length <= 1500, `Snapshot exceeded 1500 chars: ${msg.length}`);
+      assert.match(msg, /Git: branch `main`/);
+      assert.match(msg, /Modified \(55\):/);
+      assert.match(msg, /\(\+\d+ more\)/);
+      assert.match(msg, /Project:\n  - package\.json \(monorepo-heavy\) scripts: build, test, lint/);
+      assert.match(msg, /Layout \(2 levels\):/);
+      assert.match(msg, /packages\//);
+    } finally {
+      await fs.rm(dirtyDir, { recursive: true, force: true });
+    }
+  });
 });

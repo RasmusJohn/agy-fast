@@ -91,6 +91,37 @@ node scripts/install.mjs install --project /path/to/your-repo
 请将 https://github.com/INK-Q/agy-fast.git 克隆到 ~/.gemini/config/plugins/agy-fast，运行 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor` 验证可用性，并启用 agy-fast 插件。
 ```
 
+### 更新到最新版本
+
+更新操作幂等安全，且**无需执行 `npm install`**（仓库已附带最新 `dist/*.mjs` 产物）：
+
+- **通过「方式一：一行命令」安装（推荐）**——直接重新执行安装命令即可覆盖更新运行文件并自动自检：
+  ```bash
+  # macOS / Linux
+  curl -fsSL https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.sh | sh
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
+  ```
+- **通过「方式二：直接克隆到插件目录」安装**：
+  ```bash
+  # macOS / Linux
+  git -C ~/.gemini/config/plugins/agy-fast pull --ff-only && node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor
+  ```
+  ```powershell
+  # Windows (PowerShell)
+  git -C "$env:USERPROFILE\.gemini\config\plugins\agy-fast" pull --ff-only; node "$env:USERPROFILE\.gemini\config\plugins\agy-fast\scripts\install.mjs" doctor
+  ```
+- **通过本地克隆仓库或「方式四：按项目安装（`--project`）」安装**：
+  ```bash
+  cd agy-fast && git pull --ff-only
+  node scripts/install.mjs install                     # 更新全局安装
+  # 或更新指定仓库：node scripts/install.mjs install --project /path/to/your-repo
+  ```
+
+> **更新生效提示**：更新完成后，在 Antigravity CLI（`agy`）中开启新会话，或在桌面端 / IDE 中重启（或重载窗口），以重启常驻 MCP 服务并加载新版 `dist/*.mjs` 与 `rules/AGENTS.md`。
+
 ### 健康检查与卸载
 
 ```bash
@@ -136,6 +167,9 @@ node dist/benchmark.mjs analyze --local
 
 # 仅分析最近修改的 10 个本地会话（便于安装前后快速对比）
 node dist/benchmark.mjs analyze --local --recent 10
+
+# 按插件安装时间切分（兼容旧对话续聊），并对比“已用 vs 未用 agy-fast”的会话指标
+node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --split-usage
 
 # 对比同一任务在启用插件前后的指标变化
 node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./after/transcript.jsonl
