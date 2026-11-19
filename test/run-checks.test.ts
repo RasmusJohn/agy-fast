@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
+import {
+  formatPowerShellCommand,
+  needsPowerShellOnWindows,
+  resetWindowsShellCache,
+  resolveWindowsPowerShell,
+} from "../src/utils/exec-utils.js";
 
 describe("run_checks", () => {
   const nodeBin = JSON.stringify(process.execPath);
@@ -111,4 +117,111 @@ describe("run_checks", () => {
     assert.match(res.text, /npm ERR! code ELIFECYCLE/);
     assert.match(res.text, /FAIL_TWO_MARKER/);
   });
+
+  it("detects PowerShell syntax vs cross-platform commands and formats quoted executables", () => {
+    assert.equal(
+      needsPowerShellOnWindows('node "$env:USERPROFILE\\.gemini\\dist\\benchmark.mjs" --help'),
+      true,
+    );
+    assert.equal(
+      needsPowerShellOnWindows("Get-ChildItem src | Select-Object -First 5"),
+      true,
+    );
+    assert.equal(
+      needsPowerShellOnWindows("if (Test-Path dist) { Write-Output $LASTEXITCODE }"),
+      true,
+    );
+    assert.equal(needsPowerShellOnWindows("$x = 1; echo $x"), true);
+
+    assert.equal(needsPowerShellOnWindows("npm test"), false);
+    assert.equal(needsPowerShellOnWindows("npm run test-unit"), false);
+    assert.equal(
+      needsPowerShellOnWindows('"D:\\Program Files\\nodejs\\node.exe" -e "console.log(1)"'),
+      false,
+    );
+    assert.equal(needsPowerShellOnWindows("echo %USERPROFILE%"), false);
+    assert.equal(
+      needsPowerShellOnWindows('pwsh -NoProfile -Command "Write-Output ok"'),
+      false,
+    );
+
+    assert.equal(
+      formatPowerShellCommand('"$env:USERPROFILE\\bin\\tool.exe" --version'),
+      '& "$env:USERPROFILE\\bin\\tool.exe" --version',
+    );
+    assert.equal(formatPowerShellCommand('"hello" | Out-Null'), '"hello" | Out-Null');
+    assert.equal(
+      formatPowerShellCommand('node "$env:USERPROFILE\\a.js"'),
+      'node "$env:USERPROFILE\\a.js"',
+    );
+  });
+
+  it("resolves pwsh -> powershell.exe -> null fallback chain and caches probe results", async () => {
+    try {
+      resetWindowsShellCache();
+      const probed: string[] = [];
+      const first = await resolveWindowsPowerShell(async (bin) => {
+        probed.push(bin);
+        return bin === "pwsh";
+      });
+      const cached = await resolveWindowsPowerShell(async (bin) => {
+        probed.push(`unexpected-${bin}`);
+        return false;
+      });
+      assert.equal(first, "pwsh");
+      assert.equal(cached, "pwsh");
+      assert.deepEqual(probed, ["pwsh"]);
+
+      resetWindowsShellCache();
+      const fallbackProbed: string[] = [];
+      const second = await resolveWindowsPowerShell(async (bin) => {
+        fallbackProbed.push(bin);
+        return bin === "powershell.exe";
+      });
+      assert.equal(second, "powershell.exe");
+      assert.deepEqual(fallbackProbed, ["pwsh", "powershell.exe"]);
+
+      resetWindowsShellCache();
+      const noneProbed: string[] = [];
+      const third = await resolveWindowsPowerShell(async (bin) => {
+        noneProbed.push(bin);
+        return false;
+      });
+      assert.equal(third, null);
+      assert.deepEqual(noneProbed, ["pwsh", "powershell.exe"]);
+    } finally {
+      resetWindowsShellCache();
+    }
+  });
+
+  if (process.platform === "win32") {
+    it("executes PowerShell $env: variables and cmdlets cleanly on Windows", async () => {
+      const prev = process.env.AGY_FAST_PWSH_TEST;
+      process.env.AGY_FAST_PWSH_TEST = "pwsh_env_expanded_ok";
+      try {
+        const res = await runChecks({
+          outputMode: "full",
+          commands: [
+            {
+              name: "win-ps-env",
+              command: `${nodeBin} -e "console.log(process.argv[1])" "$env:AGY_FAST_PWSH_TEST"`,
+            },
+            {
+              name: "win-ps-cmdlet",
+              command: "Write-Output $env:AGY_FAST_PWSH_TEST",
+            },
+          ],
+        });
+        assert.equal(res.isError, false);
+        assert.match(res.text, /Checks: 2\/2 passed/);
+        assert.match(res.text, /pwsh_env_expanded_ok/);
+      } finally {
+        if (prev === undefined) {
+          delete process.env.AGY_FAST_PWSH_TEST;
+        } else {
+          process.env.AGY_FAST_PWSH_TEST = prev;
+        }
+      }
+    });
+  }
 });

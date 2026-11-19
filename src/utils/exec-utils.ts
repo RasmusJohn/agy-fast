@@ -69,10 +69,134 @@ export function execBinaryAsync(
   return spawnAndCollect(bin, args, false, options);
 }
 
-export function runShellCommandAsync(
+export type WindowsPowerShellBin = "pwsh" | "powershell.exe";
+export type WindowsShellProbe = (bin: WindowsPowerShellBin) => Promise<boolean>;
+
+const WINDOWS_PS_ENV_OR_VAR_RE =
+  /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/m;
+const WINDOWS_PS_CMDLET_RE =
+  /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b/i;
+const EXPLICIT_POWERSHELL_INVOCATION_RE =
+  /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+
+/**
+ * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
+ * variables, subexpressions, or `Verb-Noun` cmdlets) so cross-platform/cmd
+ * commands keep fast `cmd.exe` execution without altering quoting behavior.
+ */
+export function needsPowerShellOnWindows(command: string): boolean {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  return (
+    WINDOWS_PS_ENV_OR_VAR_RE.test(command) || WINDOWS_PS_CMDLET_RE.test(command)
+  );
+}
+
+/**
+ * Prepends `&` when a PowerShell command starts with a quoted executable path
+ * followed by arguments (e.g. `"C:\Program Files\nodejs\node.exe" -v`).
+ */
+export function formatPowerShellCommand(command: string): string {
+  const trimmed = command.trim();
+  if (!trimmed || (trimmed[0] !== '"' && trimmed[0] !== "'")) {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      const rest = trimmed.slice(idx + 1).trimStart();
+      if (rest && !/^(?:[|;&+})]|$)/.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+
+let cachedWindowsPowerShell: WindowsPowerShellBin | null | undefined;
+let pendingWindowsPowerShellProbe: Promise<WindowsPowerShellBin | null> | null = null;
+
+async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<boolean> {
+  const res = await execBinaryAsync(
+    bin,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd: process.cwd(),
+      timeoutMs: 3000,
+      maxOutputBytes: 4096,
+    },
+  );
+  return !res.error && res.exitCode === 0;
+}
+
+/**
+ * Resolves the preferred PowerShell executable on Windows (`pwsh` -> `powershell.exe`
+ * -> `null`), caching the probe result across calls.
+ */
+export async function resolveWindowsPowerShell(
+  probe: WindowsShellProbe = defaultProbeWindowsShell,
+): Promise<WindowsPowerShellBin | null> {
+  if (cachedWindowsPowerShell !== undefined) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+
+  return pendingWindowsPowerShellProbe;
+}
+
+export function resetWindowsShellCache(): void {
+  cachedWindowsPowerShell = undefined;
+  pendingWindowsPowerShellProbe = null;
+}
+
+export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
+  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
+    const psBin = await resolveWindowsPowerShell();
+    if (psBin) {
+      return spawnAndCollect(
+        psBin,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          formatPowerShellCommand(command),
+        ],
+        false,
+        options,
+      );
+    }
+  }
   return spawnAndCollect(command, [], true, options);
 }
 

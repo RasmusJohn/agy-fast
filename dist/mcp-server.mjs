@@ -300,7 +300,95 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-function runShellCommandAsync(command, options) {
+var WINDOWS_PS_ENV_OR_VAR_RE = /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/m;
+var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b/i;
+var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+function needsPowerShellOnWindows(command) {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  return WINDOWS_PS_ENV_OR_VAR_RE.test(command) || WINDOWS_PS_CMDLET_RE.test(command);
+}
+function formatPowerShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      const rest = trimmed.slice(idx + 1).trimStart();
+      if (rest && !/^(?:[|;&+})]|$)/.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+var cachedWindowsPowerShell;
+var pendingWindowsPowerShellProbe = null;
+async function defaultProbeWindowsShell(bin) {
+  const res = await execBinaryAsync(
+    bin,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd: process.cwd(),
+      timeoutMs: 3e3,
+      maxOutputBytes: 4096
+    }
+  );
+  return !res.error && res.exitCode === 0;
+}
+async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
+  if (cachedWindowsPowerShell !== void 0) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+  return pendingWindowsPowerShellProbe;
+}
+async function runShellCommandAsync(command, options) {
+  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
+    const psBin = await resolveWindowsPowerShell();
+    if (psBin) {
+      return spawnAndCollect(
+        psBin,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          formatPowerShellCommand(command)
+        ],
+        false,
+        options
+      );
+    }
+  }
   return spawnAndCollect(command, [], true, options);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
