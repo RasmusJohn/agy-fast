@@ -241,6 +241,45 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(parsed.agyFastToolCalls.apply_edits, 1);
     assert.equal(parsed.agyFastToolCalls.run_checks, 1);
 
+    // Also recognize Antigravity lazy-loaded call_mcp_tool entries (including JSON-encoded ServerName/ToolName)
+    const lazyMetrics = analyzeTranscriptSessions([
+      [
+        {
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-10-01T10:00:00Z",
+          output_tokens: 100,
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: '"agy-fast_fast"',
+                ToolName: '"batch_search"',
+                Arguments: "{}",
+              },
+            },
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: '"agy-fast_fast"',
+                ToolName: '"read_slices"',
+                Arguments: "{}",
+              },
+            },
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: '"other_server"',
+                ToolName: '"batch_search"',
+                Arguments: "{}",
+              },
+            },
+          ],
+        },
+      ],
+    ]);
+    assert.equal(lazyMetrics.agyFastToolCalls.batch_search, 1);
+    assert.equal(lazyMetrics.agyFastToolCalls.read_slices, 1);
+
     assert.throws(() => {
       execFileSync(
         process.execPath,

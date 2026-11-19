@@ -112,9 +112,9 @@ node scripts/install.mjs install --project /path/to/your-repo
 | 模块 | 文件路径 | 作用 |
 | :--- | :--- | :--- |
 | **原生插件清单** | [`plugin.json`](plugin.json) | 符合官方规范的元数据，通过 `agy plugin validate --strict` 零警告校验 |
-| **本地常驻 MCP 服务（`fast`）** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 严格仅注册 **4 个合并操作工具**，避免工具过多导致的延迟加载退化 |
+| **本地常驻 MCP 服务（`fast`）** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 本地常驻进程，仅注册 **4 个合并操作工具**（`agy-fast_fast`），将多次细粒度操作合并为单次调用 |
 | **会话启动快照钩子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 仅在 `SessionStart` 运行一次（实测约 35~50 ms），注入 ≤1.5 KB 的 git 状态、2 层目录与脚本清单 |
-| **工具路由规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | <1.5 KB 精简决策表，明确何时调用批处理工具、何时沿用内置 `read_file` |
+| **工具路由规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 2.2 KB 精简规则，内置 `agy-fast_fast` 4 个工具的参数签名，支持直接发起 `call_mcp_tool` 调用而无需额外先读 schema JSON 文件 |
 | **离线基准测试工具** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | 本地解析 `transcript.jsonl` 并输出单次统计或 A/B 对比表 |
 
 ### 4 个核心 MCP 工具

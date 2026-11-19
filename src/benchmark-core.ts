@@ -923,6 +923,19 @@ export function analyzeTranscriptSessions(
             if (isReadonlySearchShell(cmd)) {
               readonlySearchRunCommandCalls += 1;
             }
+          } else if (name === "call_mcp_tool") {
+            const serverName = unwrapJsonString(
+              callArgs?.ServerName ?? callArgs?.serverName ?? callArgs?.server_name ?? "",
+            );
+            const toolName = unwrapJsonString(
+              callArgs?.ToolName ?? callArgs?.toolName ?? callArgs?.tool_name ?? "",
+            );
+            const isFastServer =
+              !serverName || /(?:^|[_:/-])fast$/i.test(serverName) || /agy-fast/i.test(serverName);
+            const m = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
+            if (m && m[1] && agyFastToolCalls[m[1]] !== undefined) {
+              agyFastToolCalls[m[1]] = (agyFastToolCalls[m[1]] ?? 0) + 1;
+            }
           } else {
             const m = AGY_FAST_TOOL_RE.exec(name);
             if (m && m[1] && agyFastToolCalls[m[1]] !== undefined) {

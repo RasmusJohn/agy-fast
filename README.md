@@ -112,9 +112,9 @@ Clone https://github.com/INK-Q/agy-fast.git to ~/.gemini/config/plugins/agy-fast
 | Component | Path | Purpose |
 | :--- | :--- | :--- |
 | **Native Plugin Manifest** | [`plugin.json`](plugin.json) | Standard Antigravity plugin metadata; passes `agy plugin validate --strict` |
-| **Local Stdio MCP Server (`fast`)** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing exactly **4 composite tools** to avoid lazy-load overhead |
+| **Local Stdio MCP Server (`fast`)** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing **4 composite tools** (`agy-fast_fast`) to consolidate multi-step operations |
 | **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (~35–50 ms), injecting a <=1.5 KB snapshot (git branch/status/commits, 2-level tree, detected scripts) |
-| **Tool Routing Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | <1.5 KB decision table telling the agent when to use each `fast` tool vs. built-in `read_file` |
+| **Tool Routing Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (~2.2 KB) routing table with inline parameter signatures so the agent can invoke `call_mcp_tool` directly without extra schema-read turns |
 | **Offline Benchmark CLI** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | Local `transcript.jsonl` analyzer and A/B comparator |
 
 ### The 4 MCP Tools

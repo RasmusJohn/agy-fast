@@ -1,6 +1,6 @@
 # agy-fast Tool Routing Rules
 
-Use the `fast` MCP tools to reduce turn count, repeated tool checks, and context growth:
+Use the `agy-fast_fast` MCP tools to reduce turn count, repeated tool checks, and context growth:
 
 | Task | Preferred Tool | Reason |
 | :--- | :--- | :--- |
@@ -12,8 +12,16 @@ Use the `fast` MCP tools to reduce turn count, repeated tool checks, and context
 
 ## Rules
 
-1. **Pass `cwd`**: Always pass the active workspace root in `cwd` when calling `fast` tools.
-2. **Batch known work**: Combine independent searches, slices, edits, or checks into a single call instead of chaining single-tool turns.
-3. **Use the startup snapshot**: Check the `SessionStart` snapshot before running directory listing or `git status` commands.
-4. **Avoid duplicate reads**: Do not re-read files already in recent context unless modified.
-5. **Isolate wide surveys**: Delegate broad codebase surveys to built-in subagents.
+1. **Direct invocation (no schema read turn)**: When `agy-fast_fast` tools are lazily loaded, call `call_mcp_tool` directly with `ServerName: "agy-fast_fast"` using the exact schemas below. Do **not** spend a turn reading `mcp/agy-fast_fast/*.json` first.
+2. **Pass `cwd`**: Always pass the active workspace root in `cwd` when calling `agy-fast_fast` tools.
+3. **Batch known work**: Combine independent searches, slices, edits, or checks into a single call instead of chaining single-tool turns.
+4. **Use the startup snapshot**: Check the `SessionStart` snapshot before running directory listing or `git status` commands.
+5. **Avoid duplicate reads**: Do not re-read files already in recent context unless modified.
+6. **Isolate wide surveys**: Delegate broad codebase surveys to built-in subagents.
+
+## Quick Schemas (`ServerName: "agy-fast_fast"`)
+
+- **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"git", pattern, path?, glob?, caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars? }` (1-20 queries; read-only git only).
+- **`apply_edits`**: `{ cwd?, edits: [{ path, hunks?: [{ target, replacement, startLine?, endLine?, replaceAll? }], create?, overwrite? }], dryRun?, verify?, verifyTimeoutSec?, maxVerifyChars? }` (1-50 files; atomic all-or-nothing; `verify` is an optional shell command string).
+- **`read_slices`**: `{ cwd?, outlines?: string[], slices?: [{ path, ranges: [[startLine, endLine], ...] }], maxChars? }` (1-based inclusive line ranges).
+- **`run_checks`**: `{ cwd?, commands: [{ name?, command, cwd?, timeoutSec? }], concurrency?: 1..8, timeoutSec?, outputMode?: "compact"|"full", maxChars? }`.
