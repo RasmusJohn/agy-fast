@@ -24,6 +24,7 @@ export interface TranscriptStep {
   output_tokens?: number;
   tool_calls?: TranscriptToolCall[];
   content?: string;
+  media?: Array<{ mime_type?: string; uri?: string }>;
 }
 
 export interface BenchmarkMetrics {
@@ -46,6 +47,13 @@ export interface BenchmarkMetrics {
   runCommandCalls: number;
   readonlySearchRunCommandCalls: number;
   agyFastToolCalls: Record<string, number>;
+  mcpSpillCalls: number;
+  agyTruncatedCalls: number;
+  agyErrorCalls: number;
+  multiMcpTurns: number;
+  multiRunCommandTurns: number;
+  mediaLoadedCount: number;
+  multimodalHighCtxTurns: number;
   avgContextTokens: number;
   over150kContextRatio: number;
   avgCacheHitRate: number;
@@ -895,6 +903,13 @@ export function analyzeTranscriptSessions(
     read_slices: 0,
     run_checks: 0,
   };
+  let mcpSpillCalls = 0;
+  let agyTruncatedCalls = 0;
+  let agyErrorCalls = 0;
+  let multiMcpTurns = 0;
+  let multiRunCommandTurns = 0;
+  let mediaLoadedCount = 0;
+  let multimodalHighCtxTurns = 0;
 
   let contextSum = 0;
   let contextCount = 0;
@@ -908,6 +923,7 @@ export function analyzeTranscriptSessions(
     if (steps.length === 0) continue;
     let hasPlanner = false;
     let sessionFastCalls = 0;
+    let sessionMediaCount = 0;
 
     let prevSingleToolName: string | null = null;
     let prevPlannerMs: number | null = null;
@@ -916,6 +932,10 @@ export function analyzeTranscriptSessions(
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]!;
+      if (Array.isArray(step.media) && step.media.length > 0) {
+        sessionMediaCount += step.media.length;
+        mediaLoadedCount += step.media.length;
+      }
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
@@ -965,6 +985,9 @@ export function analyzeTranscriptSessions(
         contextSum += ctxTok;
         contextCount += 1;
         if (ctxTok >= 150_000) over150kCount += 1;
+        if (sessionMediaCount > 0 && ctxTok >= 180_000) {
+          multimodalHighCtxTurns += 1;
+        }
         if (ctxTok >= 10_000) {
           cacheHitSum += cacheTok / ctxTok;
           cacheHitCount += 1;
@@ -976,6 +999,7 @@ export function analyzeTranscriptSessions(
         (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name),
       );
 
+      const agyCallIndices: number[] = [];
       if (calls.length > 0) {
         toolTurns += 1;
         totalToolCalls += calls.length;
@@ -992,7 +1016,10 @@ export function analyzeTranscriptSessions(
         }
 
         const editedFilesThisTurn = new Map<string, number>();
-        for (const call of calls) {
+        let mcpCallsThisTurn = 0;
+        let runCmdCallsThisTurn = 0;
+        for (let callIdx = 0; callIdx < calls.length; callIdx++) {
+          const call = calls[callIdx]!;
           const name = call.name ?? "";
           const callArgs = getCallArgs(call);
           if (name === "edit_file") {
@@ -1005,6 +1032,7 @@ export function analyzeTranscriptSessions(
             }
           } else if (name === "run_command") {
             runCommandCalls += 1;
+            runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
             if (isReadonlySearchShell(cmd)) {
               readonlySearchRunCommandCalls += 1;
@@ -1014,9 +1042,13 @@ export function analyzeTranscriptSessions(
             if (fastTool && agyFastToolCalls[fastTool] !== undefined) {
               agyFastToolCalls[fastTool] = (agyFastToolCalls[fastTool] ?? 0) + 1;
               sessionFastCalls += 1;
+              mcpCallsThisTurn += 1;
+              agyCallIndices.push(callIdx);
             }
           }
         }
+        if (mcpCallsThisTurn >= 2) multiMcpTurns += 1;
+        if (runCmdCallsThisTurn >= 2) multiRunCommandTurns += 1;
       } else {
         prevSingleToolName = null;
       }
@@ -1025,6 +1057,7 @@ export function analyzeTranscriptSessions(
 
       // Collect following tool/generic steps before next PLANNER_RESPONSE or USER_INPUT
       const genericTimes: number[] = [];
+      const genericSteps: TranscriptStep[] = [];
       let nextPlannerMs: number | null = null;
       for (let j = i + 1; j < steps.length; j++) {
         const nxt = steps[j]!;
@@ -1035,8 +1068,34 @@ export function analyzeTranscriptSessions(
           break;
         }
         if (nxt.type === "GENERIC") {
+          genericSteps.push(nxt);
           const gt = parseTimeMs(nxt.created_at);
           if (gt !== null) genericTimes.push(gt);
+        }
+      }
+
+      for (const callIdx of agyCallIndices) {
+        const resStep = genericSteps[callIdx];
+        if (!resStep) continue;
+        const resText = typeof resStep.content === "string" ? resStep.content : "";
+        const isSpill =
+          resText.includes("The output was large and was saved to:") ||
+          (/output was truncated/i.test(resText) && resText.includes("output.txt"));
+        if (isSpill) {
+          mcpSpillCalls += 1;
+        } else if (
+          resText.includes("[truncated:") ||
+          resText.includes("[truncated at ")
+        ) {
+          agyTruncatedCalls += 1;
+        }
+        if (
+          resStep.status === "ERROR" ||
+          resText.includes("Encountered error in step execution") ||
+          resText.includes("Partial edit applied") ||
+          resText.includes("Atomic edit aborted")
+        ) {
+          agyErrorCalls += 1;
         }
       }
 
@@ -1101,6 +1160,13 @@ export function analyzeTranscriptSessions(
     runCommandCalls,
     readonlySearchRunCommandCalls,
     agyFastToolCalls,
+    mcpSpillCalls,
+    agyTruncatedCalls,
+    agyErrorCalls,
+    multiMcpTurns,
+    multiRunCommandTurns,
+    mediaLoadedCount,
+    multimodalHighCtxTurns,
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
@@ -1411,6 +1477,9 @@ export function formatMetricsMarkdown(m: BenchmarkMetrics): string {
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
     `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`,
+    `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
+    `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
+    `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`,
   ].join("\n");
 }
 
@@ -1439,6 +1508,9 @@ export function formatCompareMarkdown(
     `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`,
+    `| agy-fast MCP spills (output.txt) | ${before.mcpSpillCalls} | ${after.mcpSpillCalls} | ${formatDelta(before.mcpSpillCalls, after.mcpSpillCalls)} |`,
+    `| agy-fast internal truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| Multimodal >=180k turns | ${before.multimodalHighCtxTurns} | ${after.multimodalHighCtxTurns} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`,
   ].join("\n");
 }
 
@@ -1470,5 +1542,8 @@ export function formatUsageSplitMarkdown(split: UsageSplitMetrics): string {
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
     `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
+    `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
+    `| Parallel leaks (multi-MCP / multi-run_command) | ${overall.multiMcpTurns} / ${overall.multiRunCommandTurns} | ${wo.multiMcpTurns} / ${wo.multiRunCommandTurns} | ${wf.multiMcpTurns} / ${wf.multiRunCommandTurns} | - |`,
+    `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`,
   ].join("\n");
 }

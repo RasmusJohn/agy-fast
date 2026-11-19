@@ -120,6 +120,8 @@ function getLineWindowOffsets(
   return { windowStart, windowEnd };
 }
 
+const MAX_NEARBY_LINES = 26;
+
 function formatNearbyLines(
   text: string,
   startLine?: number,
@@ -128,7 +130,9 @@ function formatNearbyLines(
   const lines = text.split("\n");
   if (startLine === undefined && endLine === undefined) return "";
   const from = Math.max(1, (startLine ?? endLine ?? 1) - 2);
-  const to = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
+  const rawTo = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
+  const truncated = rawTo - from + 1 > MAX_NEARBY_LINES;
+  const to = truncated ? from + MAX_NEARBY_LINES - 1 : rawTo;
   const snippet: string[] = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = lines[ln - 1] ?? "";
@@ -136,7 +140,8 @@ function formatNearbyLines(
       `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`,
     );
   }
-  return `\n  Nearby lines (${from}-${to}):\n${snippet.join("\n")}`;
+  const extra = truncated ? `\n    ... (${rawTo - to} more lines in range omitted)` : "";
+  return `\n  Nearby lines (${from}-${to}):\n${snippet.join("\n")}${extra}`;
 }
 
 function extractLineTokens(trimmedLine: string): string[] {
@@ -149,13 +154,15 @@ function extractLineTokens(trimmedLine: string): string[] {
 }
 
 /**
- * When target text is not found and no startLine/endLine was provided,
- * locate the closest matching region in the file so the caller can fix the
- * hunk immediately without an extra read_file round-trip or blind retry.
+ * Locate the closest matching region in the file (optionally bounded to a
+ * 1-based line window) so the caller can fix a mismatched hunk immediately
+ * without dumping an 80-line range or doing an extra read_file round-trip.
  */
 function findClosestRegionSnippet(
   normalizedContent: string,
   normTarget: string,
+  rangeStartLine?: number,
+  rangeEndLine?: number,
 ): string {
   const fileLines = normalizedContent.split("\n");
   if (fileLines.length === 0) return "";
@@ -186,7 +193,13 @@ function findClosestRegionSnippet(
   let bestIdx = -1;
   let bestScore = 0;
 
-  for (let i = 0; i < trimmedFileLines.length; i++) {
+  const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
+  const scanEnd = Math.min(
+    trimmedFileLines.length - 1,
+    (rangeEndLine ?? trimmedFileLines.length) - 1,
+  );
+
+  for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i]!;
     if (!line) continue;
 
@@ -311,11 +324,42 @@ function planHunksForContent(
       const rangeNote = hasRange
         ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}`
         : "";
-      const nearby = hasRange
-        ? formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine)
-        : findClosestRegionSnippet(normalizedContent, normTarget);
+      let hint = "";
+      if (hasRange) {
+        // Check if exact target exists outside the provided line window (line drift)
+        const globalOffsets: number[] = [];
+        let gPos = 0;
+        while (
+          gPos <= normalizedContent.length - normTarget.length &&
+          globalOffsets.length < 5
+        ) {
+          const found = normalizedContent.indexOf(normTarget, gPos);
+          if (found === -1) break;
+          globalOffsets.push(found);
+          gPos = found + Math.max(1, normTarget.length);
+        }
+        if (globalOffsets.length > 0) {
+          const hitLines = globalOffsets
+            .map((o) => `L${offsetToLine(lineStarts, o)}`)
+            .join(", ");
+          hint = ` Exact match found outside range at ${hitLines} — adjust startLine/endLine or omit them.`;
+        } else {
+          const effStart = hunk.startLine ?? 1;
+          const effEnd = hunk.endLine ?? lineStarts.length;
+          if (effEnd - effStart + 1 > MAX_NEARBY_LINES - 4) {
+            hint =
+              findClosestRegionSnippet(normalizedContent, normTarget, effStart, effEnd) ||
+              findClosestRegionSnippet(normalizedContent, normTarget) ||
+              formatNearbyLines(normalizedContent, effStart, effEnd);
+          } else {
+            hint = formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
+          }
+        }
+      } else {
+        hint = findClosestRegionSnippet(normalizedContent, normTarget);
+      }
       errors.push(
-        `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${nearby}`,
+        `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${hint}`,
       );
       continue;
     }
@@ -694,7 +738,7 @@ export async function runApplyEdits(
         ) * 1000;
       const maxVerifyChars = Math.max(
         300,
-        Math.min(20_000, Math.trunc(input.maxVerifyChars ?? 4000)),
+        Math.min(7_500, Math.trunc(input.maxVerifyChars ?? 4000)),
       );
 
       const res = await runShellCommandAsync(verifySpec.command, {
@@ -723,9 +767,6 @@ export async function runApplyEdits(
   }
 
   const outText = parts.join("\n");
-  const finalText =
-    input.maxVerifyChars === undefined
-      ? truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES)
-      : outText;
+  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
   return { text: finalText, isError: false };
 }

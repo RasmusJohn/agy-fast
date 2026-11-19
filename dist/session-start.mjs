@@ -260,9 +260,30 @@ var SNAPSHOT_COLLAPSE_DIRS = /* @__PURE__ */ new Set([
   "ssl",
   "SSL",
   "playwright-report",
+  "test-results",
   "coverage",
   "logs"
 ]);
+var SNAPSHOT_PRIORITY_SUBDIRS = /* @__PURE__ */ new Set([
+  "src",
+  "app",
+  "lib",
+  "packages",
+  "server",
+  "web",
+  "client",
+  "api",
+  "tests",
+  "test",
+  "scripts"
+]);
+function isIgnoredSnapshotSubdir(name) {
+  if (name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(name)) return true;
+  if (name === "playwright-report" || name === "test-results" || name.startsWith("dist-") || name.startsWith("build-")) {
+    return true;
+  }
+  return false;
+}
 var MANIFEST_SKIP_SUBDIRS = /* @__PURE__ */ new Set([
   "docs",
   "doc",
@@ -318,9 +339,14 @@ async function getTwoLevelTree(workspaceDir) {
           withFileTypes: true
         });
         const valid = sub.filter(
-          (s) => s.name !== ".DS_Store" && !(s.isDirectory() && (s.name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(s.name)))
+          (s) => s.name !== ".DS_Store" && !(s.isDirectory() && isIgnoredSnapshotSubdir(s.name))
         ).sort((a, b) => {
           if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+          if (a.isDirectory() && b.isDirectory()) {
+            const aPrio = SNAPSHOT_PRIORITY_SUBDIRS.has(a.name);
+            const bPrio = SNAPSHOT_PRIORITY_SUBDIRS.has(b.name);
+            if (aPrio !== bPrio) return aPrio ? -1 : 1;
+          }
           return a.name.localeCompare(b.name);
         });
         if (SNAPSHOT_COLLAPSE_DIRS.has(entry.name)) {

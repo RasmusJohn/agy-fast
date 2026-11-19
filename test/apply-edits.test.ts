@@ -393,4 +393,89 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(okFile, "utf8"), "public class Ok {\n  int value = 2;\n}\n");
     assert.match(await fs.readFile(missFile, "utf8"), /case "ERP" -> "实付"/);
   });
+
+  it("detects line-drifted exact matches, bounds wide-range failure snippets, and filters Spring/Pino verify noise", async () => {
+    const bigPath = path.join(tmpDir, "drift.ts");
+    const lines = [
+      ...Array.from({ length: 85 }, (_, i) => `const filler_${i + 1} = ${i + 1};`),
+      "function targetBlock() {",
+      "  const answer = 42;",
+      "  return answer;",
+      "}",
+    ];
+    await fs.writeFile(bigPath, lines.join("\n") + "\n", "utf8");
+
+    // 1. Exact target exists outside startLine..endLine -> reports exact drifted line
+    const driftRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 40,
+              target: "function targetBlock() {\n  const answer = 42;",
+              replacement: "function targetBlock() {\n  const answer = 99;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(driftRes.isError, true);
+    assert.match(driftRes.text, /Exact match found outside range at L86/);
+
+    // 2. Wide range (>26 lines) mismatch uses closest-region snippet instead of dumping 85 lines
+    const wideRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 89,
+              target: "function targetBlock() {\n  const answer = 999;",
+              replacement: "function targetBlock() {\n  const answer = 100;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(wideRes.isError, true);
+    assert.match(wideRes.text, /Closest match near line 86/);
+    assert.ok(wideRes.text.length < 1500, `Expected compact hint, got ${wideRes.text.length} chars`);
+
+    // 3. Verify compact output strips Pino level:30 JSON noise + Maven Help footer and preserves Spring Description + Caused by
+    const noisyVerifyScript = [
+      'for (let i = 0; i < 80; i++) console.log(JSON.stringify({ level: 30, msg: "incoming request", reqId: i, payload: "x".repeat(60) }));',
+      'console.log("Description:");',
+      'console.log("Parameter 1 of constructor in AfterSaleController required a bean of type AfterSaleQueryService.");',
+      'console.log("Action:");',
+      'console.log("Consider defining a bean of type AfterSaleQueryService.");',
+      'for (let i = 0; i < 40; i++) console.log("    at com.example.Framework.invoke(Framework.java:" + i + ")");',
+      'console.log("Caused by: java.sql.SQLSyntaxErrorException: Unknown column shop_avatar");',
+      'console.log("[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.");',
+      'console.log("[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException");',
+      "process.exit(1);",
+    ].join(" ");
+    const verifyRes = await runApplyEdits({
+      cwd: tmpDir,
+      maxVerifyChars: 20_000,
+      verify: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(noisyVerifyScript)}`,
+      edits: [
+        {
+          path: "drift.ts",
+          hunks: [{ target: "const filler_1 = 1;", replacement: "const filler_1 = 10;" }],
+        },
+      ],
+    });
+    const verifyBody = verifyRes.text.split("`:\n")[1] ?? "";
+    assert.equal(verifyRes.isError, false);
+    assert.ok(Buffer.byteLength(verifyRes.text, "utf8") <= 8_800);
+    assert.match(verifyBody, /AfterSaleQueryService/);
+    assert.match(verifyBody, /Caused by: java\.sql\.SQLSyntaxErrorException/);
+    assert.doesNotMatch(verifyBody, /incoming request/);
+    assert.doesNotMatch(verifyBody, /\[Help 1\]/);
+  });
 });

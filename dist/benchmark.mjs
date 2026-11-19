@@ -682,6 +682,13 @@ function analyzeTranscriptSessions(sessions) {
     read_slices: 0,
     run_checks: 0
   };
+  let mcpSpillCalls = 0;
+  let agyTruncatedCalls = 0;
+  let agyErrorCalls = 0;
+  let multiMcpTurns = 0;
+  let multiRunCommandTurns = 0;
+  let mediaLoadedCount = 0;
+  let multimodalHighCtxTurns = 0;
   let contextSum = 0;
   let contextCount = 0;
   let over150kCount = 0;
@@ -693,12 +700,17 @@ function analyzeTranscriptSessions(sessions) {
     if (steps.length === 0) continue;
     let hasPlanner = false;
     let sessionFastCalls = 0;
+    let sessionMediaCount = 0;
     let prevSingleToolName = null;
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
     let prevTurnHadCalls = false;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
+      if (Array.isArray(step.media) && step.media.length > 0) {
+        sessionMediaCount += step.media.length;
+        mediaLoadedCount += step.media.length;
+      }
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
@@ -736,6 +748,9 @@ function analyzeTranscriptSessions(sessions) {
         contextSum += ctxTok;
         contextCount += 1;
         if (ctxTok >= 15e4) over150kCount += 1;
+        if (sessionMediaCount > 0 && ctxTok >= 18e4) {
+          multimodalHighCtxTurns += 1;
+        }
         if (ctxTok >= 1e4) {
           cacheHitSum += cacheTok / ctxTok;
           cacheHitCount += 1;
@@ -745,6 +760,7 @@ function analyzeTranscriptSessions(sessions) {
       const hasBlockingTool = calls.some(
         (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
       );
+      const agyCallIndices = [];
       if (calls.length > 0) {
         toolTurns += 1;
         totalToolCalls += calls.length;
@@ -759,7 +775,10 @@ function analyzeTranscriptSessions(sessions) {
           prevSingleToolName = null;
         }
         const editedFilesThisTurn = /* @__PURE__ */ new Map();
-        for (const call of calls) {
+        let mcpCallsThisTurn = 0;
+        let runCmdCallsThisTurn = 0;
+        for (let callIdx = 0; callIdx < calls.length; callIdx++) {
+          const call = calls[callIdx];
           const name = call.name ?? "";
           const callArgs = getCallArgs(call);
           if (name === "edit_file") {
@@ -772,6 +791,7 @@ function analyzeTranscriptSessions(sessions) {
             }
           } else if (name === "run_command") {
             runCommandCalls += 1;
+            runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
             if (isReadonlySearchShell(cmd)) {
               readonlySearchRunCommandCalls += 1;
@@ -781,14 +801,19 @@ function analyzeTranscriptSessions(sessions) {
             if (fastTool && agyFastToolCalls[fastTool] !== void 0) {
               agyFastToolCalls[fastTool] = (agyFastToolCalls[fastTool] ?? 0) + 1;
               sessionFastCalls += 1;
+              mcpCallsThisTurn += 1;
+              agyCallIndices.push(callIdx);
             }
           }
         }
+        if (mcpCallsThisTurn >= 2) multiMcpTurns += 1;
+        if (runCmdCallsThisTurn >= 2) multiRunCommandTurns += 1;
       } else {
         prevSingleToolName = null;
       }
       prevTurnHadCalls = calls.length > 0;
       const genericTimes = [];
+      const genericSteps = [];
       let nextPlannerMs = null;
       for (let j = i + 1; j < steps.length; j++) {
         const nxt = steps[j];
@@ -799,8 +824,23 @@ function analyzeTranscriptSessions(sessions) {
           break;
         }
         if (nxt.type === "GENERIC") {
+          genericSteps.push(nxt);
           const gt = parseTimeMs(nxt.created_at);
           if (gt !== null) genericTimes.push(gt);
+        }
+      }
+      for (const callIdx of agyCallIndices) {
+        const resStep = genericSteps[callIdx];
+        if (!resStep) continue;
+        const resText = typeof resStep.content === "string" ? resStep.content : "";
+        const isSpill = resText.includes("The output was large and was saved to:") || /output was truncated/i.test(resText) && resText.includes("output.txt");
+        if (isSpill) {
+          mcpSpillCalls += 1;
+        } else if (resText.includes("[truncated:") || resText.includes("[truncated at ")) {
+          agyTruncatedCalls += 1;
+        }
+        if (resStep.status === "ERROR" || resText.includes("Encountered error in step execution") || resText.includes("Partial edit applied") || resText.includes("Atomic edit aborted")) {
+          agyErrorCalls += 1;
         }
       }
       if (tPlanner !== null && !hasBlockingTool) {
@@ -857,6 +897,13 @@ function analyzeTranscriptSessions(sessions) {
     runCommandCalls,
     readonlySearchRunCommandCalls,
     agyFastToolCalls,
+    mcpSpillCalls,
+    agyTruncatedCalls,
+    agyErrorCalls,
+    multiMcpTurns,
+    multiRunCommandTurns,
+    mediaLoadedCount,
+    multimodalHighCtxTurns,
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
@@ -1094,7 +1141,10 @@ function formatMetricsMarkdown(m) {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`,
+    `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
+    `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
+    `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`
   ].join("\n");
 }
 function formatDelta(before, after) {
@@ -1117,7 +1167,10 @@ function formatCompareMarkdown(before, after) {
     `| Single-tool turn ratio | ${pct(before.singleToolTurnRatio)} | ${pct(after.singleToolTurnRatio)} | ${formatDelta(before.singleToolTurnRatio, after.singleToolTurnRatio)} |`,
     `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
-    `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`
+    `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`,
+    `| agy-fast MCP spills (output.txt) | ${before.mcpSpillCalls} | ${after.mcpSpillCalls} | ${formatDelta(before.mcpSpillCalls, after.mcpSpillCalls)} |`,
+    `| agy-fast internal truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
+    `| Multimodal >=180k turns | ${before.multimodalHighCtxTurns} | ${after.multimodalHighCtxTurns} | ${formatDelta(before.multimodalHighCtxTurns, after.multimodalHighCtxTurns)} |`
   ].join("\n");
 }
 function formatUsageSplitMarkdown(split) {
@@ -1143,7 +1196,10 @@ function formatUsageSplitMarkdown(split) {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`
+    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
+    `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
+    `| Parallel leaks (multi-MCP / multi-run_command) | ${overall.multiMcpTurns} / ${overall.multiRunCommandTurns} | ${wo.multiMcpTurns} / ${wo.multiRunCommandTurns} | ${wf.multiMcpTurns} / ${wf.multiRunCommandTurns} | - |`,
+    `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`
   ].join("\n");
 }
 

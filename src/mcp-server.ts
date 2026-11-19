@@ -72,8 +72,8 @@ export function createAgyFastServer(): McpStdioServer {
           maxChars: {
             type: "integer",
             minimum: 500,
-            maximum: 60000,
-            description: "Total character cap for combined results (default 8500, inline UTF-8 capped <= 8800 bytes).",
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to avoid disk spills).",
           },
         },
         required: ["queries"],
@@ -163,7 +163,8 @@ export function createAgyFastServer(): McpStdioServer {
           maxVerifyChars: {
             type: "integer",
             minimum: 300,
-            maximum: 20000,
+            maximum: 7500,
+            description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes).",
           },
         },
         required: ["edits"],
@@ -176,21 +177,21 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "read_slices",
       description:
-        "Extract symbol outlines (with line ranges) and/or batch-read exact line ranges across multiple files in one call to keep context compact.",
+        "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across up to 40 files in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
       inputSchema: {
         type: "object",
         properties: {
           cwd: { type: "string" },
           outlines: {
             type: "array",
-            maxItems: 20,
+            maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol line ranges from.",
+            description: "File paths to extract top-level symbol/section line ranges from (max 40).",
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Files and 1-based inclusive [startLine, endLine] ranges to read.",
+            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes).",
             items: {
               type: "object",
               properties: {
@@ -212,8 +213,8 @@ export function createAgyFastServer(): McpStdioServer {
           maxChars: {
             type: "integer",
             minimum: 1000,
-            maximum: 80000,
-            description: "Total character cap across all outlines and slices (default 8500, inline UTF-8 capped <= 8800 bytes).",
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills).",
           },
         },
       },
@@ -225,7 +226,7 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "run_checks",
       description:
-        "Run multiple build, typecheck, lint, or test commands concurrently with compact output filtering (1-line pass summaries, error lines on failure).",
+        "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
       inputSchema: {
         type: "object",
         properties: {
@@ -261,13 +262,13 @@ export function createAgyFastServer(): McpStdioServer {
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
-            description: "Compact hides verbose pass logs (default 'compact').",
+            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands.",
           },
           maxChars: {
             type: "integer",
             minimum: 500,
-            maximum: 60000,
-            description: "Total character cap (default 8000, inline UTF-8 capped <= 8800 bytes).",
+            maximum: 8800,
+            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes).",
           },
         },
         required: ["commands"],

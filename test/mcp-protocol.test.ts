@@ -252,7 +252,7 @@ describe("MCP Stdio Server end-to-end", () => {
     assert.equal(JSON.parse(jsonPart).id, 99);
   });
 
-  it("flushes large (>64KB) stdout responses completely before exiting on stdin EOF", async () => {
+  it("flushes large (>64KB) pipelined stdout responses completely on stdin EOF and enforces 8.8KB inline cap per tool call", async () => {
     const bigFile = path.join(tmpDir, "large.txt");
     const bigLines = Array.from(
       { length: 1200 },
@@ -260,30 +260,47 @@ describe("MCP Stdio Server end-to-end", () => {
     );
     await fs.writeFile(bigFile, bigLines.join("\n"), "utf8");
 
-    const req =
+    // Pipeline 10 calls totaling >75KB stdout while verifying each response stays <= 8,800 UTF-8 bytes even if caller passes maxChars: 80000
+    const reqs = Array.from({ length: 10 }, (_, idx) =>
       JSON.stringify({
         jsonrpc: "2.0",
-        id: 200,
+        id: 200 + idx,
         method: "tools/call",
         params: {
           name: "read_slices",
           arguments: {
             cwd: tmpDir,
-            slices: [{ path: "large.txt", ranges: [[1, 1200]] }],
+            slices: [{ path: "large.txt", ranges: [[idx * 100 + 1, idx * 100 + 200]] }],
             maxChars: 80_000,
           },
         },
-      }) + "\n";
+      }) + "\n",
+    );
 
-    const res = await sendMessagesToServer([req]);
+    const res = await sendMessagesToServer([reqs.join("")]);
     assert.equal(res.code, 0);
     assert.equal(res.stderr, "");
-    assert.ok(res.stdout.length > 70_000, `Expected >70KB response, got ${res.stdout.length}`);
-    const parsed = JSON.parse(res.stdout.trim()) as {
-      id: number;
-      result: { content: Array<{ text: string }> };
-    };
-    assert.equal(parsed.id, 200);
-    assert.match(parsed.result.content[0]?.text ?? "", /line_1000:/);
+    assert.ok(res.stdout.length > 75_000, `Expected >75KB pipelined stdout, got ${res.stdout.length}`);
+    const parsed = res.stdout
+      .trim()
+      .split("\n")
+      .map(
+        (l) =>
+          JSON.parse(l) as {
+            id: number;
+            result: { content: Array<{ text: string }> };
+          },
+      );
+    assert.equal(parsed.length, 10);
+    const ids = parsed.map((p) => p.id).sort((a, b) => a - b);
+    assert.deepEqual(ids, [200, 201, 202, 203, 204, 205, 206, 207, 208, 209]);
+    for (const item of parsed) {
+      const text = item.result.content[0]?.text ?? "";
+      assert.ok(
+        Buffer.byteLength(text, "utf8") <= 8_800,
+        `Expected per-call inline cap <= 8800B, got ${Buffer.byteLength(text, "utf8")}`,
+      );
+      assert.match(text, /use parallel read_file/);
+    }
   });
 });

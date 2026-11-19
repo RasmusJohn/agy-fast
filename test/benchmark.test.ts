@@ -794,5 +794,65 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(asyncMetrics.llmTimeSec, 8); // NOT 278s (270s async sleep excluded)
     assert.equal(asyncMetrics.toolExecTimeSec, 1);
     assert.equal(asyncMetrics.over60sGapRatio, 0);
+
+    // Health & multimodal diagnostics: MCP spills, internal truncations, errors, multi-MCP, multi-run_command, and >=180k multimodal turns
+    const healthSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T12:00:00Z",
+          media: [{ mime_type: "image/png", uri: "file:///tmp/shot1.png" }],
+          content: "image loaded",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T12:00:05Z",
+          input_tokens: 10_000,
+          cache_read_tokens: 185_000,
+          output_tokens: 400,
+          tool_calls: [
+            { name: "call_mcp_tool", arguments: { ServerName: "agy-fast_fast", ToolName: "read_slices", Arguments: {} } },
+            { name: "call_mcp_tool", arguments: { ServerName: "agy-fast_fast", ToolName: "batch_search", Arguments: {} } },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T12:00:08Z",
+          content: "The output was large and was saved to: file:///tmp/output.txt",
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T12:00:09Z",
+          content: "## Query 1\n... [truncated: showed 4000 of 9000 bytes]",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-19T12:00:10Z",
+          input_tokens: 5_000,
+          cache_read_tokens: 195_000,
+          output_tokens: 300,
+          tool_calls: [
+            { name: "run_command", arguments: { CommandLine: "echo a" } },
+            { name: "run_command", arguments: { CommandLine: "echo b" } },
+            { name: "call_mcp_tool", arguments: { ServerName: "agy-fast_fast", ToolName: "apply_edits", Arguments: {} } },
+          ],
+        }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-19T12:00:11Z", content: "a" }),
+        JSON.stringify({ type: "GENERIC", created_at: "2026-11-19T12:00:12Z", content: "b" }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-19T12:00:13Z",
+          content: "Encountered error in step execution: Partial edit applied (1/2 file(s) written; 1 file(s) failed)",
+        }),
+      ].join("\n"),
+    );
+    const hm = analyzeTranscriptSessions([healthSteps]);
+    assert.equal(hm.mcpSpillCalls, 1);
+    assert.equal(hm.agyTruncatedCalls, 1);
+    assert.equal(hm.agyErrorCalls, 1);
+    assert.equal(hm.multiMcpTurns, 1);
+    assert.equal(hm.multiRunCommandTurns, 1);
+    assert.equal(hm.mediaLoadedCount, 1);
+    assert.equal(hm.multimodalHighCtxTurns, 2);
   });
 });

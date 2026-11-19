@@ -766,7 +766,24 @@ function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n
   }
   return Buffer.byteLength(fitted, "utf8") <= maxBytes ? fitted : truncateWithByteNotice(fitted, maxBytes);
 }
-var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b)/i;
+var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯+\s*failed tests|compilation error)/i;
+var JSON_INFO_LOG_PATTERNS = [
+  /^\s*\{"level":(?:10|20|30)\b/,
+  /^\s*\{[^}]*"level"\s*:\s*"(?:trace|debug|info)"/i
+];
+var ALWAYS_NOISE_LINE_PATTERNS = [
+  /^\[ERROR\]\s*(?:To see the full stack trace|Re-run Maven using the -X|For more information about the errors|\[Help \d+\]|->\s*\[Help \d+\])/i,
+  /^\(node:\d+\)\s*ExperimentalWarning:/,
+  /^\(Use `node --trace-warnings/
+];
+function isFailureNoiseLine(line) {
+  if (ALWAYS_NOISE_LINE_PATTERNS.some((re) => re.test(line))) return true;
+  if (JSON_INFO_LOG_PATTERNS.some((re) => re.test(line))) {
+    return !/"statusCode"\s*:\s*5\d\d|\b(?:error|exception|failed|fatal)\b/i.test(line);
+  }
+  return false;
+}
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
 function formatCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
@@ -790,19 +807,27 @@ ${tail}` : "TIMED OUT (no output)",
     const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines2.length <= 2 ? lines2 : [lines2[lines2.length - 1]];
     return truncateWithNotice(picked.join(" | "), Math.min(params.maxChars, 320));
   }
-  const lines = combined.split("\n");
-  if (combined.length <= params.maxChars) {
-    return combined || `Exited with code ${params.exitCode ?? "unknown"}`;
+  const rawLines = combined.split("\n");
+  const filteredLines = rawLines.filter((line) => !isFailureNoiseLine(line));
+  const lines = filteredLines.length > 0 ? filteredLines : rawLines;
+  const cleanedCombined = lines.join("\n");
+  if (cleanedCombined.length <= params.maxChars) {
+    return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
   }
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
-    if (ERROR_LINE_PATTERN.test(lines[i])) {
+    const line = lines[i];
+    if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
+      const from = Math.max(0, i - 1);
+      const to = Math.min(lines.length - 1, i + 8);
+      for (let j = from; j <= to; j++) keepIndices.add(j);
+    } else if (ERROR_LINE_PATTERN.test(line)) {
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
       for (let j = from; j <= to; j++) keepIndices.add(j);
     }
   }
-  const tailStart = Math.max(0, lines.length - 15);
+  const tailStart = Math.max(0, lines.length - 12);
   for (let i = tailStart; i < lines.length; i++) {
     keepIndices.add(i);
   }
@@ -867,11 +892,14 @@ function getLineWindowOffsets(text, lineStarts, startLine, endLine) {
   const windowEnd = eLine < totalLines ? lineStarts[eLine] : text.length;
   return { windowStart, windowEnd };
 }
+var MAX_NEARBY_LINES = 26;
 function formatNearbyLines(text, startLine, endLine) {
   const lines = text.split("\n");
   if (startLine === void 0 && endLine === void 0) return "";
   const from = Math.max(1, (startLine ?? endLine ?? 1) - 2);
-  const to = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
+  const rawTo = Math.min(lines.length, (endLine ?? startLine ?? 1) + 2);
+  const truncated = rawTo - from + 1 > MAX_NEARBY_LINES;
+  const to = truncated ? from + MAX_NEARBY_LINES - 1 : rawTo;
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = lines[ln - 1] ?? "";
@@ -879,16 +907,18 @@ function formatNearbyLines(text, startLine, endLine) {
       `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`
     );
   }
+  const extra = truncated ? `
+    ... (${rawTo - to} more lines in range omitted)` : "";
   return `
   Nearby lines (${from}-${to}):
-${snippet.join("\n")}`;
+${snippet.join("\n")}${extra}`;
 }
 function extractLineTokens(trimmedLine) {
   const tokens = trimmedLine.match(/[A-Za-z0-9_$]{3,}|[\u4e00-\u9fff]{2,}/g);
   if (tokens && tokens.length > 0) return tokens;
   return trimmedLine.split(/\s+/).map((s) => s.trim()).filter((s) => s.length >= 2);
 }
-function findClosestRegionSnippet(normalizedContent, normTarget) {
+function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine, rangeEndLine) {
   const fileLines = normalizedContent.split("\n");
   if (fileLines.length === 0) return "";
   const targetLines = normTarget.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
@@ -909,7 +939,12 @@ function findClosestRegionSnippet(normalizedContent, normTarget) {
   const trimmedFileLines = fileLines.map((l) => l.trim());
   let bestIdx = -1;
   let bestScore = 0;
-  for (let i = 0; i < trimmedFileLines.length; i++) {
+  const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
+  const scanEnd = Math.min(
+    trimmedFileLines.length - 1,
+    (rangeEndLine ?? trimmedFileLines.length) - 1
+  );
+  for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i];
     if (!line) continue;
     let score = 0;
@@ -1017,9 +1052,33 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     if (foundOffsets.length === 0) {
       const hasRange = hunk.startLine !== void 0 || hunk.endLine !== void 0;
       const rangeNote = hasRange ? ` within lines ${hunk.startLine ?? 1}-${hunk.endLine ?? lineStarts.length}` : "";
-      const nearby = hasRange ? formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine) : findClosestRegionSnippet(normalizedContent, normTarget);
+      let hint = "";
+      if (hasRange) {
+        const globalOffsets = [];
+        let gPos = 0;
+        while (gPos <= normalizedContent.length - normTarget.length && globalOffsets.length < 5) {
+          const found = normalizedContent.indexOf(normTarget, gPos);
+          if (found === -1) break;
+          globalOffsets.push(found);
+          gPos = found + Math.max(1, normTarget.length);
+        }
+        if (globalOffsets.length > 0) {
+          const hitLines = globalOffsets.map((o) => `L${offsetToLine(lineStarts, o)}`).join(", ");
+          hint = ` Exact match found outside range at ${hitLines} \u2014 adjust startLine/endLine or omit them.`;
+        } else {
+          const effStart = hunk.startLine ?? 1;
+          const effEnd = hunk.endLine ?? lineStarts.length;
+          if (effEnd - effStart + 1 > MAX_NEARBY_LINES - 4) {
+            hint = findClosestRegionSnippet(normalizedContent, normTarget, effStart, effEnd) || findClosestRegionSnippet(normalizedContent, normTarget) || formatNearbyLines(normalizedContent, effStart, effEnd);
+          } else {
+            hint = formatNearbyLines(normalizedContent, hunk.startLine, hunk.endLine);
+          }
+        }
+      } else {
+        hint = findClosestRegionSnippet(normalizedContent, normTarget);
+      }
       errors.push(
-        `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${nearby}`
+        `${displayPath} hunk #${idx + 1}: target text not found${rangeNote}.${hint}`
       );
       continue;
     }
@@ -1330,7 +1389,7 @@ ${summaryLines.join("\n")}`];
       ) * 1e3;
       const maxVerifyChars = Math.max(
         300,
-        Math.min(2e4, Math.trunc(input.maxVerifyChars ?? 4e3))
+        Math.min(7500, Math.trunc(input.maxVerifyChars ?? 4e3))
       );
       const res = await runShellCommandAsync(verifySpec.command, {
         cwd: verifyCwd,
@@ -1353,7 +1412,7 @@ ${formatted}`
     }
   }
   const outText = parts.join("\n");
-  const finalText = input.maxVerifyChars === void 0 ? truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES) : outText;
+  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
   return { text: finalText, isError: false };
 }
 
@@ -1873,8 +1932,9 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     return matched ? rel : "(no files matched)";
   }
+  const scanLimit = Math.max(maxResults + 1, 2e3);
   const walked = await walkFiles(searchRoot, {
-    maxFiles: maxResults + 1,
+    maxFiles: scanLimit,
     includeHidden: pattern.startsWith(".") || pattern.includes("/."),
     fileFilter: (relPosix) => {
       if (matcher.test(relPosix)) return true;
@@ -1886,16 +1946,30 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
     }
   });
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
-  const items = walked.files.slice(0, maxResults).map((f) => {
+  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
   });
-  const truncated = walked.truncated || walked.files.length > maxResults;
+  const truncated = walked.truncated || sortedFiles.length > maxResults;
   if (items.length === 0) {
     return "(no files matched)";
   }
-  const suffix = truncated ? `
-... [truncated at ${maxResults} files]` : "";
+  if (!truncated) {
+    return items.join("\n");
+  }
+  const omitted = sortedFiles.slice(maxResults);
+  const dirCounts = /* @__PURE__ */ new Map();
+  for (const f of omitted) {
+    const slash = f.indexOf("/");
+    const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
+    dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
+  }
+  const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
+  const totalLabel = walked.truncated ? `${walked.files.length}+` : String(walked.files.length);
+  const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
+  const suffix = `
+... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
   return `${items.join("\n")}${suffix}`;
 }
 async function runGitQuery(query, searchRoot) {
@@ -2006,8 +2080,8 @@ async function runBatchSearch(input, options = {}) {
   } catch {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
-  const maxChars = clampInt(input.maxChars ?? 8500, 500, 6e4);
-  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
+  const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const needsTextSearch = input.queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
@@ -2038,11 +2112,13 @@ function isRegexStartContext(line, slashIdx) {
   const word = line.slice(k + 1, j + 1);
   return word === "return" || word === "case" || word === "throw" || word === "in" || word === "of" || word === "typeof" || word === "void" || word === "delete" || word === "new";
 }
-function scanBracesOnLine(line, state, lang) {
+function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = false, alreadySeenOpen = false) {
   let open = 0;
   let close = 0;
   let openParen = 0;
   let closeParen = 0;
+  let parenDepth = state.parenDepth ?? 0;
+  let seenOpen = alreadySeenOpen;
   let inSingle = false;
   let inDouble = false;
   let inRegex = false;
@@ -2132,8 +2208,9 @@ function scanBracesOnLine(line, state, lang) {
     if (ch === "{") {
       if (state.templateExprStack.length > 0) {
         state.templateExprStack[state.templateExprStack.length - 1] += 1;
-      } else {
+      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
         open++;
+        seenOpen = true;
       }
       lastCodeChar = "{";
     } else if (ch === "}") {
@@ -2145,58 +2222,124 @@ function scanBracesOnLine(line, state, lang) {
         } else {
           state.templateExprStack[state.templateExprStack.length - 1] = top - 1;
         }
-      } else {
+      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
         close++;
       }
       lastCodeChar = "}";
     } else if (ch === "(") {
       openParen++;
+      parenDepth++;
       lastCodeChar = "(";
     } else if (ch === ")") {
       closeParen++;
+      parenDepth = Math.max(0, parenDepth - 1);
       lastCodeChar = ")";
     } else if (!/\s/.test(ch)) {
       lastCodeChar = ch;
     }
   }
+  state.parenDepth = parenDepth;
   return {
     open,
     close,
     openParen,
     closeParen,
-    endsWithSemi: lastCodeChar === ";"
+    endsWithSemi: lastCodeChar === ";",
+    lastCodeChar
   };
 }
 function findBraceBlockEnd(lines, startIdx, lang = "c") {
   let depth = 0;
-  let parenDepth = 0;
   let seenOpen = false;
   const state = {
     inBlockComment: false,
     templateExprStack: [],
-    inBacktick: false
+    inBacktick: false,
+    parenDepth: 0
   };
   const maxScan = Math.min(lines.length, startIdx + 2e3);
   for (let i = startIdx; i < maxScan; i++) {
-    const { open, close, openParen, closeParen, endsWithSemi } = scanBracesOnLine(
+    const { open, close, endsWithSemi, lastCodeChar } = scanBracesOnLine(
       lines[i],
       state,
-      lang
+      lang,
+      lang === "js",
+      seenOpen
     );
     if (open > 0) seenOpen = true;
     depth += open - close;
-    parenDepth += openParen - closeParen;
     if (seenOpen && depth <= 0) {
+      if (lang === "js" && lastCodeChar === ">" && i <= startIdx + 12) {
+        seenOpen = false;
+        depth = 0;
+        continue;
+      }
       return i + 1;
     }
-    if (!seenOpen && parenDepth <= 0 && endsWithSemi) {
+    if (!seenOpen && (state.parenDepth ?? 0) <= 0 && endsWithSemi) {
       return i + 1;
     }
-    if (!seenOpen && i > startIdx + 15) {
+    if (!seenOpen && i > startIdx + 40) {
       return startIdx + 1;
     }
   }
   return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
+}
+function findTypeAliasEnd(lines, startIdx) {
+  const firstLine = lines[startIdx] ?? "";
+  const eqIdx = firstLine.indexOf("=");
+  const rhs = eqIdx >= 0 ? firstLine.slice(eqIdx + 1) : firstLine;
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0
+  };
+  const firstScan = scanBracesOnLine(rhs, state, "js");
+  if (firstScan.open > firstScan.close) {
+    return findBraceBlockEnd(lines, startIdx, "js");
+  }
+  if (firstScan.endsWithSemi && firstScan.openParen <= firstScan.closeParen) {
+    return startIdx + 1;
+  }
+  let endIdx = startIdx;
+  let parenBal = firstScan.openParen - firstScan.closeParen;
+  let prevLast = firstScan.lastCodeChar;
+  const maxScan = Math.min(lines.length - 1, startIdx + 40);
+  while (endIdx < maxScan) {
+    const nextLine = lines[endIdx + 1] ?? "";
+    const nextTrim = nextLine.trim();
+    if (!nextTrim) break;
+    const isContinuation = parenBal > 0 || prevLast === "=" || prevLast === "|" || prevLast === "&" || prevLast === "?" || prevLast === ":" || /^[ \t]+(?:[|&?:]|\w+\s*\?*:)/.test(nextLine);
+    if (!isContinuation) break;
+    endIdx++;
+    const scan = scanBracesOnLine(nextLine, state, "js");
+    if (scan.open > scan.close) {
+      return findBraceBlockEnd(lines, endIdx, "js");
+    }
+    parenBal += scan.openParen - scan.closeParen;
+    prevLast = scan.lastCodeChar;
+    if (scan.endsWithSemi && parenBal <= 0) break;
+  }
+  return endIdx + 1;
+}
+function findParenCallEnd(lines, startIdx) {
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0
+  };
+  let seenParen = false;
+  const maxScan = Math.min(lines.length, startIdx + 400);
+  for (let i = startIdx; i < maxScan; i++) {
+    const { openParen } = scanBracesOnLine(lines[i], state, "js");
+    if (openParen > 0) seenParen = true;
+    if (seenParen && (state.parenDepth ?? 0) <= 0) {
+      return i + 1;
+    }
+  }
+  return startIdx + 1;
 }
 function hasArrowOrBraceWithin(lines, startIdx, maxLookahead = 12) {
   const state = { inBlockComment: false, templateExprStack: [], inBacktick: false };
@@ -2271,8 +2414,13 @@ function extractTsJsSymbols(lines) {
     "typeof",
     "delete"
   ]);
+  const routeRegisterRe = /^[ \t]{1,6}(?:app|router|server|fastify)\.(get|post|put|patch|delete|all|route)\s*(?:<[^>]*>)?\s*\(\s*['"`]([^'"`]+)['"`]/;
+  const testSuiteRe = /^(?:describe|suite)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
+  const testCaseRe = /^[ \t]{0,4}(?:it|test)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
   let currentClassEnd = -1;
   let currentClassIndent = -1;
+  let currentFnEnd = -1;
+  let currentSuiteEnd = -1;
   const commentState = {
     inBlockComment: false,
     templateExprStack: [],
@@ -2292,7 +2440,7 @@ function extractTsJsSymbols(lines) {
       for (const p of patterns) {
         const m = p.re.exec(line);
         if (m && m[p.nameGroup]) {
-          const endLine = findBraceBlockEnd(lines, i, "js");
+          const endLine = p.kind === "type" ? findTypeAliasEnd(lines, i) : findBraceBlockEnd(lines, i, "js");
           symbols.push({
             kind: p.kind,
             name: m[p.nameGroup],
@@ -2303,6 +2451,8 @@ function extractTsJsSymbols(lines) {
           if (p.kind === "class") {
             currentClassEnd = endLine;
             currentClassIndent = -1;
+          } else if (p.kind === "function" && endLine - (i + 1) >= 40) {
+            currentFnEnd = endLine;
           }
           matchedTop = true;
           break;
@@ -2321,8 +2471,26 @@ function extractTsJsSymbols(lines) {
               endLine,
               depth: 0
             });
+            if (endLine - (i + 1) >= 40) {
+              currentFnEnd = endLine;
+            }
             matchedTop = true;
           }
+        }
+      }
+      if (!matchedTop) {
+        const ms = testSuiteRe.exec(line);
+        if (ms && ms[1]) {
+          const endLine = findParenCallEnd(lines, i);
+          symbols.push({
+            kind: "suite",
+            name: ms[1].slice(0, 64),
+            startLine: i + 1,
+            endLine,
+            depth: 0
+          });
+          currentSuiteEnd = endLine;
+          matchedTop = true;
         }
       }
     }
@@ -2346,6 +2514,30 @@ function extractTsJsSymbols(lines) {
             });
           }
         }
+      }
+    } else if (!matchedTop && i + 1 <= currentFnEnd) {
+      const mr = routeRegisterRe.exec(line);
+      if (mr && mr[1] && mr[2]) {
+        const endLine = findParenCallEnd(lines, i);
+        symbols.push({
+          kind: "route",
+          name: `${mr[1].toUpperCase()} ${mr[2]}`,
+          startLine: i + 1,
+          endLine,
+          depth: 1
+        });
+      }
+    } else if (!matchedTop) {
+      const mt = testCaseRe.exec(line);
+      if (mt && mt[1]) {
+        const endLine = findParenCallEnd(lines, i);
+        symbols.push({
+          kind: "test",
+          name: mt[1].slice(0, 64),
+          startLine: i + 1,
+          endLine,
+          depth: i + 1 <= currentSuiteEnd ? 1 : 0
+        });
       }
     }
   }
@@ -2668,6 +2860,207 @@ function extractJsonYamlSymbols(lines, isJson) {
   }
   return symbols;
 }
+function extractCssSymbols(lines, compactOnly = false) {
+  const symbols = [];
+  const state = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false
+  };
+  let braceDepth = 0;
+  const atRuleRe = /^@(layer|media|keyframes|supports|container|font-face|theme)\b([^{;]*)/i;
+  const tokenBlockRe = /^(:root\b|html(?:\[[^\]]+\]|\.[A-Za-z_-][\w-]*)?(?=\s|[,{])|\[data-theme[^\]]*\]|body\b)[^{;]*\{/;
+  const sectionCommentRe = /^\/\*\s*[=\-*#]*\s*([^*/=][^*/]{1,70}?)\s*[=\-*#]*\s*\*\/$/;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const wasInComment = state.inBlockComment;
+    if (!wasInComment && braceDepth === 0 && trimmed) {
+      const cm = sectionCommentRe.exec(trimmed);
+      if (cm && cm[1] && /[A-Za-z0-9\u4e00-\u9fff]/.test(cm[1])) {
+        symbols.push({
+          kind: "section",
+          name: cm[1].trim().slice(0, 64),
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0
+        });
+      } else {
+        const am = atRuleRe.exec(trimmed);
+        if (am && am[1]) {
+          const endLine = trimmed.includes("{") ? findBraceBlockEnd(lines, i, "c") : i + 1;
+          const rest = (am[2] ?? "").trim().replace(/\s+/g, " ").slice(0, 56);
+          symbols.push({
+            kind: `@${am[1].toLowerCase()}`,
+            name: rest || `@${am[1].toLowerCase()}`,
+            startLine: i + 1,
+            endLine,
+            depth: 0
+          });
+        } else {
+          const tm = tokenBlockRe.exec(trimmed);
+          if (tm && tm[1]) {
+            const endLine = findBraceBlockEnd(lines, i, "c");
+            const header = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
+            symbols.push({
+              kind: "tokens",
+              name: header || tm[1],
+              startLine: i + 1,
+              endLine,
+              depth: 0
+            });
+          }
+        }
+      }
+    }
+    const { open, close } = scanBracesOnLine(line, state, "c");
+    braceDepth = Math.max(0, braceDepth + open - close);
+  }
+  if (!compactOnly && symbols.length < 10) {
+    const fallbackState = {
+      inBlockComment: false,
+      templateExprStack: [],
+      inBacktick: false
+    };
+    let d = 0;
+    let lastAddedLine = -999;
+    const seen = new Set(symbols.map((s) => s.startLine));
+    for (let i = 0; i < lines.length && symbols.length < 40; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      const wasInComment = fallbackState.inBlockComment;
+      if (!wasInComment && d === 0 && !seen.has(i + 1) && i - lastAddedLine >= 10 && /^[.#\[a-zA-Z*:]/.test(trimmed) && trimmed.includes("{") && !trimmed.startsWith("@")) {
+        const sel = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
+        if (sel) {
+          const endLine = findBraceBlockEnd(lines, i, "c");
+          symbols.push({
+            kind: "rule",
+            name: sel,
+            startLine: i + 1,
+            endLine,
+            depth: 0
+          });
+          lastAddedLine = i;
+        }
+      }
+      const { open, close } = scanBracesOnLine(line, fallbackState, "c");
+      d = Math.max(0, d + open - close);
+    }
+    symbols.sort((a, b) => a.startLine - b.startLine);
+  }
+  return symbols;
+}
+function extractSfcSymbols(lines) {
+  const symbols = [];
+  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const m = blockOpenRe.exec(line.trim());
+    if (!m || !m[1] || line.startsWith("  ") || line.startsWith("	")) {
+      i++;
+      continue;
+    }
+    const tag = m[1].toLowerCase();
+    const attrs = (m[2] ?? "").trim();
+    const startIdx = i;
+    let endIdx = i;
+    if (tag === "template") {
+      let depth = 0;
+      const openTemplateRe = /<template\b[^>]*>/gi;
+      const closeTemplateRe = /<\/template\s*>/gi;
+      for (let j = i; j < lines.length; j++) {
+        const ln = lines[j];
+        const opens = ln.match(openTemplateRe)?.length ?? 0;
+        const closes = ln.match(closeTemplateRe)?.length ?? 0;
+        depth += opens - closes;
+        if (depth <= 0) {
+          endIdx = j;
+          break;
+        }
+        endIdx = j;
+      }
+    } else {
+      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
+      for (let j = i; j < lines.length; j++) {
+        endIdx = j;
+        if (j > i && closeRe.test(lines[j])) break;
+        if (j === i && closeRe.test(lines[j].slice(m[0].length))) break;
+      }
+    }
+    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
+    symbols.push({
+      kind: tag,
+      name: headerLabel,
+      startLine: startIdx + 1,
+      endLine: endIdx + 1,
+      depth: 0
+    });
+    const innerStart = startIdx + 1;
+    const innerLines = lines.slice(innerStart, endIdx);
+    if (tag === "script" && innerLines.length > 0) {
+      const innerSyms = extractTsJsSymbols(innerLines);
+      for (const s of innerSyms) {
+        symbols.push({
+          kind: s.kind,
+          name: s.name,
+          startLine: s.startLine + innerStart,
+          endLine: s.endLine + innerStart,
+          depth: s.depth + 1
+        });
+      }
+    } else if (tag === "template" && innerLines.length >= 30) {
+      let landmarks = 0;
+      const commentLandmarkRe = /^<!--\s*[=\-*#]*\s*([^-][^>]{2,60}?)\s*[=\-*#]*\s*-->$/;
+      const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
+      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
+        const raw = innerLines[k];
+        const indent = raw.length - raw.trimStart().length;
+        if (indent > 8) continue;
+        const trimmed = raw.trim();
+        const cm = commentLandmarkRe.exec(trimmed);
+        if (cm && cm[1]) {
+          symbols.push({
+            kind: "section",
+            name: cm[1].trim(),
+            startLine: innerStart + k + 1,
+            endLine: innerStart + k + 1,
+            depth: 1
+          });
+          landmarks++;
+          continue;
+        }
+        const sm = semanticTagRe.exec(trimmed);
+        if (sm && sm[1]) {
+          const attrStr = sm[2] ?? "";
+          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
+          const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
+          symbols.push({
+            kind: "block",
+            name: tagDesc,
+            startLine: innerStart + k + 1,
+            endLine: innerStart + k + 1,
+            depth: 1
+          });
+          landmarks++;
+        }
+      }
+    } else if (tag === "style" && innerLines.length > 0) {
+      const cssSyms = extractCssSymbols(innerLines, true).slice(0, 12);
+      for (const s of cssSyms) {
+        symbols.push({
+          kind: s.kind,
+          name: s.name,
+          startLine: s.startLine + innerStart,
+          endLine: s.endLine + innerStart,
+          depth: 1
+        });
+      }
+    }
+    i = endIdx + 1;
+  }
+  return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
+}
 function extractSymbolsFromLines(filePath, lines) {
   const ext = path4.extname(filePath).toLowerCase();
   switch (ext) {
@@ -2680,6 +3073,14 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".mjs":
     case ".cjs":
       return extractTsJsSymbols(lines);
+    case ".vue":
+    case ".svelte":
+      return extractSfcSymbols(lines);
+    case ".css":
+    case ".scss":
+    case ".less":
+    case ".pcss":
+      return extractCssSymbols(lines);
     case ".py":
       return extractPythonSymbols(lines);
     case ".go":
@@ -2713,6 +3114,20 @@ function extractSymbolsFromLines(filePath, lines) {
       return extractTsJsSymbols(lines);
   }
 }
+var MAX_OUTLINES = 40;
+var MAX_SLICE_FILES = 30;
+var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
+function selectOutlineSymbols(symbols, limit) {
+  if (symbols.length <= limit) return symbols;
+  const keptIndices = /* @__PURE__ */ new Set();
+  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
+    if (symbols[i].depth === 0) keptIndices.add(i);
+  }
+  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
+    keptIndices.add(i);
+  }
+  return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
+}
 async function runReadSlices(input) {
   const outlines = Array.isArray(input.outlines) ? input.outlines : [];
   const slices = Array.isArray(input.slices) ? input.slices : [];
@@ -2722,18 +3137,19 @@ async function runReadSlices(input) {
       isError: true
     };
   }
-  if (outlines.length > 20 || slices.length > 30) {
+  if (outlines.length > MAX_OUTLINES || slices.length > MAX_SLICE_FILES) {
     return {
-      text: "Error: limits exceeded (max 20 outlines and 30 slice files per call).",
+      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice files per call).`,
       isError: true
     };
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const maxChars = Math.max(
     1e3,
-    Math.min(8e4, Math.trunc(input.maxChars ?? 8500))
+    Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(input.maxChars ?? 8500))
   );
-  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
+  const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : 20;
   const fileCache = /* @__PURE__ */ new Map();
   async function loadLines(absPath) {
     const cached = fileCache.get(absPath);
@@ -2757,13 +3173,14 @@ async function runReadSlices(input) {
             return `## Outline: ${relPath} (${lines.length} lines)
 (no top-level symbols detected)`;
           }
-          const formatted = symbols.slice(0, 120).map((s) => {
+          const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
+          const formatted = picked.map((s) => {
             const indent = "  ".repeat(s.depth);
             const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
             return `${indent}${span} [${s.kind}] ${s.name}`;
           });
-          const extra = symbols.length > 120 ? `
-... (${symbols.length - 120} more symbols omitted)` : "";
+          const extra = symbols.length > picked.length ? `
+... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)` : "";
           return `## Outline: ${relPath} (${lines.length} lines)
 ${formatted.join("\n")}${extra}`;
         } catch (err) {
@@ -2833,6 +3250,22 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     );
     sections.push(...sliceResults);
   }
+  const rawJoined = sections.join("\n\n");
+  const rawBytes = Buffer.byteLength(rawJoined, "utf8");
+  const needsSliceTip = slices.length > 0 && (rawJoined.length > maxChars || rawBytes > maxBytes);
+  if (needsSliceTip && maxChars > SLICE_TRUNCATION_TIP.length + 200) {
+    const tipBytes = Buffer.byteLength(SLICE_TRUNCATION_TIP, "utf8");
+    const body = fitSectionsToByteBudget(
+      sections,
+      maxChars - SLICE_TRUNCATION_TIP.length,
+      maxBytes - tipBytes,
+      "\n\n"
+    );
+    return {
+      text: `${body}${SLICE_TRUNCATION_TIP}`,
+      isError: false
+    };
+  }
   return {
     text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
     isError: false
@@ -2880,8 +3313,8 @@ async function runChecks(input) {
   const concurrency = clampInt2(input.concurrency ?? 4, 1, 8);
   const defaultTimeoutSec = clampInt2(input.timeoutSec ?? 60, 1, 300);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt2(input.maxChars ?? 8e3, 500, 6e4);
-  const maxBytes = input.maxChars === void 0 ? DEFAULT_INLINE_MAX_BYTES : void 0;
+  const maxChars = clampInt2(input.maxChars ?? 8e3, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const normalized = [];
   for (let i = 0; i < input.commands.length; i++) {
     const raw = input.commands[i];
@@ -3061,8 +3494,8 @@ function createAgyFastServer() {
           maxChars: {
             type: "integer",
             minimum: 500,
-            maximum: 6e4,
-            description: "Total character cap for combined results (default 8500, inline UTF-8 capped <= 8800 bytes)."
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to avoid disk spills)."
           }
         },
         required: ["queries"]
@@ -3148,7 +3581,8 @@ function createAgyFastServer() {
           maxVerifyChars: {
             type: "integer",
             minimum: 300,
-            maximum: 2e4
+            maximum: 7500,
+            description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes)."
           }
         },
         required: ["edits"]
@@ -3159,21 +3593,21 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Extract symbol outlines (with line ranges) and/or batch-read exact line ranges across multiple files in one call to keep context compact.",
+      description: "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across up to 40 files in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
       inputSchema: {
         type: "object",
         properties: {
           cwd: { type: "string" },
           outlines: {
             type: "array",
-            maxItems: 20,
+            maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol line ranges from."
+            description: "File paths to extract top-level symbol/section line ranges from (max 40)."
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Files and 1-based inclusive [startLine, endLine] ranges to read.",
+            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes).",
             items: {
               type: "object",
               properties: {
@@ -3195,8 +3629,8 @@ function createAgyFastServer() {
           maxChars: {
             type: "integer",
             minimum: 1e3,
-            maximum: 8e4,
-            description: "Total character cap across all outlines and slices (default 8500, inline UTF-8 capped <= 8800 bytes)."
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills)."
           }
         }
       }
@@ -3206,7 +3640,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Run multiple build, typecheck, lint, or test commands concurrently with compact output filtering (1-line pass summaries, error lines on failure).",
+      description: "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
       inputSchema: {
         type: "object",
         properties: {
@@ -3242,13 +3676,13 @@ function createAgyFastServer() {
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
-            description: "Compact hides verbose pass logs (default 'compact')."
+            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands."
           },
           maxChars: {
             type: "integer",
             minimum: 500,
-            maximum: 6e4,
-            description: "Total character cap (default 8000, inline UTF-8 capped <= 8800 bytes)."
+            maximum: 8800,
+            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes)."
           }
         },
         required: ["commands"]

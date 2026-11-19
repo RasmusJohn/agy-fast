@@ -90,9 +90,8 @@ export async function runChecks(
   const concurrency = clampInt(input.concurrency ?? 4, 1, 8);
   const defaultTimeoutSec = clampInt(input.timeoutSec ?? 60, 1, 300);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt(input.maxChars ?? 8_000, 500, 60_000);
-  const maxBytes =
-    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
+  const maxChars = clampInt(input.maxChars ?? 8_000, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
 
   const normalized: NormalizedCommand[] = [];
   for (let i = 0; i < input.commands.length; i++) {

@@ -650,8 +650,9 @@ async function runGlobQuery(
     return matched ? rel : "(no files matched)";
   }
 
+  const scanLimit = Math.max(maxResults + 1, 2000);
   const walked = await walkFiles(searchRoot, {
-    maxFiles: maxResults + 1,
+    maxFiles: scanLimit,
     includeHidden: pattern.startsWith(".") || pattern.includes("/."),
     fileFilter: (relPosix) => {
       if (matcher.test(relPosix)) return true;
@@ -664,16 +665,39 @@ async function runGlobQuery(
   });
 
   const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
-  const items = walked.files.slice(0, maxResults).map((f) => {
+  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
   });
-  const truncated = walked.truncated || walked.files.length > maxResults;
+  const truncated = walked.truncated || sortedFiles.length > maxResults;
 
   if (items.length === 0) {
     return "(no files matched)";
   }
-  const suffix = truncated ? `\n... [truncated at ${maxResults} files]` : "";
+
+  if (!truncated) {
+    return items.join("\n");
+  }
+
+  // Summarize omitted matches by top-level directory so callers can scope follow-ups
+  const omitted = sortedFiles.slice(maxResults);
+  const dirCounts = new Map<string, number>();
+  for (const f of omitted) {
+    const slash = f.indexOf("/");
+    const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
+    dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
+  }
+  const topDirs = [...dirCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 6)
+    .map(([dir, cnt]) => `${dir} (${cnt})`);
+  const totalLabel = walked.truncated
+    ? `${walked.files.length}+`
+    : String(walked.files.length);
+  const dirSummary =
+    topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
+  const suffix = `\n... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
   return `${items.join("\n")}${suffix}`;
 }
 
@@ -803,9 +827,8 @@ export async function runBatchSearch(
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
 
-  const maxChars = clampInt(input.maxChars ?? 8_500, 500, 60_000);
-  const maxBytes =
-    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
+  const maxChars = clampInt(input.maxChars ?? 8_500, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const needsTextSearch = input.queries.some(
     (q) => q.type === "text" || q.type === "regex",
   );

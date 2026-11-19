@@ -202,7 +202,30 @@ export function fitSectionsToByteBudget(
 }
 
 const ERROR_LINE_PATTERN =
-  /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b)/i;
+  /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+
+const ROOT_CAUSE_HEADER_PATTERN =
+  /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯+\s*failed tests|compilation error)/i;
+
+const JSON_INFO_LOG_PATTERNS: RegExp[] = [
+  /^\s*\{"level":(?:10|20|30)\b/,
+  /^\s*\{[^}]*"level"\s*:\s*"(?:trace|debug|info)"/i,
+];
+
+const ALWAYS_NOISE_LINE_PATTERNS: RegExp[] = [
+  /^\[ERROR\]\s*(?:To see the full stack trace|Re-run Maven using the -X|For more information about the errors|\[Help \d+\]|->\s*\[Help \d+\])/i,
+  /^\(node:\d+\)\s*ExperimentalWarning:/,
+  /^\(Use `node --trace-warnings/,
+];
+
+function isFailureNoiseLine(line: string): boolean {
+  if (ALWAYS_NOISE_LINE_PATTERNS.some((re) => re.test(line))) return true;
+  if (JSON_INFO_LOG_PATTERNS.some((re) => re.test(line))) {
+    // Never strip a structured log line if it reports an actual 5xx/error/exception
+    return !/"statusCode"\s*:\s*5\d\d|\b(?:error|exception|failed|fatal)\b/i.test(line);
+  }
+  return false;
+}
 
 const SUMMARY_LINE_PATTERN =
   /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
@@ -248,23 +271,32 @@ export function formatCompactCommandOutput(params: {
     return truncateWithNotice(picked.join(" | "), Math.min(params.maxChars, 320));
   }
 
-  // Non-zero exit: extract error-relevant windows plus tail
-  const lines = combined.split("\n");
-  if (combined.length <= params.maxChars) {
-    return combined || `Exited with code ${params.exitCode ?? "unknown"}`;
+  // Non-zero exit: drop noisy info JSON / Maven boilerplate lines first
+  const rawLines = combined.split("\n");
+  const filteredLines = rawLines.filter((line) => !isFailureNoiseLine(line));
+  const lines = filteredLines.length > 0 ? filteredLines : rawLines;
+  const cleanedCombined = lines.join("\n");
+
+  if (cleanedCombined.length <= params.maxChars) {
+    return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
   }
 
   const keepIndices = new Set<number>();
   for (let i = 0; i < lines.length; i++) {
-    if (ERROR_LINE_PATTERN.test(lines[i]!)) {
+    const line = lines[i]!;
+    if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
+      const from = Math.max(0, i - 1);
+      const to = Math.min(lines.length - 1, i + 8);
+      for (let j = from; j <= to; j++) keepIndices.add(j);
+    } else if (ERROR_LINE_PATTERN.test(line)) {
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
       for (let j = from; j <= to; j++) keepIndices.add(j);
     }
   }
 
-  // Always include the last 15 lines for final summary/stack tail
-  const tailStart = Math.max(0, lines.length - 15);
+  // Always include the last 12 non-noise lines for final summary/stack tail
+  const tailStart = Math.max(0, lines.length - 12);
   for (let i = tailStart; i < lines.length; i++) {
     keepIndices.add(i);
   }

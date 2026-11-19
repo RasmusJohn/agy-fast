@@ -334,5 +334,33 @@ describe("batch_search", () => {
     );
     assert.match(cjkRes.text, /## Query 2/);
     assert.match(cjkRes.text, /getUsers/);
+
+    // Explicit maxChars > 8800 is still hard-capped <= 8800 UTF-8 bytes
+    const explicitLarge = await runBatchSearch({
+      cwd: tmpDir,
+      maxChars: 50_000,
+      queries: [{ type: "text", pattern: "CJK_MATCH", path: "cjk-heavy.txt", maxResults: 120 }],
+    });
+    assert.equal(explicitLarge.isError, false);
+    assert.ok(Buffer.byteLength(explicitLarge.text, "utf8") <= 8_800);
+
+    // Glob truncation reports omitted top-level directories
+    const globDir = path.join(tmpDir, "glob-many");
+    await fs.mkdir(path.join(globDir, "alpha"), { recursive: true });
+    await fs.mkdir(path.join(globDir, "views"), { recursive: true });
+    await fs.mkdir(path.join(globDir, "components"), { recursive: true });
+    for (let i = 0; i < 6; i++) {
+      await fs.writeFile(path.join(globDir, "alpha", `a${i}.ts`), "x", "utf8");
+      await fs.writeFile(path.join(globDir, "views", `v${i}.vue`), "x", "utf8");
+      await fs.writeFile(path.join(globDir, "components", `c${i}.vue`), "x", "utf8");
+    }
+    const globTrunc = await runBatchSearch({
+      cwd: globDir,
+      queries: [{ type: "glob", pattern: "**/*", maxResults: 5 }],
+    });
+    assert.equal(globTrunc.isError, false);
+    assert.match(globTrunc.text, /truncated at 5 of 18 files/);
+    assert.match(globTrunc.text, /omitted dirs:/);
+    assert.match(globTrunc.text, /views\/ \(6\)/);
   });
 });

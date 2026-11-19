@@ -284,4 +284,144 @@ describe("read_slices", () => {
       ["key:name", "key:scripts"],
     );
   });
+
+  it("extracts Vue SFC blocks, CSS structure, TS no-semi types, multiline object-param functions, and Fastify routes", () => {
+    const vueSyms = extractSymbols(
+      "App.vue",
+      [
+        '<script setup lang="ts">',
+        "interface NavItem { label: string }",
+        "function toggleMenu() {",
+        "  return true",
+        "}",
+        "</script>",
+        "",
+        "<template>",
+        "  <header class=\"top-bar\">",
+        "    <template #slotA>nested</template>",
+        "  </header>",
+        ...Array.from({ length: 32 }, (_, i) => `  <div>row ${i}</div>`),
+        "  <!-- Modal Section -->",
+        "  <ConfirmModal />",
+        "</template>",
+        "",
+        "<style scoped>",
+        "/* Layout */",
+        "@media (max-width: 768px) {",
+        "  .top-bar { display: none; }",
+        "}",
+        "</style>",
+      ].join("\n"),
+    );
+    assert.ok(vueSyms.some((s) => s.kind === "script" && s.startLine === 1 && s.endLine === 6));
+    assert.ok(vueSyms.some((s) => s.kind === "function" && s.name === "toggleMenu" && s.startLine === 3));
+    assert.ok(vueSyms.some((s) => s.kind === "template" && s.startLine === 8 && s.endLine === 46));
+    assert.ok(vueSyms.some((s) => s.kind === "style" && s.startLine === 48 && s.endLine === 53));
+    assert.ok(vueSyms.some((s) => s.kind === "@media" && s.startLine === 50));
+
+    const cssSyms = extractSymbols(
+      "base.css",
+      [
+        "/* === Design Tokens === */",
+        ":root {",
+        "  --accent: #111;",
+        "}",
+        '[data-theme="dark"] {',
+        "  --accent: #fff;",
+        "}",
+        "@keyframes fadeIn {",
+        "  from { opacity: 0; }",
+        "  to { opacity: 1; }",
+        "}",
+        "@media (max-width: 900px) {",
+        "  .grid { display: block; }",
+        "}",
+      ].join("\n"),
+    );
+    assert.ok(cssSyms.some((s) => s.kind === "section" && s.name === "Design Tokens"));
+    assert.ok(cssSyms.some((s) => s.kind === "tokens" && s.name === ":root" && s.endLine === 4));
+    assert.ok(cssSyms.some((s) => s.kind === "tokens" && s.name.includes("data-theme") && s.endLine === 7));
+    assert.ok(cssSyms.some((s) => s.kind === "@keyframes" && s.name === "fadeIn"));
+    assert.ok(cssSyms.some((s) => s.kind === "@media"));
+
+    const tsNoSemiSyms = extractSymbols(
+      "runtime.ts",
+      [
+        "export type RuntimeMode = 'simulation' | 'live'",
+        "",
+        "export interface EnvConfig {",
+        "  dbPath: string",
+        "}",
+        "",
+        "export async function startServer(",
+        "  options: { port: number; host?: string },",
+        "): Promise<{ ok: boolean }> {",
+        ...Array.from({ length: 42 }, (_, i) => `  const line${i} = ${i}`),
+        "  app.get('/api/health', async () => {",
+        "    return { ok: true }",
+        "  })",
+        "  return { ok: true }",
+        "}",
+      ].join("\n"),
+    );
+    const modeSym = tsNoSemiSyms.find((s) => s.name === "RuntimeMode");
+    const fnSym = tsNoSemiSyms.find((s) => s.name === "startServer");
+    const routeSym = tsNoSemiSyms.find((s) => s.kind === "route" && s.name === "GET /api/health");
+    assert.ok(modeSym && modeSym.startLine === 1 && modeSym.endLine === 1, `Bad type span: ${JSON.stringify(modeSym)}`);
+    assert.ok(fnSym && fnSym.startLine === 7 && fnSym.endLine === 56, `Bad fn span: ${JSON.stringify(fnSym)}`);
+    assert.ok(routeSym && routeSym.startLine === 52 && routeSym.endLine === 54, `Bad route: ${JSON.stringify(routeSym)}`);
+  });
+
+  it("supports up to 40 outlines with multi-file fairness and hard-caps explicit maxChars <= 8800 UTF-8 bytes", async () => {
+    const manyDir = path.join(tmpDir, "many-outlines");
+    await fs.mkdir(manyDir, { recursive: true });
+    const paths: string[] = [];
+    for (let i = 0; i < 24; i++) {
+      const rel = `many-outlines/f${i}.ts`;
+      paths.push(rel);
+      const body =
+        i === 0
+          ? [
+              "export class HugeStore {",
+              ...Array.from({ length: 60 }, (_, m) => `  method${m}() { return ${m}; }`),
+              "}",
+              "export function tailHelper() { return 1; }",
+            ].join("\n")
+          : `export function fn${i}() { return ${i}; }\n`;
+      await fs.writeFile(path.join(tmpDir, rel), body, "utf8");
+    }
+
+    const outlineRes = await runReadSlices({ cwd: tmpDir, outlines: paths });
+    assert.equal(outlineRes.isError, false);
+    assert.ok(Buffer.byteLength(outlineRes.text, "utf8") <= 8_800);
+    // Depth-0 tailHelper must survive even though HugeStore has 60 methods
+    assert.match(outlineRes.text, /tailHelper/);
+    assert.match(outlineRes.text, /fn23/);
+
+    const tooMany = await runReadSlices({
+      cwd: tmpDir,
+      outlines: Array.from({ length: 41 }, () => paths[0]!),
+    });
+    assert.equal(tooMany.isError, true);
+    assert.match(tooMany.text, /max 40 outlines/);
+
+    // Explicit maxChars: 42000 must still stay <= 8800 bytes and surface read_file tip
+    const bigSliceFile = path.join(tmpDir, "big-slice.ts");
+    await fs.writeFile(
+      bigSliceFile,
+      Array.from({ length: 300 }, (_, i) => `export const row_${i} = "${"中文测试".repeat(10)}";`).join("\n"),
+      "utf8",
+    );
+    const capped = await runReadSlices({
+      cwd: tmpDir,
+      slices: [{ path: "big-slice.ts", ranges: [[1, 300]] }],
+      maxChars: 42_000,
+    });
+    assert.equal(capped.isError, false);
+    assert.ok(
+      Buffer.byteLength(capped.text, "utf8") <= 8_800,
+      `Expected <= 8800B, got ${Buffer.byteLength(capped.text, "utf8")}`,
+    );
+    assert.match(capped.text, /use parallel read_file/);
+  });
 });

@@ -1,27 +1,27 @@
-# agy-fast Tool Routing Rules
+# agy-fast Tool Routing & Latency Hygiene Rules
 
-Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote check (~1.8s) and prevents context bloat, and keep built-in `read_file` for allowlisted fast narrow reads (~7ms):
+Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote check (~1.8s) and keeps context lean, and use built-in `read_file` for allowlisted fast reads (~7ms, 46 KB inline cap per call):
 
 | Task | Preferred Tool | Reason |
 | :--- | :--- | :--- |
-| Read 1-4 small files (<300 lines) OR 1-4 **narrow** known line ranges (<=150 lines) | Built-in `read_file` (parallel in one turn) | Locally allowlisted (~7ms, skips remote check) |
-| Inspect ANY large unknown file (>300 lines, especially >=2 large files), OR read >=5 scattered ranges | `read_slices` (`outlines` first, then narrow ranges) | **Do NOT blind-read `1-800` on large files**—prevents 300k+ context bloat & slow TTFT |
-| Run >=2 text/regex/glob/read-only `git` queries (even across multiple directories/repos) | `batch_search` (pack ALL queries into **one** call via per-query `path`) | 1 remote check + concurrent local execution (<70ms), auto-capped <=8.8 KB inline |
-| Edit >=2 blocks in one file, edit/create/overwrite >=2 files in one turn, OR any edit + verify | `apply_edits` (`bestEffort: true` for >=4 files; optional `verify`) | Replaces N serial checks + verify turn; `bestEffort` commits valid files & returns closest-line hints on mismatch |
-| Run >=2 standalone build, typecheck, lint, or test commands (not already chained in `apply_edits.verify`) | `run_checks` (`outputMode: "compact"`) | Concurrent execution with 1-line pass summaries |
+| Outline unknown large files (>300 lines, up to 40 files: TS/JS/Vue/Svelte/CSS/Py/Go/Rust/Java/MD/JSON/YAML) | `read_slices({ outlines: [...] })` | 1 call maps exact symbol/section line ranges without blind full-file dumps |
+| Read small files (<300 lines) OR **any** known line ranges after outlining (even 4-8 scattered ranges) | Built-in `read_file` (parallel in one turn, with `StartLine`/`EndLine` <=200 lines) | Locally allowlisted (~7ms, **0 remote check**) + **46 KB/call** inline vs MCP's 8.8 KB total cap |
+| Run >=2 text/regex/glob/read-only `git` queries (even across multiple directories/repos) | `batch_search` (pack ALL queries into **one** call via per-query `path`) | 1 remote check + concurrent local execution (<70ms), hard-capped <=8.8 KB inline |
+| Edit >=2 blocks in one file, edit/create/overwrite >=2 files in one turn, OR any edit + verify | `apply_edits` (`bestEffort: true` for >=3 files; optional `verify`) | Replaces N serial checks + verify turn; `bestEffort` commits valid files & returns closest-line / drifted-line hints |
+| Run >=2 independent non-interactive shell commands in one turn | `run_checks` (`outputMode: "compact"` for build/lint/test; `"full"` for diagnostic/inspection scripts) | 1 remote check + concurrent execution instead of N serial `run_command` checks |
 
 ## Rules
 
-1. **Direct invocation (no schema read turn)**: When `agy-fast_fast` tools are lazily loaded, call `call_mcp_tool` directly with `ServerName: "agy-fast_fast"` using the exact schemas below. Do **not** spend a turn reading `mcp/agy-fast_fast/*.json` first.
-2. **Keep context lean (no blind `1-800` dumps)**: On files >300 lines whose layout you don't know, call `read_slices({ outlines: [...] })` first to get exact symbol line numbers, then fetch only the needed <=150-line sections.
-3. **Apply across all directories and file types**: Use `apply_edits` and `batch_search` consistently for code, HTML/CSS, docs, scripts, and non-repo scratch folders—do not fall back to multi-call `edit_file`/`write_file` in long conversations.
-4. **Use `bestEffort: true` on large multi-file edits**: When editing >=4 files in one `apply_edits` call, pass `bestEffort: true` (and keep batches <=6-8 files) so a typo in 1 file never forces regenerating all files.
-5. **Pack into ONE MCP call per turn**: Each `call_mcp_tool` pays ~1.8s of remote evaluation. Combine cross-repo searches into one `batch_search` (via `queries[].path`), combine edits + verify into one `apply_edits`, and avoid wrapping a single trivial `git status` alone.
-6. **Pass `cwd`, use the startup snapshot, avoid duplicate reads**: Always pass the active workspace root in `cwd`, read the `SessionStart` snapshot before running `ls`/`git status`, and delegate wide codebase surveys to subagents.
+1. **Direct invocation (no schema read turn)**: When `agy-fast_fast` tools are lazily loaded, call `call_mcp_tool` directly with `ServerName: "agy-fast_fast"` using the schemas below. Do **not** spend a turn reading `mcp/agy-fast_fast/*.json` first.
+2. **Outline via `read_slices`, read code via parallel `read_file`**: On unknown files >300 lines, call `read_slices({ outlines: [...] })` first (you may piggyback 1-2 tiny <=120-line slices in the same call), then fetch needed <=200-line sections with parallel built-in `read_file(StartLine, EndLine)`. **Do NOT** use `read_slices({ slices })` to bulk-read >150 lines across multiple files (MCP output is hard-capped <=8.8 KB inline and will truncate), and **do NOT** blind-read `1-800` on large unknown files.
+3. **Keep screenshots/images out of long coding sessions (TTFT hygiene)**: Loading multiple `.png`/`.jpg` screenshots into a long (>180k-token) coding conversation causes a **3-7x TTFT cliff (40-97s/turn)** due to multimodal KV-cache scheduling. Delegate visual/UI screenshot inspection to a subagent that returns a **text-only** list of findings (file paths, selectors, concrete fixes); do **not** re-read those screenshots in the main coding session unless strictly unavoidable.
+4. **Prevent context bloat & cache expiry**: Keep subagent reports structured and concise (no raw file dumps). For large `git diff`/`git show` in `batch_search`, run `--stat` or path-scoped diffs first. In long (>200k-token) multi-phase tasks, batch tool calls aggressively—avoid tiny single-read/single-search turns that pay full TTFT for <300 output tokens—and recommend `/compact` or a fresh session between major phases (e.g., audit -> backend -> frontend).
+5. **Apply across all directories & use `bestEffort: true` for >=3 files**: Use `apply_edits` and `batch_search` consistently for code, Vue/HTML/CSS, docs, scripts, and scratch folders. For `apply_edits` touching >=3 files, pass `bestEffort: true` (batches <=6-8 files) so one mismatch never rolls back valid files.
+6. **Pack into ONE MCP call per turn & use the startup snapshot**: Combine cross-repo searches into one `batch_search`, combine edits + verify into one `apply_edits`, pass `cwd`, read the `SessionStart` snapshot before running `ls`/`git status`, and avoid issuing 2 parallel `call_mcp_tool` calls of the same kind in one turn.
 
 ## Quick Schemas (`ServerName: "agy-fast_fast"`)
 
-- **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"git", pattern, path?, glob?, caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars? }` (1-20 queries; `path` may be relative or absolute; read-only git only).
-- **`apply_edits`**: `{ cwd?, edits: [{ path, hunks?: [{ target, replacement, startLine?, endLine?, replaceAll? }], create?: string, overwrite?: boolean }], dryRun?, bestEffort?, verify?: string, verifyTimeoutSec?, maxVerifyChars? }` (1-50 files; `create` is full file text and mutually exclusive with `hunks`).
-- **`read_slices`**: `{ cwd?, outlines?: string[], slices?: [{ path, ranges: [[startLine, endLine], ...] }], maxChars? }` (1-based inclusive line ranges).
-- **`run_checks`**: `{ cwd?, commands: [{ name?, command, cwd?, timeoutSec? }], concurrency?: 1..8, timeoutSec?, outputMode?: "compact"|"full", maxChars? }`.
+- **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"git", pattern, path?, glob?, caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars?: 500..8800 }` (1-20 queries; `path` relative or absolute; read-only git only).
+- **`apply_edits`**: `{ cwd?, edits: [{ path, hunks?: [{ target, replacement, startLine?, endLine?, replaceAll? }], create?: string, overwrite?: boolean }], dryRun?, bestEffort?, verify?: string, verifyTimeoutSec?, maxVerifyChars?: 300..7500 }` (1-50 files; `create` is mutually exclusive with `hunks`).
+- **`read_slices`**: `{ cwd?, outlines?: string[], slices?: [{ path, ranges: [[startLine, endLine], ...] }], maxChars?: 1000..8800 }` (up to 40 outlines; 1-based inclusive line ranges).
+- **`run_checks`**: `{ cwd?, commands: [{ name?, command, cwd?, timeoutSec? }], concurrency?: 1..8, timeoutSec?, outputMode?: "compact"|"full", maxChars?: 500..8800 }` (1-12 commands).

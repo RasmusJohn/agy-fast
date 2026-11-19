@@ -243,6 +243,24 @@ describe("session-start hook", () => {
       assert.match(msg, /output\/ \(15 entries\)/);
       assert.match(msg, /tmp\/ \(15 entries\)/);
       assert.doesNotMatch(msg, /\.claude\//);
+
+      // Verify 2nd-level subdir prioritization & build/report filtering (e.g. SourcingAgent/ in monorepo)
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "data"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "dist-server"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "docs"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "memory"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "playwright-report"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "public"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "src"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "tests"), { recursive: true });
+      await fs.mkdir(path.join(monoDir, "SourcingAgent", "zebra"), { recursive: true });
+
+      const res2 = await runHook(JSON.stringify({ cwd: monoDir, workspacePaths: [monoDir] }));
+      assert.equal(res2.code, 0);
+      const msg2: string = JSON.parse(res2.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.match(msg2, /SourcingAgent\/ \(src\/, tests\//);
+      assert.doesNotMatch(msg2, /dist-server/);
+      assert.doesNotMatch(msg2, /playwright-report/);
     } finally {
       await fs.rm(monoDir, { recursive: true, force: true });
     }

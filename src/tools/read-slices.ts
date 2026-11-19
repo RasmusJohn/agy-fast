@@ -31,6 +31,7 @@ interface ScanState {
   inBlockComment: boolean;
   templateExprStack: number[]; // tracks open `{` depth inside `${...}` of nested template strings
   inBacktick: boolean;
+  parenDepth?: number;
 }
 
 function isRegexStartContext(line: string, slashIdx: number): boolean {
@@ -60,11 +61,22 @@ function scanBracesOnLine(
   line: string,
   state: ScanState,
   lang: BraceLang,
-): { open: number; close: number; openParen: number; closeParen: number; endsWithSemi: boolean } {
+  ignoreBracesInParensBeforeOpen = false,
+  alreadySeenOpen = false,
+): {
+  open: number;
+  close: number;
+  openParen: number;
+  closeParen: number;
+  endsWithSemi: boolean;
+  lastCodeChar: string;
+} {
   let open = 0;
   let close = 0;
   let openParen = 0;
   let closeParen = 0;
+  let parenDepth = state.parenDepth ?? 0;
+  let seenOpen = alreadySeenOpen;
   let inSingle = false;
   let inDouble = false;
   let inRegex = false;
@@ -167,8 +179,9 @@ function scanBracesOnLine(
     if (ch === "{") {
       if (state.templateExprStack.length > 0) {
         state.templateExprStack[state.templateExprStack.length - 1]! += 1;
-      } else {
+      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
         open++;
+        seenOpen = true;
       }
       lastCodeChar = "{";
     } else if (ch === "}") {
@@ -180,20 +193,24 @@ function scanBracesOnLine(
         } else {
           state.templateExprStack[state.templateExprStack.length - 1] = top - 1;
         }
-      } else {
+      } else if (!(ignoreBracesInParensBeforeOpen && !seenOpen && parenDepth > 0)) {
         close++;
       }
       lastCodeChar = "}";
     } else if (ch === "(") {
       openParen++;
+      parenDepth++;
       lastCodeChar = "(";
     } else if (ch === ")") {
       closeParen++;
+      parenDepth = Math.max(0, parenDepth - 1);
       lastCodeChar = ")";
     } else if (!/\s/.test(ch)) {
       lastCodeChar = ch;
     }
   }
+
+  state.parenDepth = parenDepth;
 
   return {
     open,
@@ -201,6 +218,7 @@ function scanBracesOnLine(
     openParen,
     closeParen,
     endsWithSemi: lastCodeChar === ";",
+    lastCodeChar,
   };
 }
 
@@ -210,36 +228,110 @@ function findBraceBlockEnd(
   lang: BraceLang = "c",
 ): number {
   let depth = 0;
-  let parenDepth = 0;
   let seenOpen = false;
   const state: ScanState = {
     inBlockComment: false,
     templateExprStack: [],
     inBacktick: false,
+    parenDepth: 0,
   };
   const maxScan = Math.min(lines.length, startIdx + 2000);
 
   for (let i = startIdx; i < maxScan; i++) {
-    const { open, close, openParen, closeParen, endsWithSemi } = scanBracesOnLine(
+    const { open, close, endsWithSemi, lastCodeChar } = scanBracesOnLine(
       lines[i]!,
       state,
       lang,
+      lang === "js",
+      seenOpen,
     );
     if (open > 0) seenOpen = true;
     depth += open - close;
-    parenDepth += openParen - closeParen;
     if (seenOpen && depth <= 0) {
+      // Inline generic return type like `): Promise<{ ok: boolean }>\n{` closes with `>` before body `{`
+      if (lang === "js" && lastCodeChar === ">" && i <= startIdx + 12) {
+        seenOpen = false;
+        depth = 0;
+        continue;
+      }
       return i + 1;
     }
-    if (!seenOpen && parenDepth <= 0 && endsWithSemi) {
+    if (!seenOpen && (state.parenDepth ?? 0) <= 0 && endsWithSemi) {
       return i + 1;
     }
-    // Multiline signature without opening brace after 15 lines
-    if (!seenOpen && i > startIdx + 15) {
+    // Multiline signature without opening brace after 40 lines
+    if (!seenOpen && i > startIdx + 40) {
       return startIdx + 1;
     }
   }
   return seenOpen ? Math.min(lines.length, maxScan) : startIdx + 1;
+}
+
+function findTypeAliasEnd(lines: string[], startIdx: number): number {
+  const firstLine = lines[startIdx] ?? "";
+  const eqIdx = firstLine.indexOf("=");
+  const rhs = eqIdx >= 0 ? firstLine.slice(eqIdx + 1) : firstLine;
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0,
+  };
+  const firstScan = scanBracesOnLine(rhs, state, "js");
+  if (firstScan.open > firstScan.close) {
+    return findBraceBlockEnd(lines, startIdx, "js");
+  }
+  if (firstScan.endsWithSemi && firstScan.openParen <= firstScan.closeParen) {
+    return startIdx + 1;
+  }
+
+  // Handle multiline union/intersection/mapped types without braces (including semi: false style)
+  let endIdx = startIdx;
+  let parenBal = firstScan.openParen - firstScan.closeParen;
+  let prevLast = firstScan.lastCodeChar;
+  const maxScan = Math.min(lines.length - 1, startIdx + 40);
+  while (endIdx < maxScan) {
+    const nextLine = lines[endIdx + 1] ?? "";
+    const nextTrim = nextLine.trim();
+    if (!nextTrim) break;
+    const isContinuation =
+      parenBal > 0 ||
+      prevLast === "=" ||
+      prevLast === "|" ||
+      prevLast === "&" ||
+      prevLast === "?" ||
+      prevLast === ":" ||
+      /^[ \t]+(?:[|&?:]|\w+\s*\?*:)/.test(nextLine);
+    if (!isContinuation) break;
+    endIdx++;
+    const scan = scanBracesOnLine(nextLine, state, "js");
+    if (scan.open > scan.close) {
+      return findBraceBlockEnd(lines, endIdx, "js");
+    }
+    parenBal += scan.openParen - scan.closeParen;
+    prevLast = scan.lastCodeChar;
+    if (scan.endsWithSemi && parenBal <= 0) break;
+  }
+  return endIdx + 1;
+}
+
+function findParenCallEnd(lines: string[], startIdx: number): number {
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+    parenDepth: 0,
+  };
+  let seenParen = false;
+  const maxScan = Math.min(lines.length, startIdx + 400);
+  for (let i = startIdx; i < maxScan; i++) {
+    const { openParen } = scanBracesOnLine(lines[i]!, state, "js");
+    if (openParen > 0) seenParen = true;
+    if (seenParen && (state.parenDepth ?? 0) <= 0) {
+      return i + 1;
+    }
+  }
+  return startIdx + 1;
 }
 
 function hasArrowOrBraceWithin(lines: string[], startIdx: number, maxLookahead = 12): { hasArrow: boolean; hasBrace: boolean } {
@@ -320,8 +412,15 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
     "delete",
   ]);
 
+  const routeRegisterRe =
+    /^[ \t]{1,6}(?:app|router|server|fastify)\.(get|post|put|patch|delete|all|route)\s*(?:<[^>]*>)?\s*\(\s*['"`]([^'"`]+)['"`]/;
+  const testSuiteRe = /^(?:describe|suite)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
+  const testCaseRe = /^[ \t]{0,4}(?:it|test)(?:\.(?:only|skip))?\s*\(\s*['"`]([^'"`]+)['"`]/;
+
   let currentClassEnd = -1;
   let currentClassIndent = -1;
+  let currentFnEnd = -1;
+  let currentSuiteEnd = -1;
   const commentState: ScanState = {
     inBlockComment: false,
     templateExprStack: [],
@@ -344,7 +443,10 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
       for (const p of patterns) {
         const m = p.re.exec(line);
         if (m && m[p.nameGroup]) {
-          const endLine = findBraceBlockEnd(lines, i, "js");
+          const endLine =
+            p.kind === "type"
+              ? findTypeAliasEnd(lines, i)
+              : findBraceBlockEnd(lines, i, "js");
           symbols.push({
             kind: p.kind,
             name: m[p.nameGroup]!,
@@ -355,6 +457,8 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
           if (p.kind === "class") {
             currentClassEnd = endLine;
             currentClassIndent = -1;
+          } else if (p.kind === "function" && endLine - (i + 1) >= 40) {
+            currentFnEnd = endLine;
           }
           matchedTop = true;
           break;
@@ -374,8 +478,27 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
               endLine,
               depth: 0,
             });
+            if (endLine - (i + 1) >= 40) {
+              currentFnEnd = endLine;
+            }
             matchedTop = true;
           }
+        }
+      }
+
+      if (!matchedTop) {
+        const ms = testSuiteRe.exec(line);
+        if (ms && ms[1]) {
+          const endLine = findParenCallEnd(lines, i);
+          symbols.push({
+            kind: "suite",
+            name: ms[1].slice(0, 64),
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+          currentSuiteEnd = endLine;
+          matchedTop = true;
         }
       }
     }
@@ -400,6 +523,30 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
             });
           }
         }
+      }
+    } else if (!matchedTop && i + 1 <= currentFnEnd) {
+      const mr = routeRegisterRe.exec(line);
+      if (mr && mr[1] && mr[2]) {
+        const endLine = findParenCallEnd(lines, i);
+        symbols.push({
+          kind: "route",
+          name: `${mr[1].toUpperCase()} ${mr[2]}`,
+          startLine: i + 1,
+          endLine,
+          depth: 1,
+        });
+      }
+    } else if (!matchedTop) {
+      const mt = testCaseRe.exec(line);
+      if (mt && mt[1]) {
+        const endLine = findParenCallEnd(lines, i);
+        symbols.push({
+          kind: "test",
+          name: mt[1].slice(0, 64),
+          startLine: i + 1,
+          endLine,
+          depth: i + 1 <= currentSuiteEnd ? 1 : 0,
+        });
       }
     }
   }
@@ -756,6 +903,238 @@ function extractJsonYamlSymbols(lines: string[], isJson: boolean): SymbolEntry[]
   return symbols;
 }
 
+function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const state: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+  };
+  let braceDepth = 0;
+
+  const atRuleRe = /^@(layer|media|keyframes|supports|container|font-face|theme)\b([^{;]*)/i;
+  const tokenBlockRe =
+    /^(:root\b|html(?:\[[^\]]+\]|\.[A-Za-z_-][\w-]*)?(?=\s|[,{])|\[data-theme[^\]]*\]|body\b)[^{;]*\{/;
+  const sectionCommentRe = /^\/\*\s*[=\-*#]*\s*([^*/=][^*/]{1,70}?)\s*[=\-*#]*\s*\*\/$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    const wasInComment = state.inBlockComment;
+
+    if (!wasInComment && braceDepth === 0 && trimmed) {
+      const cm = sectionCommentRe.exec(trimmed);
+      if (cm && cm[1] && /[A-Za-z0-9\u4e00-\u9fff]/.test(cm[1])) {
+        symbols.push({
+          kind: "section",
+          name: cm[1].trim().slice(0, 64),
+          startLine: i + 1,
+          endLine: i + 1,
+          depth: 0,
+        });
+      } else {
+        const am = atRuleRe.exec(trimmed);
+        if (am && am[1]) {
+          const endLine = trimmed.includes("{")
+            ? findBraceBlockEnd(lines, i, "c")
+            : i + 1;
+          const rest = (am[2] ?? "").trim().replace(/\s+/g, " ").slice(0, 56);
+          symbols.push({
+            kind: `@${am[1].toLowerCase()}`,
+            name: rest || `@${am[1].toLowerCase()}`,
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+        } else {
+          const tm = tokenBlockRe.exec(trimmed);
+          if (tm && tm[1]) {
+            const endLine = findBraceBlockEnd(lines, i, "c");
+            const header = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
+            symbols.push({
+              kind: "tokens",
+              name: header || tm[1],
+              startLine: i + 1,
+              endLine,
+              depth: 0,
+            });
+          }
+        }
+      }
+    }
+
+    const { open, close } = scanBracesOnLine(line, state, "c");
+    braceDepth = Math.max(0, braceDepth + open - close);
+  }
+
+  // If few structural blocks were found in a standalone CSS/SCSS file, sample top-level rule groups
+  if (!compactOnly && symbols.length < 10) {
+    const fallbackState: ScanState = {
+      inBlockComment: false,
+      templateExprStack: [],
+      inBacktick: false,
+    };
+    let d = 0;
+    let lastAddedLine = -999;
+    const seen = new Set(symbols.map((s) => s.startLine));
+    for (let i = 0; i < lines.length && symbols.length < 40; i++) {
+      const line = lines[i]!;
+      const trimmed = line.trim();
+      const wasInComment = fallbackState.inBlockComment;
+      if (
+        !wasInComment &&
+        d === 0 &&
+        !seen.has(i + 1) &&
+        i - lastAddedLine >= 10 &&
+        /^[.#\[a-zA-Z*:]/.test(trimmed) &&
+        trimmed.includes("{") &&
+        !trimmed.startsWith("@")
+      ) {
+        const sel = trimmed.slice(0, trimmed.indexOf("{")).trim().replace(/\s+/g, " ").slice(0, 60);
+        if (sel) {
+          const endLine = findBraceBlockEnd(lines, i, "c");
+          symbols.push({
+            kind: "rule",
+            name: sel,
+            startLine: i + 1,
+            endLine,
+            depth: 0,
+          });
+          lastAddedLine = i;
+        }
+      }
+      const { open, close } = scanBracesOnLine(line, fallbackState, "c");
+      d = Math.max(0, d + open - close);
+    }
+    symbols.sort((a, b) => a.startLine - b.startLine);
+  }
+
+  return symbols;
+}
+
+function extractSfcSymbols(lines: string[]): SymbolEntry[] {
+  const symbols: SymbolEntry[] = [];
+  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const m = blockOpenRe.exec(line.trim());
+    if (!m || !m[1] || line.startsWith("  ") || line.startsWith("\t")) {
+      i++;
+      continue;
+    }
+
+    const tag = m[1].toLowerCase();
+    const attrs = (m[2] ?? "").trim();
+    const startIdx = i;
+    let endIdx = i;
+
+    if (tag === "template") {
+      let depth = 0;
+      const openTemplateRe = /<template\b[^>]*>/gi;
+      const closeTemplateRe = /<\/template\s*>/gi;
+      for (let j = i; j < lines.length; j++) {
+        const ln = lines[j]!;
+        const opens = ln.match(openTemplateRe)?.length ?? 0;
+        const closes = ln.match(closeTemplateRe)?.length ?? 0;
+        depth += opens - closes;
+        if (depth <= 0) {
+          endIdx = j;
+          break;
+        }
+        endIdx = j;
+      }
+    } else {
+      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
+      for (let j = i; j < lines.length; j++) {
+        endIdx = j;
+        if (j > i && closeRe.test(lines[j]!)) break;
+        if (j === i && closeRe.test(lines[j]!.slice(m[0].length))) break;
+      }
+    }
+
+    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
+    symbols.push({
+      kind: tag,
+      name: headerLabel,
+      startLine: startIdx + 1,
+      endLine: endIdx + 1,
+      depth: 0,
+    });
+
+    const innerStart = startIdx + 1;
+    const innerLines = lines.slice(innerStart, endIdx);
+    if (tag === "script" && innerLines.length > 0) {
+      const innerSyms = extractTsJsSymbols(innerLines);
+      for (const s of innerSyms) {
+        symbols.push({
+          kind: s.kind,
+          name: s.name,
+          startLine: s.startLine + innerStart,
+          endLine: s.endLine + innerStart,
+          depth: s.depth + 1,
+        });
+      }
+    } else if (tag === "template" && innerLines.length >= 30) {
+      let landmarks = 0;
+      const commentLandmarkRe = /^<!--\s*[=\-*#]*\s*([^-][^>]{2,60}?)\s*[=\-*#]*\s*-->$/;
+      const semanticTagRe =
+        /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
+      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
+        const raw = innerLines[k]!;
+        const indent = raw.length - raw.trimStart().length;
+        if (indent > 8) continue;
+        const trimmed = raw.trim();
+        const cm = commentLandmarkRe.exec(trimmed);
+        if (cm && cm[1]) {
+          symbols.push({
+            kind: "section",
+            name: cm[1].trim(),
+            startLine: innerStart + k + 1,
+            endLine: innerStart + k + 1,
+            depth: 1,
+          });
+          landmarks++;
+          continue;
+        }
+        const sm = semanticTagRe.exec(trimmed);
+        if (sm && sm[1]) {
+          const attrStr = sm[2] ?? "";
+          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
+          const tagDesc =
+            idMatch && idMatch[1]
+              ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>`
+              : `<${sm[1]}>`;
+          symbols.push({
+            kind: "block",
+            name: tagDesc,
+            startLine: innerStart + k + 1,
+            endLine: innerStart + k + 1,
+            depth: 1,
+          });
+          landmarks++;
+        }
+      }
+    } else if (tag === "style" && innerLines.length > 0) {
+      const cssSyms = extractCssSymbols(innerLines, true).slice(0, 12);
+      for (const s of cssSyms) {
+        symbols.push({
+          kind: s.kind,
+          name: s.name,
+          startLine: s.startLine + innerStart,
+          endLine: s.endLine + innerStart,
+          depth: 1,
+        });
+      }
+    }
+
+    i = endIdx + 1;
+  }
+
+  return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
+}
+
 function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry[] {
   const ext = path.extname(filePath).toLowerCase();
 
@@ -769,6 +1148,14 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".mjs":
     case ".cjs":
       return extractTsJsSymbols(lines);
+    case ".vue":
+    case ".svelte":
+      return extractSfcSymbols(lines);
+    case ".css":
+    case ".scss":
+    case ".less":
+    case ".pcss":
+      return extractCssSymbols(lines);
     case ".py":
       return extractPythonSymbols(lines);
     case ".go":
@@ -808,6 +1195,26 @@ export function extractSymbols(filePath: string, content: string): SymbolEntry[]
   return extractSymbolsFromLines(filePath, lines);
 }
 
+const MAX_OUTLINES = 40;
+const MAX_SLICE_FILES = 30;
+const SLICE_TRUNCATION_TIP =
+  "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
+
+function selectOutlineSymbols(symbols: SymbolEntry[], limit: number): SymbolEntry[] {
+  if (symbols.length <= limit) return symbols;
+  // Prioritize depth-0 declarations so one giant class's methods never crowd out top-level structure
+  const keptIndices = new Set<number>();
+  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
+    if (symbols[i]!.depth === 0) keptIndices.add(i);
+  }
+  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
+    keptIndices.add(i);
+  }
+  return [...keptIndices]
+    .sort((a, b) => a - b)
+    .map((idx) => symbols[idx]!);
+}
+
 export async function runReadSlices(
   input: ReadSlicesInput,
 ): Promise<{ text: string; isError: boolean }> {
@@ -820,9 +1227,9 @@ export async function runReadSlices(
       isError: true,
     };
   }
-  if (outlines.length > 20 || slices.length > 30) {
+  if (outlines.length > MAX_OUTLINES || slices.length > MAX_SLICE_FILES) {
     return {
-      text: "Error: limits exceeded (max 20 outlines and 30 slice files per call).",
+      text: `Error: limits exceeded (max ${MAX_OUTLINES} outlines and ${MAX_SLICE_FILES} slice files per call).`,
       isError: true,
     };
   }
@@ -830,10 +1237,18 @@ export async function runReadSlices(
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const maxChars = Math.max(
     1000,
-    Math.min(80_000, Math.trunc(input.maxChars ?? 8_500)),
+    Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(input.maxChars ?? 8_500)),
   );
-  const maxBytes =
-    input.maxChars === undefined ? DEFAULT_INLINE_MAX_BYTES : undefined;
+  const maxBytes = DEFAULT_INLINE_MAX_BYTES;
+
+  const perFileSymbolLimit =
+    outlines.length <= 1
+      ? 120
+      : outlines.length <= 4
+        ? 60
+        : outlines.length <= 10
+          ? 30
+          : 20;
 
   const fileCache = new Map<string, { lines: string[]; size: number }>();
   async function loadLines(absPath: string): Promise<{ lines: string[]; size: number }> {
@@ -861,7 +1276,8 @@ export async function runReadSlices(
           if (symbols.length === 0) {
             return `## Outline: ${relPath} (${lines.length} lines)\n(no top-level symbols detected)`;
           }
-          const formatted = symbols.slice(0, 120).map((s) => {
+          const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
+          const formatted = picked.map((s) => {
             const indent = "  ".repeat(s.depth);
             const span =
               s.endLine > s.startLine
@@ -870,8 +1286,8 @@ export async function runReadSlices(
             return `${indent}${span} [${s.kind}] ${s.name}`;
           });
           const extra =
-            symbols.length > 120
-              ? `\n... (${symbols.length - 120} more symbols omitted)`
+            symbols.length > picked.length
+              ? `\n... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)`
               : "";
           return `## Outline: ${relPath} (${lines.length} lines)\n${formatted.join("\n")}${extra}`;
         } catch (err) {
@@ -944,6 +1360,25 @@ export async function runReadSlices(
       }),
     );
     sections.push(...sliceResults);
+  }
+
+  const rawJoined = sections.join("\n\n");
+  const rawBytes = Buffer.byteLength(rawJoined, "utf8");
+  const needsSliceTip =
+    slices.length > 0 && (rawJoined.length > maxChars || rawBytes > maxBytes);
+
+  if (needsSliceTip && maxChars > SLICE_TRUNCATION_TIP.length + 200) {
+    const tipBytes = Buffer.byteLength(SLICE_TRUNCATION_TIP, "utf8");
+    const body = fitSectionsToByteBudget(
+      sections,
+      maxChars - SLICE_TRUNCATION_TIP.length,
+      maxBytes - tipBytes,
+      "\n\n",
+    );
+    return {
+      text: `${body}${SLICE_TRUNCATION_TIP}`,
+      isError: false,
+    };
   }
 
   return {
