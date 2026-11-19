@@ -7,12 +7,16 @@ import { after, before, describe, it } from "node:test";
 
 const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
 
-function runHook(stdinText: string): Promise<{ code: number | null; stdout: string; stderr: string; durationMs: number }> {
+function runHook(
+  stdinText: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<{ code: number | null; stdout: string; stderr: string; durationMs: number }> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOOK_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: { ...process.env, AGY_FAST_AUTO_UPDATE: "off", ...extraEnv },
     });
     let stdout = "";
     let stderr = "";

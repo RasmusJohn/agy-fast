@@ -91,11 +91,35 @@ node scripts/install.mjs install --project /path/to/your-repo
 请将 https://github.com/INK-Q/agy-fast.git 克隆到 ~/.gemini/config/plugins/agy-fast，运行 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor` 验证可用性，并启用 agy-fast 插件。
 ```
 
-### 更新到最新版本
+### 自动更新与手动更新
 
-更新操作幂等安全，且**无需执行 `npm install`**（仓库已附带最新 `dist/*.mjs` 产物）：
+`agy-fast` 内置了**零启动延迟的后台自动更新机制**（无需执行 `npm install`，每次发版均附带预构建 `dist/*.mjs` 产物）：
 
-- **通过「方式一：一行命令」安装（推荐）**——直接重新执行安装命令即可覆盖更新运行文件并自动自检：
+- **工作原理**：
+  - 每 **12 小时**在 `SessionStart` 吐出快照后，异步拉起完全分离的后台更新进程（`dist/updater.mjs`），**不增加任何会话启动延迟**。
+  - 通过 `git ls-remote --tags`（无 `git` 时回退 GitHub Releases API）检测最新正式版本标签，克隆到临时暂存目录后**先执行实时 MCP 4 工具冒烟校验**，校验通过后再按文件原子替换运行产物。
+  - **安全保护**：常规复制安装与干净的直接 `git clone` 安装会自动更新；`--link` 开发软链接与有未提交改动的仓库**绝不覆盖**（仅提示有新版本）；校验失败的损坏版本会被自动拦截、原安装完全不受影响。
+  - 更新完成后，下一次开启新会话会在启动快照末尾弹出一次性提示。
+
+- **手动触发更新与配置**：
+  ```bash
+  # 仅检查是否有新版本，不修改文件
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check
+
+  # 立即更新并自动自检（也可直接用 ./install.sh update 或 .\install.ps1 update）
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update
+
+  # 切换模式：auto（默认自动更新）| notify（仅后台检查提醒）| off（关闭后台检查）
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24
+  ```
+
+- **环境变量覆盖**：
+  - `AGY_FAST_AUTO_UPDATE=auto|notify|off` — 覆盖自动更新模式（优先级高于配置文件）。
+  - `AGY_FAST_UPDATE_INTERVAL_HOURS=12` — 后台检查间隔（小时）。
+  - `AGY_FAST_UPDATE_CHANNEL=release|main` — 跟踪稳定发版标签（`release`，默认）或 `main` 分支。
+  - `AGY_FAST_REPO=<git-url>` — 自定义镜像或 Fork 仓库地址。
+
+- **一行命令覆盖更新（兜底方式）**：
   ```bash
   # macOS / Linux
   curl -fsSL https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.sh | sh
@@ -104,23 +128,8 @@ node scripts/install.mjs install --project /path/to/your-repo
   # Windows (PowerShell)
   irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
   ```
-- **通过「方式二：直接克隆到插件目录」安装**：
-  ```bash
-  # macOS / Linux
-  git -C ~/.gemini/config/plugins/agy-fast pull --ff-only && node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor
-  ```
-  ```powershell
-  # Windows (PowerShell)
-  git -C "$env:USERPROFILE\.gemini\config\plugins\agy-fast" pull --ff-only; node "$env:USERPROFILE\.gemini\config\plugins\agy-fast\scripts\install.mjs" doctor
-  ```
-- **通过本地克隆仓库或「方式四：按项目安装（`--project`）」安装**：
-  ```bash
-  cd agy-fast && git pull --ff-only
-  node scripts/install.mjs install                     # 更新全局安装
-  # 或更新指定仓库：node scripts/install.mjs install --project /path/to/your-repo
-  ```
 
-> **更新生效提示**：更新完成后，在 Antigravity CLI（`agy`）中开启新会话，或在桌面端 / IDE 中重启（或重载窗口），以重启常驻 MCP 服务并加载新版 `dist/*.mjs` 与 `rules/AGENTS.md`。
+> **更新生效提示**：新版 `rules/AGENTS.md` 与 `dist/session-start.mjs` 在下一次开启新会话时自动生效；Antigravity 桌面端 / IDE 若需立即刷新常驻 MCP 服务，重载窗口或重启一次即可。
 
 ### 健康检查与卸载
 

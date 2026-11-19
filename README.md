@@ -91,11 +91,35 @@ Paste this prompt into Antigravity:
 Clone https://github.com/INK-Q/agy-fast.git to ~/.gemini/config/plugins/agy-fast, run `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor`, and enable the agy-fast plugin.
 ```
 
-### Update to Latest Version
+### Auto-Update & Manual Update
 
-Updating is idempotent and does **not** require `npm install` (pre-built `dist/*.mjs` bundles are included):
+`agy-fast` includes a built-in **zero-latency background auto-updater** (requires no `npm install` because pre-built `dist/*.mjs` bundles are shipped in every release):
 
-- **Installed via One-Command Installer (recommended)** — re-run the same one-liner to pull the latest `main`, overwrite runtime files, and run `doctor`:
+- **How it works**:
+  - Once every **12 hours**, `SessionStart` spawns a detached background check (`dist/updater.mjs`) after emitting the workspace snapshot, adding **0 ms** to session startup.
+  - Checks GitHub release tags (`git ls-remote --tags` with GitHub Releases API fallback), clones the newer release into an isolated staging directory, runs a **live MCP 4-tool smoke test** before touching your installation, and atomically replaces runtime files.
+  - **Safe by design**: Standard copied installs and clean direct `git clone` installs auto-update safely; `--link` dev symlinks and dirty git repos are **never overwritten** (notify-only). Broken releases failing the staged MCP smoke check are automatically rejected.
+  - On the next new session, `SessionStart` shows a one-time notice when an update is applied (or available).
+
+- **Manual update & configuration**:
+  ```bash
+  # Check for updates without modifying files
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check
+
+  # Update immediately (also works via ./install.sh update or .\install.ps1 update)
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update
+
+  # Configure mode: auto (default) | notify (check only) | off (disable background checks)
+  node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24
+  ```
+
+- **Environment variable overrides**:
+  - `AGY_FAST_AUTO_UPDATE=auto|notify|off` — override auto-update mode (takes precedence over saved config).
+  - `AGY_FAST_UPDATE_INTERVAL_HOURS=12` — background check interval in hours.
+  - `AGY_FAST_UPDATE_CHANNEL=release|main` — track stable semver tags (`release`, default) or `main`.
+  - `AGY_FAST_REPO=<git-url>` — custom mirror or fork URL.
+
+- **Re-install fallback (one-command)**:
   ```bash
   # macOS / Linux
   curl -fsSL https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.sh | sh
@@ -104,23 +128,8 @@ Updating is idempotent and does **not** require `npm install` (pre-built `dist/*
   # Windows (PowerShell)
   irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
   ```
-- **Installed via Direct `git clone` into `~/.gemini/config/plugins/agy-fast`**:
-  ```bash
-  # macOS / Linux
-  git -C ~/.gemini/config/plugins/agy-fast pull --ff-only && node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs doctor
-  ```
-  ```powershell
-  # Windows (PowerShell)
-  git -C "$env:USERPROFILE\.gemini\config\plugins\agy-fast" pull --ff-only; node "$env:USERPROFILE\.gemini\config\plugins\agy-fast\scripts\install.mjs" doctor
-  ```
-- **Installed from a Local Clone or Per-Project (`--project`)**:
-  ```bash
-  cd agy-fast && git pull --ff-only
-  node scripts/install.mjs install                     # global install
-  # or: node scripts/install.mjs install --project /path/to/your-repo
-  ```
 
-> **Applying updates**: Start a new session in Antigravity CLI (`agy`), or reload/restart Antigravity Desktop / IDE so the persistent MCP server reloads the updated `dist/*.mjs` bundles and `rules/AGENTS.md`.
+> **Applying updates**: `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop / IDE, reload/restart the window once to refresh the resident MCP server process.
 
 ### Verify / Uninstall
 

@@ -57,7 +57,7 @@ $__agyFastState = @{ ExitCode = 0 }
     return
   }
 
-  $subcommands = @("install", "uninstall", "status", "doctor", "-h", "--help")
+  $subcommands = @("install", "update", "config", "uninstall", "status", "doctor", "-h", "--help")
   $hasSubcmd = ($InputArgs.Length -gt 0) -and ($subcommands -contains $InputArgs[0])
 
   $forwardList = New-Object 'System.Collections.Generic.List[string]'

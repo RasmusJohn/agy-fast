@@ -27,7 +27,7 @@ fi
 
 HAS_SUBCMD=0
 case "${1:-}" in
-  install|uninstall|status|doctor|-h|--help)
+  install|update|config|uninstall|status|doctor|-h|--help)
     HAS_SUBCMD=1
     ;;
 esac

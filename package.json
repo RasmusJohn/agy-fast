@@ -36,6 +36,7 @@
     "test": "npm run build && node scripts/test.mjs",
     "validate": "agy plugin validate --strict .",
     "install:plugin": "node scripts/install.mjs install",
+    "update:plugin": "node scripts/install.mjs update",
     "uninstall:plugin": "node scripts/install.mjs uninstall",
     "doctor": "node scripts/install.mjs doctor",
     "benchmark": "node dist/benchmark.mjs"

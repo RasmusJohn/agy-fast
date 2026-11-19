@@ -1,0 +1,819 @@
+#!/usr/bin/env node
+// agy-fast Background & CLI Auto-Updater (zero-dependency ESM)
+
+
+// src/updater.ts
+import path2 from "node:path";
+import { fileURLToPath } from "node:url";
+
+// src/utils/updater-core.ts
+import { spawn as spawn2 } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// src/utils/exec-utils.ts
+import { spawn } from "node:child_process";
+var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+function killChildTree(pid, detached) {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    try {
+      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true
+      });
+      killer.unref();
+    } catch {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+      }
+    }
+    return;
+  }
+  try {
+    if (detached) {
+      process.kill(-pid, "SIGTERM");
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+  } catch {
+  }
+  setTimeout(() => {
+    try {
+      if (detached) {
+        process.kill(-pid, "SIGKILL");
+      } else {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+    }
+  }, 400).unref();
+}
+function execBinaryAsync(bin, args, options) {
+  return spawnAndCollect(bin, args, false, options);
+}
+function spawnAndCollect(commandOrBin, args, shell, options) {
+  const startMs = Date.now();
+  const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const detached = process.platform !== "win32";
+  return new Promise((resolve) => {
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let truncated = false;
+    let timedOut = false;
+    let settled = false;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let child;
+    try {
+      child = spawn(commandOrBin, args, {
+        cwd: options.cwd,
+        shell,
+        detached,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: options.env ?? process.env
+      });
+    } catch (err) {
+      resolve({
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        durationMs: Date.now() - startMs,
+        stdout: "",
+        stderr: "",
+        truncated: false,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
+    let settleFallbackTimer = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildTree(child.pid, detached);
+      settleFallbackTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(null, "SIGKILL");
+      }, 1500);
+      settleFallbackTimer.unref();
+    }, Math.max(100, options.timeoutMs));
+    timer.unref();
+    const finish = (exitCode, signal, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
+      resolve({
+        exitCode,
+        signal,
+        timedOut,
+        durationMs: Date.now() - startMs,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        truncated,
+        error
+      });
+    };
+    child.stdout?.on("data", (chunk) => {
+      if (stdoutBytes >= maxOutputBytes) {
+        truncated = true;
+        return;
+      }
+      const remaining = maxOutputBytes - stdoutBytes;
+      if (chunk.length > remaining) {
+        stdoutChunks.push(chunk.subarray(0, remaining));
+        stdoutBytes += remaining;
+        truncated = true;
+      } else {
+        stdoutChunks.push(chunk);
+        stdoutBytes += chunk.length;
+      }
+    });
+    child.stderr?.on("data", (chunk) => {
+      if (stderrBytes >= maxOutputBytes) {
+        truncated = true;
+        return;
+      }
+      const remaining = maxOutputBytes - stderrBytes;
+      if (chunk.length > remaining) {
+        stderrChunks.push(chunk.subarray(0, remaining));
+        stderrBytes += remaining;
+        truncated = true;
+      } else {
+        stderrChunks.push(chunk);
+        stderrBytes += chunk.length;
+      }
+    });
+    child.on("error", (err) => {
+      finish(null, null, err.message);
+    });
+    child.on("close", (code, signal) => {
+      finish(code, signal);
+    });
+  });
+}
+
+// src/utils/updater-core.ts
+var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
+var DEFAULT_CHECK_INTERVAL_HOURS = 12;
+var LOCK_STALE_MS = 10 * 60 * 1e3;
+var UPDATER_RUNTIME_FILES = [
+  "plugin.json",
+  "mcp_config.json",
+  "hooks.json",
+  "rules/AGENTS.md",
+  "assets/logo.svg",
+  "dist/mcp-server.mjs",
+  "dist/session-start.mjs",
+  "dist/benchmark.mjs",
+  "dist/updater.mjs",
+  "scripts/install.mjs",
+  "LICENSE"
+];
+var UPDATER_OPTIONAL_FILES = [
+  "README.md",
+  "README.zh-CN.md",
+  "CHANGELOG.md",
+  "docs/ANALYSIS_REPORT.md",
+  "docs/ANALYSIS_REPORT.zh-CN.md"
+];
+function getHomeDir(env = process.env) {
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+}
+function getUpdaterPaths(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const cacheDir = custom ? path.resolve(custom) : path.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  return {
+    cacheDir,
+    stateFile: path.join(cacheDir, "update-state.json"),
+    configFile: path.join(cacheDir, "config.json"),
+    lockFile: path.join(cacheDir, "update.lock")
+  };
+}
+function parseSemver(raw) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+  if (!m) return null;
+  return [
+    Number.parseInt(m[1], 10),
+    Number.parseInt(m[2], 10),
+    Number.parseInt(m[3], 10)
+  ];
+}
+function compareSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+function pickLatestSemverTag(lsRemoteOutput) {
+  let best = null;
+  for (const rawLine of lsRemoteOutput.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 2) continue;
+    const sha = parts[0];
+    const ref = parts[1];
+    if (!ref.startsWith("refs/tags/") || ref.endsWith("^{}")) continue;
+    const tag = ref.slice("refs/tags/".length);
+    const parsed = parseSemver(tag);
+    if (!parsed) continue;
+    const version = `${parsed[0]}.${parsed[1]}.${parsed[2]}`;
+    if (!best || compareSemver(version, best.version) > 0) {
+      best = { tag, version, commitSha: sha };
+    }
+  }
+  return best;
+}
+function parseAutoUpdateMode(raw) {
+  if (!raw) return null;
+  const norm = raw.trim().toLowerCase();
+  if (norm === "auto" || norm === "on" || norm === "1" || norm === "true") {
+    return "auto";
+  }
+  if (norm === "notify" || norm === "check") {
+    return "notify";
+  }
+  if (norm === "off" || norm === "0" || norm === "false" || norm === "disabled") {
+    return "off";
+  }
+  return null;
+}
+function parseUpdateChannel(raw) {
+  if (!raw) return null;
+  const norm = raw.trim().toLowerCase();
+  if (norm === "release" || norm === "stable") return "release";
+  if (norm === "main" || norm === "nightly" || norm === "edge") return "main";
+  return null;
+}
+async function readJsonFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+  }
+  return null;
+}
+async function writeJsonAtomically(filePath, data) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+`, "utf8");
+  try {
+    await fs.rename(tmpPath, filePath);
+  } catch {
+    await fs.copyFile(tmpPath, filePath);
+    await fs.rm(tmpPath, { force: true }).catch(() => {
+    });
+  }
+}
+async function readUpdaterConfig(env = process.env) {
+  const paths = getUpdaterPaths(env);
+  return await readJsonFile(paths.configFile) ?? {};
+}
+async function readUpdateState(env = process.env) {
+  const paths = getUpdaterPaths(env);
+  return await readJsonFile(paths.stateFile) ?? {};
+}
+async function writeUpdateState(patch, env = process.env) {
+  const paths = getUpdaterPaths(env);
+  const existing = await readJsonFile(paths.stateFile) ?? {};
+  const merged = { ...existing, ...patch };
+  await writeJsonAtomically(paths.stateFile, merged);
+  return merged;
+}
+async function resolveUpdaterSettings(env = process.env) {
+  const cfg = await readUpdaterConfig(env);
+  const envMode = parseAutoUpdateMode(env.AGY_FAST_AUTO_UPDATE);
+  const cfgMode = parseAutoUpdateMode(cfg.autoUpdate);
+  const mode = envMode ?? cfgMode ?? "auto";
+  const envHours = Number.parseFloat(env.AGY_FAST_UPDATE_INTERVAL_HOURS ?? "");
+  const rawHours = Number.isFinite(envHours) && envHours >= 0.01 ? envHours : typeof cfg.checkIntervalHours === "number" && cfg.checkIntervalHours >= 0.01 ? cfg.checkIntervalHours : DEFAULT_CHECK_INTERVAL_HOURS;
+  const checkIntervalHours = Math.max(0.01, Math.min(24 * 30, rawHours));
+  const envChan = parseUpdateChannel(env.AGY_FAST_UPDATE_CHANNEL);
+  const cfgChan = parseUpdateChannel(cfg.channel);
+  const channel = envChan ?? cfgChan ?? "release";
+  const repoUrl = env.AGY_FAST_REPO?.trim() || cfg.repoUrl?.trim() || DEFAULT_REPO_URL;
+  return {
+    mode,
+    checkIntervalHours,
+    checkIntervalMs: Math.round(checkIntervalHours * 3600 * 1e3),
+    channel,
+    repoUrl
+  };
+}
+async function readInstalledVersion(pluginDir) {
+  const manifest = await readJsonFile(
+    path.join(pluginDir, "plugin.json")
+  );
+  if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
+    return manifest.version.trim();
+  }
+  return "0.0.0";
+}
+async function pathExists(p) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function detectInstallKind(pluginDir) {
+  const resolved = path.resolve(pluginDir);
+  try {
+    const lst = await fs.lstat(resolved);
+    if (lst.isSymbolicLink()) return "symlink";
+  } catch {
+    return "copied";
+  }
+  const hasGit = await pathExists(path.join(resolved, ".git"));
+  if (hasGit) {
+    const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
+      cwd: resolved,
+      timeoutMs: 4e3
+    });
+    if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
+      return "git-dirty";
+    }
+    const norm = resolved.split(path.sep).join("/").toLowerCase();
+    const isPluginInstallDir = norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
+    if (!isPluginInstallDir) {
+      return "dev-source";
+    }
+    return "git-clone";
+  }
+  if (await pathExists(path.join(resolved, "src"))) {
+    return "dev-source";
+  }
+  return "copied";
+}
+function extractGithubSlug(repoUrl) {
+  const m = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?\/?$/i.exec(repoUrl.trim());
+  return m?.[1] ?? null;
+}
+async function fetchLatestRemoteVersion(opts) {
+  const timeoutMs = opts.timeoutMs ?? 8e3;
+  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  if (opts.channel === "release") {
+    const tagsRes = await execBinaryAsync(
+      "git",
+      ["ls-remote", "--tags", "--refs", opts.repoUrl],
+      { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
+    );
+    if (!tagsRes.error && !tagsRes.timedOut && tagsRes.exitCode === 0) {
+      const latest = pickLatestSemverTag(tagsRes.stdout);
+      if (latest) {
+        return {
+          ref: latest.tag,
+          version: latest.version,
+          commitSha: latest.commitSha,
+          source: "git-tags"
+        };
+      }
+    }
+    const slug = extractGithubSlug(opts.repoUrl);
+    if (slug && typeof fetch === "function") {
+      try {
+        const res = await fetch(
+          `https://api.github.com/repos/${slug}/releases/latest`,
+          {
+            headers: {
+              Accept: "application/vnd.github+json",
+              "User-Agent": "agy-fast-updater"
+            },
+            signal: AbortSignal.timeout(timeoutMs)
+          }
+        );
+        if (res.ok) {
+          const json = await res.json();
+          if (typeof json.tag_name === "string") {
+            const parsed = parseSemver(json.tag_name);
+            if (parsed) {
+              return {
+                ref: json.tag_name.trim(),
+                version: `${parsed[0]}.${parsed[1]}.${parsed[2]}`,
+                source: "github-api"
+              };
+            }
+          }
+        }
+      } catch {
+      }
+    }
+  }
+  const headRes = await execBinaryAsync(
+    "git",
+    ["ls-remote", opts.repoUrl, "refs/heads/main", "HEAD"],
+    { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
+  );
+  if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
+    const firstLine = headRes.stdout.trim().split(/\r?\n/)[0] ?? "";
+    const sha = firstLine.split(/\s+/)[0] || void 0;
+    if (sha) {
+      return {
+        ref: "main",
+        version: null,
+        commitSha: sha,
+        source: "git-main"
+      };
+    }
+  }
+  throw new Error(
+    headRes.stderr.trim() || headRes.error || `Unable to reach update source: ${opts.repoUrl}`
+  );
+}
+async function verifyStagedPlugin(stagingDir) {
+  for (const rel of UPDATER_RUNTIME_FILES) {
+    if (!await pathExists(path.join(stagingDir, rel))) {
+      return { ok: false, version: "0.0.0", reason: `Missing required file: ${rel}` };
+    }
+  }
+  const manifest = await readJsonFile(
+    path.join(stagingDir, "plugin.json")
+  );
+  if (!manifest || manifest.name !== "agy-fast" || typeof manifest.version !== "string" || !parseSemver(manifest.version)) {
+    return { ok: false, version: "0.0.0", reason: "Invalid staged plugin.json manifest" };
+  }
+  const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
+  const smokeOk = await new Promise((resolve) => {
+    const child = spawn2(process.execPath, [mcpPath], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let stdout = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(false);
+    }, 6e3);
+    timer.unref();
+    child.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve(false);
+        return;
+      }
+      try {
+        const lines = stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        const listResp = lines.find((m) => m.id === 2);
+        const tools = listResp?.result?.tools?.map((t) => t.name) ?? [];
+        resolve(tools.length >= 4);
+      } catch {
+        resolve(false);
+      }
+    });
+    const initMsg = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "updater", version: "1" } }
+    });
+    const listMsg = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+      params: {}
+    });
+    child.stdin.write(`${initMsg}
+${listMsg}
+`);
+    child.stdin.end();
+  });
+  if (!smokeOk) {
+    return {
+      ok: false,
+      version: manifest.version,
+      reason: "Staged MCP server smoke check failed"
+    };
+  }
+  return { ok: true, version: manifest.version };
+}
+async function syncRuntimeFilesAtomically(srcRoot, dstRoot) {
+  await fs.mkdir(dstRoot, { recursive: true });
+  const toCopy = [...UPDATER_RUNTIME_FILES];
+  for (const opt of UPDATER_OPTIONAL_FILES) {
+    if (await pathExists(path.join(srcRoot, opt))) {
+      toCopy.push(opt);
+    }
+  }
+  let seq = 0;
+  for (const rel of toCopy) {
+    const src = path.join(srcRoot, rel);
+    const dst = path.join(dstRoot, rel);
+    await fs.mkdir(path.dirname(dst), { recursive: true });
+    const tmp = `${dst}.agy-tmp.${process.pid}.${seq++}`;
+    await fs.copyFile(src, tmp);
+    try {
+      await fs.rename(tmp, dst);
+    } catch {
+      await fs.copyFile(tmp, dst);
+      await fs.rm(tmp, { force: true }).catch(() => {
+      });
+    }
+  }
+}
+async function acquireUpdateLock(lockPath) {
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const handle = await fs.open(lockPath, "wx");
+      try {
+        await handle.writeFile(
+          JSON.stringify({ pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+          "utf8"
+        );
+      } finally {
+        await handle.close();
+      }
+      return true;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "EEXIST") return false;
+      try {
+        const st = await fs.stat(lockPath);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+async function runPluginUpdate(opts) {
+  const env = opts.env ?? process.env;
+  const pluginDir = path.resolve(opts.pluginDir);
+  const paths = getUpdaterPaths(env);
+  const settings = await resolveUpdaterSettings(env);
+  const repoUrl = opts.repoUrl?.trim() || settings.repoUrl;
+  const channel = opts.channel ?? settings.channel;
+  const timeoutMs = opts.timeoutMs ?? 12e3;
+  const currentVersion = await readInstalledVersion(pluginDir);
+  const installKind = await detectInstallKind(pluginDir);
+  if (opts.background && settings.mode === "off") {
+    return {
+      status: "skipped-disabled",
+      currentVersion,
+      latestVersion: null,
+      installKind,
+      message: "Auto-update is disabled."
+    };
+  }
+  const locked = await acquireUpdateLock(paths.lockFile);
+  if (!locked) {
+    return {
+      status: "skipped-locked",
+      currentVersion,
+      latestVersion: null,
+      installKind,
+      message: "Another update check is already in progress."
+    };
+  }
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  let stagingDir = "";
+  try {
+    const remote = await fetchLatestRemoteVersion({ repoUrl, channel, timeoutMs });
+    const prevState = await readUpdateState(env);
+    const hasNewerSemver = remote.version !== null && compareSemver(remote.version, currentVersion) > 0;
+    const hasNewerMainCommit = remote.version === null && Boolean(remote.commitSha) && remote.commitSha !== prevState.lastAppliedCommit;
+    if (!opts.force && !hasNewerSemver && !hasNewerMainCommit) {
+      await writeUpdateState(
+        {
+          lastCheckAt: nowIso,
+          latestVersion: remote.version ?? currentVersion,
+          latestRef: remote.ref,
+          availableVersion: void 0,
+          availableReason: void 0,
+          lastError: void 0
+        },
+        env
+      );
+      return {
+        status: "up-to-date",
+        currentVersion,
+        latestVersion: remote.version ?? currentVersion,
+        installKind,
+        message: `agy-fast v${currentVersion} is already up to date.`
+      };
+    }
+    const effectiveNotifyOnly = opts.checkOnly || opts.background && settings.mode === "notify" || installKind === "symlink" || installKind === "git-dirty" || installKind === "dev-source" && !opts.force;
+    if (effectiveNotifyOnly) {
+      const reason = installKind === "symlink" ? "linked dev install" : installKind === "git-dirty" ? "uncommitted local changes" : installKind === "dev-source" ? "local source repo" : settings.mode === "notify" ? "notify mode" : void 0;
+      await writeUpdateState(
+        {
+          lastCheckAt: nowIso,
+          latestVersion: remote.version ?? void 0,
+          latestRef: remote.ref,
+          availableVersion: remote.version ?? void 0,
+          availableReason: reason,
+          lastError: void 0
+        },
+        env
+      );
+      return {
+        status: "available",
+        currentVersion,
+        latestVersion: remote.version,
+        installKind,
+        message: remote.version ? `Update available: v${currentVersion} -> v${remote.version}${reason ? ` (${reason})` : ""}.` : `Update available on branch '${remote.ref}'${reason ? ` (${reason})` : ""}.`
+      };
+    }
+    stagingDir = path.join(
+      paths.cacheDir,
+      `staging-${process.pid}-${Date.now()}`
+    );
+    await fs.mkdir(paths.cacheDir, { recursive: true });
+    const gitEnv = { ...env, GIT_TERMINAL_PROMPT: "0" };
+    const cloneArgs = remote.ref === "main" ? ["clone", "--depth", "1", "--branch", "main", repoUrl, stagingDir] : ["clone", "--depth", "1", "--branch", remote.ref, repoUrl, stagingDir];
+    const cloneRes = await execBinaryAsync("git", cloneArgs, {
+      cwd: paths.cacheDir,
+      timeoutMs: Math.max(timeoutMs, 3e4),
+      env: gitEnv
+    });
+    if (cloneRes.error || cloneRes.timedOut || cloneRes.exitCode !== 0) {
+      throw new Error(
+        cloneRes.stderr.trim() || cloneRes.error || `git clone failed for ${remote.ref}`
+      );
+    }
+    const stagedCheck = await verifyStagedPlugin(stagingDir);
+    if (!stagedCheck.ok) {
+      throw new Error(stagedCheck.reason || "Staged plugin validation failed");
+    }
+    if (!opts.force && remote.version === null && compareSemver(stagedCheck.version, currentVersion) <= 0 && remote.commitSha === prevState.lastAppliedCommit) {
+      await writeUpdateState(
+        {
+          lastCheckAt: nowIso,
+          latestVersion: stagedCheck.version,
+          latestRef: remote.ref,
+          lastAppliedCommit: remote.commitSha,
+          lastError: void 0
+        },
+        env
+      );
+      return {
+        status: "up-to-date",
+        currentVersion,
+        latestVersion: stagedCheck.version,
+        installKind,
+        message: `agy-fast v${currentVersion} is already up to date.`
+      };
+    }
+    if (installKind === "git-clone") {
+      const fetchRes = await execBinaryAsync(
+        "git",
+        ["fetch", "--depth", "1", "origin", remote.ref],
+        { cwd: pluginDir, timeoutMs: Math.max(timeoutMs, 2e4), env: gitEnv }
+      );
+      if (fetchRes.error || fetchRes.exitCode !== 0) {
+        throw new Error(fetchRes.stderr.trim() || "git fetch failed in plugin clone");
+      }
+      const checkoutRes = await execBinaryAsync(
+        "git",
+        ["checkout", "-q", "FETCH_HEAD"],
+        { cwd: pluginDir, timeoutMs: 1e4, env: gitEnv }
+      );
+      if (checkoutRes.error || checkoutRes.exitCode !== 0) {
+        throw new Error(checkoutRes.stderr.trim() || "git checkout failed in plugin clone");
+      }
+    } else {
+      await syncRuntimeFilesAtomically(stagingDir, pluginDir);
+    }
+    await writeUpdateState(
+      {
+        lastCheckAt: nowIso,
+        latestVersion: stagedCheck.version,
+        latestRef: remote.ref,
+        availableVersion: void 0,
+        availableReason: void 0,
+        lastAppliedVersion: stagedCheck.version,
+        lastAppliedFrom: currentVersion,
+        lastAppliedAt: nowIso,
+        lastAppliedCommit: remote.commitSha,
+        notifiedAppliedVersion: opts.background ? void 0 : stagedCheck.version,
+        lastError: void 0
+      },
+      env
+    );
+    return {
+      status: "updated",
+      currentVersion,
+      latestVersion: stagedCheck.version,
+      installKind,
+      message: `Updated agy-fast v${currentVersion} -> v${stagedCheck.version} (${installKind}).`
+    };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await writeUpdateState(
+      {
+        lastCheckAt: nowIso,
+        lastError: errMsg.slice(0, 300)
+      },
+      env
+    ).catch(() => {
+    });
+    return {
+      status: "error",
+      currentVersion,
+      latestVersion: null,
+      installKind,
+      message: `Update check failed: ${errMsg}`,
+      error: errMsg
+    };
+  } finally {
+    if (stagingDir) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {
+      });
+    }
+    await fs.rm(paths.lockFile, { force: true }).catch(() => {
+    });
+  }
+}
+
+// src/updater.ts
+function parseCliArgs(argv) {
+  const args = argv.slice(2);
+  const defaultPluginDir = path2.resolve(
+    path2.dirname(fileURLToPath(import.meta.url)),
+    ".."
+  );
+  let pluginDir = defaultPluginDir;
+  let background = false;
+  let checkOnly = false;
+  let force = false;
+  let json = false;
+  let channel;
+  let repoUrl;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--background") {
+      background = true;
+    } else if (a === "--check") {
+      checkOnly = true;
+    } else if (a === "--force") {
+      force = true;
+    } else if (a === "--json") {
+      json = true;
+    } else if (a === "--plugin-dir" && args[i + 1]) {
+      pluginDir = path2.resolve(args[++i]);
+    } else if (a === "--channel" && args[i + 1]) {
+      const parsed = parseUpdateChannel(args[++i]);
+      if (!parsed) throw new Error(`Invalid --channel value (expected 'release' or 'main')`);
+      channel = parsed;
+    } else if (a === "--repo" && args[i + 1]) {
+      repoUrl = args[++i];
+    }
+  }
+  return { pluginDir, background, checkOnly, force, json, channel, repoUrl };
+}
+async function main() {
+  const opts = parseCliArgs(process.argv);
+  const result = await runPluginUpdate({
+    pluginDir: opts.pluginDir,
+    background: opts.background,
+    checkOnly: opts.checkOnly,
+    force: opts.force,
+    channel: opts.channel,
+    repoUrl: opts.repoUrl
+  });
+  if (opts.background) {
+    return;
+  }
+  if (opts.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}
+`);
+  } else {
+    process.stdout.write(`${result.message}
+`);
+  }
+  if (result.status === "error") {
+    process.exitCode = 1;
+  }
+}
+main().catch((err) => {
+  if (!process.argv.includes("--background")) {
+    process.stderr.write(
+      `Error: ${err instanceof Error ? err.message : String(err)}
+`
+    );
+    process.exitCode = 1;
+  }
+});

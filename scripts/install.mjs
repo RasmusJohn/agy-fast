@@ -18,6 +18,7 @@ const RUNTIME_FILES = [
   "dist/mcp-server.mjs",
   "dist/session-start.mjs",
   "dist/benchmark.mjs",
+  "dist/updater.mjs",
   "scripts/install.mjs",
   "LICENSE",
 ];
@@ -25,16 +26,55 @@ const RUNTIME_FILES = [
 const OPTIONAL_DOC_FILES = [
   "README.md",
   "README.zh-CN.md",
+  "CHANGELOG.md",
   "docs/ANALYSIS_REPORT.md",
   "docs/ANALYSIS_REPORT.zh-CN.md",
 ];
 
+function getHomeDir() {
+  return process.platform === "win32"
+    ? process.env.USERPROFILE || process.env.HOME || os.homedir()
+    : process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
 function getGlobalPluginDir() {
-  const home =
-    process.platform === "win32"
-      ? process.env.USERPROFILE || process.env.HOME || os.homedir()
-      : process.env.HOME || process.env.USERPROFILE || os.homedir();
-  return path.join(home, ".gemini", "config", "plugins", PLUGIN_NAME);
+  return path.join(getHomeDir(), ".gemini", "config", "plugins", PLUGIN_NAME);
+}
+
+function getUpdaterCacheDir() {
+  const custom = process.env.AGY_FAST_CACHE_DIR?.trim();
+  return custom
+    ? path.resolve(custom)
+    : path.join(getHomeDir(), ".gemini", "cache", PLUGIN_NAME);
+}
+
+async function readJsonSafe(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeUpdaterConfigFile(patch) {
+  const cacheDir = getUpdaterCacheDir();
+  const cfgPath = path.join(cacheDir, "config.json");
+  await fs.mkdir(cacheDir, { recursive: true });
+  const existing = (await readJsonSafe(cfgPath)) || {};
+  const merged = { ...existing, ...patch };
+  const tmpPath = `${cfgPath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(tmpPath, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+  try {
+    await fs.rename(tmpPath, cfgPath);
+  } catch {
+    await fs.copyFile(tmpPath, cfgPath);
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+  }
+  return { cfgPath, config: merged };
 }
 
 function parseArgs(argv) {
@@ -46,6 +86,12 @@ function parseArgs(argv) {
   let skipEnable = false;
   let quiet = false;
   let showHelp = false;
+  let checkOnly = false;
+  let force = false;
+  let autoUpdate = "";
+  let intervalHours = null;
+  let channel = "";
+  let repoUrl = "";
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -58,6 +104,36 @@ function parseArgs(argv) {
       skipEnable = true;
     } else if (a === "--quiet" || a === "-q") {
       quiet = true;
+    } else if (a === "--check") {
+      checkOnly = true;
+    } else if (a === "--force") {
+      force = true;
+    } else if (a === "--auto-update") {
+      const next = args[i + 1];
+      if (!next || !["auto", "notify", "off"].includes(next.toLowerCase())) {
+        throw new Error("Invalid value after --auto-update (expected: auto | notify | off)");
+      }
+      autoUpdate = args[++i].toLowerCase();
+    } else if (a === "--interval") {
+      const next = args[i + 1];
+      const parsed = Number.parseFloat(next || "");
+      if (!Number.isFinite(parsed) || parsed < 1 || parsed > 720) {
+        throw new Error("Invalid value after --interval (expected hours between 1 and 720)");
+      }
+      intervalHours = parsed;
+      i++;
+    } else if (a === "--channel") {
+      const next = args[i + 1];
+      if (!next || !["release", "main"].includes(next.toLowerCase())) {
+        throw new Error("Invalid value after --channel (expected: release | main)");
+      }
+      channel = args[++i].toLowerCase();
+    } else if (a === "--repo") {
+      const next = args[i + 1];
+      if (!next || next.startsWith("-")) {
+        throw new Error("Missing repository URL after --repo");
+      }
+      repoUrl = args[++i];
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -103,6 +179,12 @@ function parseArgs(argv) {
     skipEnable,
     quiet,
     showHelp,
+    checkOnly,
+    force,
+    autoUpdate,
+    intervalHours,
+    channel,
+    repoUrl,
   };
 }
 
@@ -114,16 +196,24 @@ Usage:
 
 Commands:
   install      Install agy-fast plugin (default)
+  update       Check for and apply plugin updates from GitHub releases
+  config       View or persist auto-update preferences
   uninstall    Remove installed agy-fast plugin
   status       Check installation and run live health checks
   doctor       Alias for status
 
 Options:
-  --project [dir]   Install into <dir>/.agents/plugins/agy-fast instead of global
-  --target <dir>    Install into a custom plugin directory
-  --link            Create a symlink to this repository (for local development)
-  --no-enable       Skip running 'agy plugin enable agy-fast'
-  -h, --help        Show this help
+  --project [dir]               Install/update <dir>/.agents/plugins/agy-fast
+  --target <dir>                Use a custom plugin directory
+  --link                        Create a symlink to this repository (dev mode)
+  --no-enable                   Skip running 'agy plugin enable agy-fast'
+  --check                       (update) Check for newer versions without applying
+  --force                       (update) Re-apply even if already on the same version
+  --auto-update auto|notify|off Configure background auto-update mode
+  --interval <hours>            Configure background check interval in hours (default 12)
+  --channel release|main        Configure update channel (default release)
+  --repo <url>                  Override git repository URL for updates
+  -h, --help                    Show this help
 `);
 }
 
@@ -271,6 +361,7 @@ async function verifySessionStartLive(hookScriptPath, sampleWorkspace) {
     const child = spawn(process.execPath, [hookScriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: { ...process.env, AGY_FAST_AUTO_UPDATE: "off" },
     });
     let stdout = "";
     const timer = setTimeout(() => {
@@ -384,9 +475,29 @@ async function runDoctor(targetDir, quiet = false) {
     report.agyValidated = !valRes.error && valRes.status === 0;
   }
 
+  const manifest = await readJsonSafe(path.join(targetDir, "plugin.json"));
+  const installedVersion =
+    manifest && typeof manifest.version === "string" ? manifest.version : "unknown";
+  const cacheDir = getUpdaterCacheDir();
+  const updaterCfg = (await readJsonSafe(path.join(cacheDir, "config.json"))) || {};
+  const updaterState = (await readJsonSafe(path.join(cacheDir, "update-state.json"))) || {};
+  const effectiveAutoMode =
+    process.env.AGY_FAST_AUTO_UPDATE?.trim().toLowerCase() ||
+    updaterCfg.autoUpdate ||
+    "auto";
+  const effectiveInterval =
+    process.env.AGY_FAST_UPDATE_INTERVAL_HOURS?.trim() ||
+    updaterCfg.checkIntervalHours ||
+    12;
+  const effectiveChannel =
+    process.env.AGY_FAST_UPDATE_CHANNEL?.trim().toLowerCase() ||
+    updaterCfg.channel ||
+    "release";
+
   if (!quiet) {
     console.log("agy-fast health check:");
     console.log(`  - Plugin path : ${targetDir}`);
+    console.log(`  - Version     : v${installedVersion}`);
     console.log(`  - Node.js     : v${nodeVer} (OK)`);
     console.log(
       `  - ripgrep (rg): ${hasRg ? "available (fast search active)" : "not found (automatic Node.js fallback active)"}`,
@@ -396,6 +507,14 @@ async function runDoctor(targetDir, quiet = false) {
     );
     console.log(
       `  - SessionStart: ${hookCheck.bytes > 0 ? "OK" : "EMPTY (FAILED)"} (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`,
+    );
+    const checkSummary = updaterState.availableVersion
+      ? `update available: v${updaterState.availableVersion}`
+      : updaterState.lastCheckAt
+        ? `last check: ${updaterState.lastCheckAt}`
+        : "not checked yet";
+    console.log(
+      `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkSummary})`,
     );
     if (hasAgy) {
       console.log(
@@ -463,6 +582,15 @@ async function runInstall(opts) {
     }
   }
 
+  if (opts.autoUpdate || opts.intervalHours !== null || opts.channel || opts.repoUrl) {
+    const patch = {};
+    if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
+    if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
+    if (opts.channel) patch.channel = opts.channel;
+    if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
+    await writeUpdaterConfigFile(patch);
+  }
+
   const { ok } = await runDoctor(resolvedDst, opts.quiet);
   if (!ok) {
     throw new Error("Post-install health check failed.");
@@ -473,6 +601,101 @@ async function runInstall(opts) {
     console.log("Installation complete. Next steps:");
     console.log("  - Antigravity CLI (agy)    : Start a new session to activate agy-fast.");
     console.log("  - Antigravity Desktop / IDE: Open Customizations -> Installed and ensure 'agy-fast' is enabled.");
+  }
+}
+
+async function runConfig(opts) {
+  const patch = {};
+  if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
+  if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
+  if (opts.channel) patch.channel = opts.channel;
+  if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
+
+  let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
+  let cfg;
+  if (Object.keys(patch).length > 0) {
+    const res = await writeUpdaterConfigFile(patch);
+    cfgPath = res.cfgPath;
+    cfg = res.config;
+  } else {
+    cfg = (await readJsonSafe(cfgPath)) || {};
+  }
+
+  if (!opts.quiet) {
+    console.log(`agy-fast updater config (${cfgPath}):`);
+    console.log(`  - autoUpdate        : ${cfg.autoUpdate || "auto"}`);
+    console.log(`  - checkIntervalHours: ${cfg.checkIntervalHours || 12}`);
+    console.log(`  - channel           : ${cfg.channel || "release"}`);
+    console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
+  }
+}
+
+async function runUpdate(opts) {
+  checkNodeVersion();
+  const resolvedDst = path.resolve(opts.targetDir);
+  if (!(await pathExists(resolvedDst))) {
+    throw new Error(
+      `agy-fast is not installed at ${resolvedDst}. Run 'install' first.`,
+    );
+  }
+
+  if (opts.autoUpdate || opts.intervalHours !== null) {
+    const patch = {};
+    if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
+    if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
+    await writeUpdaterConfigFile(patch);
+  }
+
+  const installedUpdater = path.join(resolvedDst, "dist", "updater.mjs");
+  const repoUpdater = path.join(REPO_ROOT, "dist", "updater.mjs");
+  const updaterPath = (await pathExists(installedUpdater))
+    ? installedUpdater
+    : repoUpdater;
+  if (!(await pathExists(updaterPath))) {
+    throw new Error("Missing dist/updater.mjs. Run 'npm run build' or reinstall agy-fast.");
+  }
+
+  const updaterArgs = [updaterPath, "--plugin-dir", resolvedDst, "--json"];
+  if (opts.checkOnly) updaterArgs.push("--check");
+  if (opts.force) updaterArgs.push("--force");
+  if (opts.channel) updaterArgs.push("--channel", opts.channel);
+  if (opts.repoUrl) updaterArgs.push("--repo", opts.repoUrl);
+
+  const res = spawnSync(process.execPath, updaterArgs, {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+  });
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse((res.stdout || "").trim());
+  } catch {
+    // Non-JSON error output handled below
+  }
+
+  if (!parsed) {
+    const detail = (res.stderr || res.stdout || res.error?.message || "updater failed").trim();
+    throw new Error(detail);
+  }
+
+  if (!opts.quiet) {
+    console.log(parsed.message);
+  }
+
+  if (parsed.status === "error") {
+    throw new Error(parsed.error || parsed.message);
+  }
+
+  if (parsed.status === "updated") {
+    const { ok } = await runDoctor(resolvedDst, opts.quiet);
+    if (!ok) {
+      throw new Error("Post-update health check failed.");
+    }
+    if (!opts.quiet) {
+      console.log("");
+      console.log("Update complete. Start a new session (or reload Desktop/IDE window) to load the updated MCP server.");
+    }
   }
 }
 
@@ -518,6 +741,12 @@ async function main() {
   switch (opts.command) {
     case "install":
       await runInstall(opts);
+      break;
+    case "update":
+      await runUpdate(opts);
+      break;
+    case "config":
+      await runConfig(opts);
       break;
     case "uninstall":
       await runUninstall(opts);

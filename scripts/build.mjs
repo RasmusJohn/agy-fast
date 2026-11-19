@@ -23,6 +23,11 @@ const entrypoints = [
     out: path.join(distDir, "benchmark.mjs"),
     banner: "#!/usr/bin/env node\n// agy-fast Offline Transcript Benchmark CLI\n",
   },
+  {
+    in: path.join(rootDir, "src", "updater.ts"),
+    out: path.join(distDir, "updater.mjs"),
+    banner: "#!/usr/bin/env node\n// agy-fast Background & CLI Auto-Updater (zero-dependency ESM)\n",
+  },
 ];
 
 await fs.mkdir(distDir, { recursive: true });

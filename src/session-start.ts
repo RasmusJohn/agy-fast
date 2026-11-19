@@ -1,4 +1,16 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildWorkspaceSnapshot } from "./utils/snapshot.js";
+import {
+  consumeSnapshotUpdateNotice,
+  readInstalledVersion,
+  readUpdateState,
+  resolveUpdaterSettings,
+  shouldTriggerBackgroundCheck,
+  spawnBackgroundUpdateCheck,
+  writeUpdateState,
+} from "./utils/updater-core.js";
 
 interface SessionStartPayload {
   cwd?: string;
@@ -80,11 +92,49 @@ async function main(): Promise<void> {
       return;
     }
 
+    let updateNotice: string | null = null;
+    try {
+      const pluginDir = path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "..",
+      );
+      const settings = await resolveUpdaterSettings();
+      if (settings.mode !== "off") {
+        const [currentVersion, state] = await Promise.all([
+          readInstalledVersion(pluginDir),
+          readUpdateState(),
+        ]);
+        updateNotice = await consumeSnapshotUpdateNotice(
+          pluginDir,
+          currentVersion,
+        );
+        if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
+          const updaterPath = path.join(pluginDir, "dist", "updater.mjs");
+          const hasUpdater = await fs
+            .access(updaterPath)
+            .then(() => true)
+            .catch(() => false);
+          if (hasUpdater) {
+            await writeUpdateState({
+              lastCheckAttemptAt: new Date().toISOString(),
+            }).catch(() => {});
+            spawnBackgroundUpdateCheck(pluginDir);
+          }
+        }
+      }
+    } catch {
+      // Never block or break SessionStart on updater errors
+    }
+
+    const messageText = updateNotice
+      ? `${snapshot}\n${updateNotice}`
+      : snapshot;
+
     const response = {
       injectSteps: [
         {
           systemMessage: {
-            systemMessage: snapshot,
+            systemMessage: messageText,
           },
         },
       ],

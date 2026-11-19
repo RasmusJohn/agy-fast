@@ -46,6 +46,7 @@ describe("installer", () => {
       "dist/mcp-server.mjs",
       "dist/session-start.mjs",
       "dist/benchmark.mjs",
+      "dist/updater.mjs",
       "scripts/install.mjs",
     ]) {
       const stat = await fs.stat(path.join(expectedDir, rel));
@@ -59,6 +60,8 @@ describe("installer", () => {
       encoding: "utf8",
     });
     assert.match(docOut, /MCP server\s+: OK/);
+    assert.match(docOut, /Version\s+: v\d+\.\d+\.\d+/);
+    assert.match(docOut, /Auto-update\s+: auto/);
     const installedDocOut = execFileSync(
       process.execPath,
       [path.join(expectedDir, "scripts", "install.mjs"), "doctor"],

@@ -1,6 +1,11 @@
 // agy-fast SessionStart Hook (bundled zero-dependency ESM)
 
 
+// src/session-start.ts
+import { promises as fs3 } from "node:fs";
+import path3 from "node:path";
+import { fileURLToPath } from "node:url";
+
 // src/utils/snapshot.ts
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -597,6 +602,186 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   return fitSectionToChars(assembled, maxChars, suffix);
 }
 
+// src/utils/updater-core.ts
+import { spawn as spawn2 } from "node:child_process";
+import { promises as fs2 } from "node:fs";
+import os from "node:os";
+import path2 from "node:path";
+var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
+var DEFAULT_CHECK_INTERVAL_HOURS = 12;
+var LOCK_STALE_MS = 10 * 60 * 1e3;
+function getHomeDir(env = process.env) {
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+}
+function getUpdaterPaths(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const cacheDir = custom ? path2.resolve(custom) : path2.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  return {
+    cacheDir,
+    stateFile: path2.join(cacheDir, "update-state.json"),
+    configFile: path2.join(cacheDir, "config.json"),
+    lockFile: path2.join(cacheDir, "update.lock")
+  };
+}
+function parseSemver(raw) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+  if (!m) return null;
+  return [
+    Number.parseInt(m[1], 10),
+    Number.parseInt(m[2], 10),
+    Number.parseInt(m[3], 10)
+  ];
+}
+function compareSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+function parseAutoUpdateMode(raw) {
+  if (!raw) return null;
+  const norm = raw.trim().toLowerCase();
+  if (norm === "auto" || norm === "on" || norm === "1" || norm === "true") {
+    return "auto";
+  }
+  if (norm === "notify" || norm === "check") {
+    return "notify";
+  }
+  if (norm === "off" || norm === "0" || norm === "false" || norm === "disabled") {
+    return "off";
+  }
+  return null;
+}
+function parseUpdateChannel(raw) {
+  if (!raw) return null;
+  const norm = raw.trim().toLowerCase();
+  if (norm === "release" || norm === "stable") return "release";
+  if (norm === "main" || norm === "nightly" || norm === "edge") return "main";
+  return null;
+}
+async function readJsonFile(filePath) {
+  try {
+    const raw = await fs2.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+  }
+  return null;
+}
+async function writeJsonAtomically(filePath, data) {
+  await fs2.mkdir(path2.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
+`, "utf8");
+  try {
+    await fs2.rename(tmpPath, filePath);
+  } catch {
+    await fs2.copyFile(tmpPath, filePath);
+    await fs2.rm(tmpPath, { force: true }).catch(() => {
+    });
+  }
+}
+async function readUpdaterConfig(env = process.env) {
+  const paths = getUpdaterPaths(env);
+  return await readJsonFile(paths.configFile) ?? {};
+}
+async function readUpdateState(env = process.env) {
+  const paths = getUpdaterPaths(env);
+  return await readJsonFile(paths.stateFile) ?? {};
+}
+async function writeUpdateState(patch, env = process.env) {
+  const paths = getUpdaterPaths(env);
+  const existing = await readJsonFile(paths.stateFile) ?? {};
+  const merged = { ...existing, ...patch };
+  await writeJsonAtomically(paths.stateFile, merged);
+  return merged;
+}
+async function resolveUpdaterSettings(env = process.env) {
+  const cfg = await readUpdaterConfig(env);
+  const envMode = parseAutoUpdateMode(env.AGY_FAST_AUTO_UPDATE);
+  const cfgMode = parseAutoUpdateMode(cfg.autoUpdate);
+  const mode = envMode ?? cfgMode ?? "auto";
+  const envHours = Number.parseFloat(env.AGY_FAST_UPDATE_INTERVAL_HOURS ?? "");
+  const rawHours = Number.isFinite(envHours) && envHours >= 0.01 ? envHours : typeof cfg.checkIntervalHours === "number" && cfg.checkIntervalHours >= 0.01 ? cfg.checkIntervalHours : DEFAULT_CHECK_INTERVAL_HOURS;
+  const checkIntervalHours = Math.max(0.01, Math.min(24 * 30, rawHours));
+  const envChan = parseUpdateChannel(env.AGY_FAST_UPDATE_CHANNEL);
+  const cfgChan = parseUpdateChannel(cfg.channel);
+  const channel = envChan ?? cfgChan ?? "release";
+  const repoUrl = env.AGY_FAST_REPO?.trim() || cfg.repoUrl?.trim() || DEFAULT_REPO_URL;
+  return {
+    mode,
+    checkIntervalHours,
+    checkIntervalMs: Math.round(checkIntervalHours * 3600 * 1e3),
+    channel,
+    repoUrl
+  };
+}
+async function readInstalledVersion(pluginDir) {
+  const manifest = await readJsonFile(
+    path2.join(pluginDir, "plugin.json")
+  );
+  if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
+    return manifest.version.trim();
+  }
+  return "0.0.0";
+}
+function shouldTriggerBackgroundCheck(state, nowMs, intervalMs) {
+  const lastCompleted = state.lastCheckAt ? Date.parse(state.lastCheckAt) : NaN;
+  const lastAttempt = state.lastCheckAttemptAt ? Date.parse(state.lastCheckAttemptAt) : NaN;
+  if (Number.isFinite(lastCompleted) && nowMs - lastCompleted < intervalMs) {
+    return false;
+  }
+  if (Number.isFinite(lastAttempt) && nowMs - lastAttempt < Math.min(intervalMs, 5 * 60 * 1e3)) {
+    return false;
+  }
+  return true;
+}
+async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = process.env) {
+  const state = await readUpdateState(env);
+  if (state.lastAppliedVersion && state.lastAppliedVersion === currentVersion && state.lastAppliedFrom && state.lastAppliedFrom !== currentVersion && state.notifiedAppliedVersion !== currentVersion) {
+    await writeUpdateState({ notifiedAppliedVersion: currentVersion }, env).catch(
+      () => {
+      }
+    );
+    return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
+  }
+  if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0 && state.notifiedAvailableVersion !== state.availableVersion) {
+    await writeUpdateState(
+      { notifiedAvailableVersion: state.availableVersion },
+      env
+    ).catch(() => {
+    });
+    const reason = state.availableReason ? ` (${state.availableReason})` : "";
+    const installerPath = path2.join(pluginDir, "scripts", "install.mjs");
+    return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
+  }
+  return null;
+}
+function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
+  const updaterPath = path2.join(pluginDir, "dist", "updater.mjs");
+  try {
+    const child = spawn2(
+      process.execPath,
+      [updaterPath, "--background", "--plugin-dir", pluginDir],
+      {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        env
+      }
+    );
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // src/session-start.ts
 function firstNonEmptyPath(list) {
   if (!Array.isArray(list)) return "";
@@ -653,11 +838,43 @@ async function main() {
       process.stdout.write("{}\n");
       return;
     }
+    let updateNotice = null;
+    try {
+      const pluginDir = path3.resolve(
+        path3.dirname(fileURLToPath(import.meta.url)),
+        ".."
+      );
+      const settings = await resolveUpdaterSettings();
+      if (settings.mode !== "off") {
+        const [currentVersion, state] = await Promise.all([
+          readInstalledVersion(pluginDir),
+          readUpdateState()
+        ]);
+        updateNotice = await consumeSnapshotUpdateNotice(
+          pluginDir,
+          currentVersion
+        );
+        if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
+          const updaterPath = path3.join(pluginDir, "dist", "updater.mjs");
+          const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
+          if (hasUpdater) {
+            await writeUpdateState({
+              lastCheckAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
+            }).catch(() => {
+            });
+            spawnBackgroundUpdateCheck(pluginDir);
+          }
+        }
+      }
+    } catch {
+    }
+    const messageText = updateNotice ? `${snapshot}
+${updateNotice}` : snapshot;
     const response = {
       injectSteps: [
         {
           systemMessage: {
-            systemMessage: snapshot
+            systemMessage: messageText
           }
         }
       ]
