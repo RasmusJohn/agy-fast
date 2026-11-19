@@ -8,7 +8,7 @@
 
 零运行期依赖 · 单文件 ESM 产物 · 遵守官方规范 · 支持 Antigravity CLI（`agy`）、Desktop 2.0 与 IDE
 
-[English](README.md) · 简体中文 · [性能分析报告（中文脱敏版）](docs/ANALYSIS_REPORT.zh-CN.md) · [Latency Analysis Report (EN)](docs/ANALYSIS_REPORT.md)
+[English](README.md) · 简体中文 · [更新日志](CHANGELOG.md) · [性能分析报告（中文脱敏版）](docs/ANALYSIS_REPORT.zh-CN.md) · [Latency Analysis Report (EN)](docs/ANALYSIS_REPORT.md)
 
 </div>
 

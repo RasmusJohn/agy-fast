@@ -8,7 +8,7 @@
 
 Zero runtime dependencies · Single-file ESM bundles · Policy-compliant · Works on Antigravity CLI (`agy`), Desktop 2.0, and IDE
 
-English · [简体中文](README.zh-CN.md) · [Latency Analysis Report](docs/ANALYSIS_REPORT.md) · [性能分析报告（中文脱敏版）](docs/ANALYSIS_REPORT.zh-CN.md)
+English · [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md) · [Latency Analysis Report](docs/ANALYSIS_REPORT.md) · [性能分析报告（中文脱敏版）](docs/ANALYSIS_REPORT.zh-CN.md)
 
 </div>
 
