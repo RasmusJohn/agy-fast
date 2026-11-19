@@ -1,0 +1,11 @@
+{
+  "agy-fast-snapshot": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node dist/session-start.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "agy-fast",
+  "version": "0.1.0",
+  "description": "Policy-compliant latency and tool-call accelerator plugin for Google Antigravity",
+  "type": "module",
+  "author": "inkwhite <714395048@qq.com>",
+  "homepage": "https://github.com/INK-Q/agy-fast#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/INK-Q/agy-fast.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "agy-fast": "./scripts/install.mjs"
+  },
+  "files": [
+    "plugin.json",
+    "mcp_config.json",
+    "hooks.json",
+    "rules/AGENTS.md",
+    "assets/logo.svg",
+    "dist/*.mjs",
+    "scripts/install.mjs",
+    "docs/*.md",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/test.mjs",
+    "validate": "agy plugin validate --strict .",
+    "install:plugin": "node scripts/install.mjs install",
+    "uninstall:plugin": "node scripts/install.mjs uninstall",
+    "doctor": "node scripts/install.mjs doctor",
+    "benchmark": "node dist/benchmark.mjs"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "plugin",
+    "mcp",
+    "performance",
+    "batch",
+    "developer-tools"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}
