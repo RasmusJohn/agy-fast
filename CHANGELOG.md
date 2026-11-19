@@ -5,6 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.1] - 2026-11-19
+
+### Added
+
+- **Zero-latency background auto-update (`dist/updater.mjs` + `SessionStart`)**
+  - Checks for newer stable release tags every **12 hours** via a detached, unref'd background process after `SessionStart` emits its workspace snapshot (**0 ms** added to session startup).
+  - Uses `git ls-remote --tags --refs` (avoiding GitHub REST API rate limits and respecting native git/system proxy settings) with automatic fallback to the GitHub Releases API.
+  - Stages downloads in an isolated temp directory, validates all runtime files and runs a **live MCP 4-tool handshake smoke test** before atomically replacing live files (`tmp -> rename`); broken staged releases are rejected without touching the existing install.
+  - Protects `--link` dev symlinks, local source directories, and dirty git clones from overwriting (notify-only), while auto-updating standard copied installs and clean direct `git clone` installs safely.
+  - Concurrency lock (`~/.gemini/cache/agy-fast/update.lock` with 10-minute stale recovery) prevents duplicate parallel updates across subagents; surfaces a one-time notice in the next `SessionStart` snapshot.
+- **Manual `update` & `config` CLI subcommands (`scripts/install.mjs`, `install.sh`, `install.ps1`)**
+  - Added `update [--check] [--force] [--channel release|main] [--repo <url>]` and `config --auto-update auto|notify|off --interval <hours> --channel release|main --repo <url>`.
+  - Added environment variable overrides (`AGY_FAST_AUTO_UPDATE`, `AGY_FAST_UPDATE_INTERVAL_HOURS`, `AGY_FAST_UPDATE_CHANNEL`, `AGY_FAST_REPO`) and `npm run update:plugin`.
+  - Updated `doctor` to display installed version, auto-update mode/interval/channel, and last check status (with background checks disabled during `doctor` smoke tests).
+
+### 简体中文摘要（v0.2.1）
+
+- **零启动延迟的后台自动更新（`dist/updater.mjs` + `SessionStart`）**：每 12 小时在 `SessionStart` 输出快照后异步拉起完全分离的后台更新进程，**0 ms 启动阻塞**；支持并发锁防重入，并在下一次新会话展示一次性更新提示。
+- **先暂存冒烟校验、再原子替换**：优先走 `git ls-remote --tags`（规避 GitHub API 限流并原生走系统/git 代理），暂存目录先做全运行文件与实时 MCP 4 工具握手校验，通过后再按文件原子替换；损坏版本自动拦截。
+- **安全保护与可控配置**：常规复制安装与干净 `git clone` 自动更新，`--link` 软链接与脏仓库仅提示不覆盖；新增 `update [--check]` 与 `config --auto-update auto|notify|off` 子命令（兼容 `install.sh` / `install.ps1`）及环境变量覆盖，`doctor` 同步展示版本号与自动更新状态。
+
+---
+
 ## [0.2.0] - 2026-11-19
 
 Production-hardening release driven by real-world Antigravity CLI & Desktop 2.0 transcript telemetry.

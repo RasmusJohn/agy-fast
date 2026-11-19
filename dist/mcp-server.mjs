@@ -3430,7 +3430,7 @@ function clampInt2(val, min, max) {
 }
 
 // src/mcp-server.ts
-var SERVER_VERSION = "0.2.0";
+var SERVER_VERSION = "0.2.1";
 function createAgyFastServer() {
   const server = new McpStdioServer({
     name: "agy-fast",
