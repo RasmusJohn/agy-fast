@@ -21,6 +21,8 @@ export interface ExecOptions {
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MiB
 
 const WINDOWS_CODEPAGE_LABELS: Record<number, string> = {
+  866: "ibm866",
+  874: "windows-874",
   936: "gb18030",
   54936: "gb18030",
   950: "big5",
@@ -37,6 +39,14 @@ const WINDOWS_CODEPAGE_LABELS: Record<number, string> = {
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 let cachedWindowsFallbackEncoding: string | null | undefined;
 const fallbackDecoderCache = new Map<string, TextDecoder>();
+
+export function parseWindowsCodePage(output: string): string | null {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1]!, 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
 
 function stripTrailingIncompleteUtf8(buf: Buffer): Buffer {
   if (buf.length === 0) return buf;
@@ -66,14 +76,10 @@ function getWindowsFallbackEncoding(): string | null {
       timeout: 1500,
       windowsHide: true,
     });
-    const match = /(\d{3,5})/.exec(res.stdout || "");
-    if (match) {
-      const cp = Number.parseInt(match[1]!, 10);
-      const mapped = WINDOWS_CODEPAGE_LABELS[cp];
-      if (mapped && mapped !== "utf-8") {
-        cachedWindowsFallbackEncoding = mapped;
-        return cachedWindowsFallbackEncoding;
-      }
+    const mapped = parseWindowsCodePage(res.stdout || "");
+    if (mapped) {
+      cachedWindowsFallbackEncoding = mapped;
+      return cachedWindowsFallbackEncoding;
     }
   } catch {
     // Ignore probe errors and fall back to UTF-8
@@ -169,11 +175,13 @@ export type WindowsPowerShellBin = "pwsh" | "powershell.exe";
 export type WindowsShellProbe = (bin: WindowsPowerShellBin) => Promise<boolean>;
 
 const WINDOWS_PS_ENV_OR_VAR_RE =
-  /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/m;
+  /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
 const WINDOWS_PS_CMDLET_RE =
-  /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b/i;
+  /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b(?!-)/i;
 const EXPLICIT_POWERSHELL_INVOCATION_RE =
   /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+const PS_NON_INVOCATION_TAIL_RE =
+  /^(?:[|;&+}=)]|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 
 /**
  * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
@@ -207,7 +215,7 @@ export function formatPowerShellCommand(command: string): string {
     }
     if (trimmed[idx] === quote) {
       const rest = trimmed.slice(idx + 1).trimStart();
-      if (rest && !/^(?:[|;&+})]|$)/.test(rest)) {
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -221,6 +229,14 @@ let cachedWindowsPowerShell: WindowsPowerShellBin | null | undefined;
 let pendingWindowsPowerShellProbe: Promise<WindowsPowerShellBin | null> | null = null;
 
 async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<boolean> {
+  const whereRes = await execBinaryAsync("where.exe", [bin], {
+    cwd: process.cwd(),
+    timeoutMs: 2000,
+    maxOutputBytes: 4096,
+  });
+  if (!whereRes.error) {
+    return whereRes.exitCode === 0;
+  }
   const res = await execBinaryAsync(
     bin,
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
@@ -279,15 +295,10 @@ export async function runShellCommandAsync(
   if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
     const psBin = await resolveWindowsPowerShell();
     if (psBin) {
+      const utf8Command = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${formatPowerShellCommand(command)}`;
       return spawnAndCollect(
         psBin,
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          formatPowerShellCommand(command),
-        ],
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
         false,
         options,
       );
@@ -309,7 +320,8 @@ function spawnAndCollect(
   return new Promise<ExecResult>((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
 
@@ -367,23 +379,23 @@ function spawnAndCollect(
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), truncated),
-        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), truncated),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error,
       });
     };
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -392,14 +404,14 @@ function spawnAndCollect(
 
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;

@@ -16,6 +16,8 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
   936: "gb18030",
   54936: "gb18030",
   950: "big5",
@@ -31,6 +33,13 @@ var WINDOWS_CODEPAGE_LABELS = {
 var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 var cachedWindowsFallbackEncoding;
 var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
 function stripTrailingIncompleteUtf8(buf) {
   if (buf.length === 0) return buf;
   let i = buf.length - 1;
@@ -58,14 +67,10 @@ function getWindowsFallbackEncoding() {
       timeout: 1500,
       windowsHide: true
     });
-    const match = /(\d{3,5})/.exec(res.stdout || "");
-    if (match) {
-      const cp = Number.parseInt(match[1], 10);
-      const mapped = WINDOWS_CODEPAGE_LABELS[cp];
-      if (mapped && mapped !== "utf-8") {
-        cachedWindowsFallbackEncoding = mapped;
-        return cachedWindowsFallbackEncoding;
-      }
+    const mapped = parseWindowsCodePage(res.stdout || "");
+    if (mapped) {
+      cachedWindowsFallbackEncoding = mapped;
+      return cachedWindowsFallbackEncoding;
     }
   } catch {
   }
@@ -140,7 +145,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -190,22 +196,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), truncated),
-        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), truncated),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -213,14 +219,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;

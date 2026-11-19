@@ -5,6 +5,7 @@ import {
   decodeProcessOutput,
   formatPowerShellCommand,
   needsPowerShellOnWindows,
+  parseWindowsCodePage,
   resetWindowsShellCache,
   resolveWindowsPowerShell,
 } from "../src/utils/exec-utils.js";
@@ -125,6 +126,14 @@ describe("run_checks", () => {
       true,
     );
     assert.equal(
+      needsPowerShellOnWindows('node "$Env:USERPROFILE\\dist\\benchmark.mjs" --help'),
+      true,
+    );
+    assert.equal(
+      needsPowerShellOnWindows("echo $ENV:PATH; echo $LastExitCode"),
+      true,
+    );
+    assert.equal(
       needsPowerShellOnWindows("Get-ChildItem src | Select-Object -First 5"),
       true,
     );
@@ -136,6 +145,8 @@ describe("run_checks", () => {
 
     assert.equal(needsPowerShellOnWindows("npm test"), false);
     assert.equal(needsPowerShellOnWindows("npm run test-unit"), false);
+    assert.equal(needsPowerShellOnWindows("start-server-and-test dev 3000 test"), false);
+    assert.equal(needsPowerShellOnWindows("copy-webpack-plugin --version"), false);
     assert.equal(
       needsPowerShellOnWindows('"D:\\Program Files\\nodejs\\node.exe" -e "console.log(1)"'),
       false,
@@ -147,10 +158,12 @@ describe("run_checks", () => {
     );
 
     assert.equal(
-      formatPowerShellCommand('"$env:USERPROFILE\\bin\\tool.exe" --version'),
-      '& "$env:USERPROFILE\\bin\\tool.exe" --version',
+      formatPowerShellCommand('"$Env:USERPROFILE\\bin\\tool.exe" --version'),
+      '& "$Env:USERPROFILE\\bin\\tool.exe" --version',
     );
     assert.equal(formatPowerShellCommand('"hello" | Out-Null'), '"hello" | Out-Null');
+    assert.equal(formatPowerShellCommand('"$Env:FOO" -eq "bar"'), '"$Env:FOO" -eq "bar"');
+    assert.equal(formatPowerShellCommand('"{0}" -f $Env:USERNAME'), '"{0}" -f $Env:USERNAME');
     assert.equal(
       formatPowerShellCommand('node "$env:USERPROFILE\\a.js"'),
       'node "$env:USERPROFILE\\a.js"',
@@ -196,6 +209,12 @@ describe("run_checks", () => {
   });
 
   it("decodes UTF-8, truncated UTF-8 tails, and legacy codepage buffers cleanly", () => {
+    assert.equal(parseWindowsCodePage("Active code page: 936\r\n"), "gb18030");
+    assert.equal(parseWindowsCodePage("Active code page: 866\r\n"), "ibm866");
+    assert.equal(parseWindowsCodePage("Active code page: 874\r\n"), "windows-874");
+    assert.equal(parseWindowsCodePage("Active code page: 65001\r\n"), null);
+    assert.equal(parseWindowsCodePage("no digits here"), null);
+
     const utf8 = Buffer.from("中文 UTF-8 输出 OK", "utf8");
     assert.equal(decodeProcessOutput(utf8, false, "gb18030"), "中文 UTF-8 输出 OK");
 
@@ -209,7 +228,7 @@ describe("run_checks", () => {
   });
 
   if (process.platform === "win32") {
-    it("executes PowerShell $env: variables and cmdlets cleanly on Windows", async () => {
+    it("executes PowerShell $env: variables, UTF-8 Unicode output, and cmdlets cleanly on Windows", async () => {
       const prev = process.env.AGY_FAST_PWSH_TEST;
       process.env.AGY_FAST_PWSH_TEST = "pwsh_env_expanded_ok";
       try {
@@ -218,11 +237,11 @@ describe("run_checks", () => {
           commands: [
             {
               name: "win-ps-env",
-              command: `${nodeBin} -e "console.log(process.argv[1])" "$env:AGY_FAST_PWSH_TEST"`,
+              command: `${nodeBin} -e "console.log(process.argv[1])" "$Env:AGY_FAST_PWSH_TEST"`,
             },
             {
-              name: "win-ps-cmdlet",
-              command: "Write-Output $env:AGY_FAST_PWSH_TEST",
+              name: "win-ps-unicode",
+              command: 'Write-Output "✔ 🚀 $Env:AGY_FAST_PWSH_TEST"',
             },
             {
               name: "win-missing-cmd-encoding",
@@ -232,7 +251,7 @@ describe("run_checks", () => {
         });
         assert.equal(res.isError, false);
         assert.match(res.text, /Checks: 2\/3 passed, 1 failed/);
-        assert.match(res.text, /pwsh_env_expanded_ok/);
+        assert.match(res.text, /✔ 🚀 pwsh_env_expanded_ok/);
         assert.doesNotMatch(res.text, /\uFFFD/);
       } finally {
         if (prev === undefined) {

@@ -262,6 +262,8 @@ import path2 from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
   936: "gb18030",
   54936: "gb18030",
   950: "big5",
@@ -277,6 +279,13 @@ var WINDOWS_CODEPAGE_LABELS = {
 var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 var cachedWindowsFallbackEncoding;
 var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
 function stripTrailingIncompleteUtf8(buf) {
   if (buf.length === 0) return buf;
   let i = buf.length - 1;
@@ -304,14 +313,10 @@ function getWindowsFallbackEncoding() {
       timeout: 1500,
       windowsHide: true
     });
-    const match = /(\d{3,5})/.exec(res.stdout || "");
-    if (match) {
-      const cp = Number.parseInt(match[1], 10);
-      const mapped = WINDOWS_CODEPAGE_LABELS[cp];
-      if (mapped && mapped !== "utf-8") {
-        cachedWindowsFallbackEncoding = mapped;
-        return cachedWindowsFallbackEncoding;
-      }
+    const mapped = parseWindowsCodePage(res.stdout || "");
+    if (mapped) {
+      cachedWindowsFallbackEncoding = mapped;
+      return cachedWindowsFallbackEncoding;
     }
   } catch {
   }
@@ -379,9 +384,10 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-var WINDOWS_PS_ENV_OR_VAR_RE = /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/m;
-var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b/i;
+var WINDOWS_PS_ENV_OR_VAR_RE = /\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE|HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
+var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Za-z]+\b(?!-)/i;
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=)]|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 function needsPowerShellOnWindows(command) {
   if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
     return false;
@@ -402,7 +408,7 @@ function formatPowerShellCommand(command) {
     }
     if (trimmed[idx] === quote) {
       const rest = trimmed.slice(idx + 1).trimStart();
-      if (rest && !/^(?:[|;&+})]|$)/.test(rest)) {
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -414,6 +420,14 @@ function formatPowerShellCommand(command) {
 var cachedWindowsPowerShell;
 var pendingWindowsPowerShellProbe = null;
 async function defaultProbeWindowsShell(bin) {
+  const whereRes = await execBinaryAsync("where.exe", [bin], {
+    cwd: process.cwd(),
+    timeoutMs: 2e3,
+    maxOutputBytes: 4096
+  });
+  if (!whereRes.error) {
+    return whereRes.exitCode === 0;
+  }
   const res = await execBinaryAsync(
     bin,
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
@@ -454,15 +468,10 @@ async function runShellCommandAsync(command, options) {
   if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
     const psBin = await resolveWindowsPowerShell();
     if (psBin) {
+      const utf8Command = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${formatPowerShellCommand(command)}`;
       return spawnAndCollect(
         psBin,
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          formatPowerShellCommand(command)
-        ],
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
         false,
         options
       );
@@ -477,7 +486,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -527,22 +537,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), truncated),
-        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), truncated),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -550,14 +560,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
