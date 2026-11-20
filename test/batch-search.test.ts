@@ -113,6 +113,47 @@ describe("batch_search", () => {
     }
   });
 
+  it("handles multiline identity escapes in Node fallback, Windows backslash fuzzy queries, and contiguous fuzzy ranking", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-polish-"));
+    try {
+      await fs.mkdir(path.join(cwd, "src", "tools"), { recursive: true });
+      await fs.writeFile(path.join(cwd, "src", "tools", "batch-search.ts"), "key:val\n#tag\n");
+      await fs.writeFile(path.join(cwd, "a_serv.ts"), "");
+      await fs.writeFile(path.join(cwd, "s_xx_serv.ts"), "");
+      await fs.writeFile(path.join(cwd, "s_xx_e_r_v.ts"), "");
+
+      for (const forceNodeFallback of [false, true]) {
+        const escRes = await runBatchSearch({
+          cwd,
+          queries: [
+            { type: "regex", pattern: "key\\:val", multiline: true, path: "src/tools/batch-search.ts" },
+            { type: "regex", pattern: "\\#tag", multiline: true, path: "src/tools/batch-search.ts" },
+          ],
+        }, { forceNodeFallback });
+        assert.equal(escRes.isError, false);
+        assert.match(escRes.text, /1: key:val/);
+        assert.match(escRes.text, /2: #tag/);
+      }
+
+      const fuzzyRes = await runBatchSearch({
+        cwd,
+        queries: [
+          { type: "fuzzy", pattern: "src\\tools\\batch" },
+          { type: "fuzzy", pattern: "serv", fileType: "ts" },
+        ],
+      });
+      const sections = fuzzyRes.text.split("\n\n");
+      assert.match(sections[0]!, /src\/tools\/batch-search\.ts/);
+      assert.deepEqual(sections[1]!.split("\n").slice(1), [
+        "a_serv.ts",
+        "s_xx_serv.ts",
+        "s_xx_e_r_v.ts",
+      ]);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   before(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-"));

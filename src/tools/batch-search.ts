@@ -654,9 +654,21 @@ async function runTextOrRegexWithNode(
     try {
       regex = new RegExp(query.pattern, flags);
     } catch (err) {
-      throw new Error(
-        `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // Retry without strict Unicode 'u' mode so ripgrep-valid identity escapes
+      // (e.g. `\:` or `\#`) remain compatible in multiline Node fallback.
+      if (flags.includes("u")) {
+        try {
+          regex = new RegExp(query.pattern, flags.replace("u", ""));
+        } catch {
+          throw new Error(
+            `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else {
+        throw new Error(
+          `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

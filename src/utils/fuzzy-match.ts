@@ -4,11 +4,30 @@
 
 export interface FuzzyMatchResult { path: string; score: number }
 
+function findContiguousIndex(haystack: string[], needle: string[]): number {
+  const maxStart = haystack.length - needle.length;
+  for (let start = 0; start <= maxStart; start++) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset++) {
+      if (haystack[start + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return start;
+  }
+  return -1;
+}
+
 /** Compute subsequence span cost (smaller is better); operates on Unicode code points. */
 export function subsequenceCost(needle: string, haystack: string): number | undefined {
   if (!needle) return 2147483647;
   const lowered = [...haystack].flatMap(ch => [...ch.toLowerCase()]);
   const query = [...needle.toLowerCase()];
+  const contiguousAt = findContiguousIndex(lowered, query);
+  if (contiguousAt >= 0) {
+    return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
+  }
   let cursor = 0;
   let first = -1;
   let last = -1;
@@ -18,7 +37,7 @@ export function subsequenceCost(needle: string, haystack: string): number | unde
     if (first < 0) first = cursor;
     last = cursor++;
   }
-  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 100 : 0);
+  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
 }
 
 // Higher-is-better path ranking score, with -1 as the non-match sentinel.
@@ -28,7 +47,7 @@ function scoreSubsequence(query: string, target: string): number {
 }
 
 export function fuzzyScorePath(query: string, candidatePosix: string): number {
-  const trimmed = query.trim();
+  const trimmed = query.trim().replace(/\\/g, "/");
   if (!trimmed) return -1;
 
   // Support space-separated multi-token fuzzy queries (all tokens must match)

@@ -1421,10 +1421,28 @@ import { promises as fs3 } from "node:fs";
 import path3 from "node:path";
 
 // src/utils/fuzzy-match.ts
+function findContiguousIndex(haystack, needle) {
+  const maxStart = haystack.length - needle.length;
+  for (let start = 0; start <= maxStart; start++) {
+    let matched = true;
+    for (let offset = 0; offset < needle.length; offset++) {
+      if (haystack[start + offset] !== needle[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return start;
+  }
+  return -1;
+}
 function subsequenceCost(needle, haystack) {
   if (!needle) return 2147483647;
   const lowered = [...haystack].flatMap((ch) => [...ch.toLowerCase()]);
   const query = [...needle.toLowerCase()];
+  const contiguousAt = findContiguousIndex(lowered, query);
+  if (contiguousAt >= 0) {
+    return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
+  }
   let cursor = 0;
   let first = -1;
   let last = -1;
@@ -1434,14 +1452,14 @@ function subsequenceCost(needle, haystack) {
     if (first < 0) first = cursor;
     last = cursor++;
   }
-  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 100 : 0);
+  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
 }
 function scoreSubsequence(query, target) {
   const cost = subsequenceCost(query, target);
   return cost === void 0 ? -1 : Math.max(1, 1e3 - cost);
 }
 function fuzzyScorePath(query, candidatePosix) {
-  const trimmed = query.trim();
+  const trimmed = query.trim().replace(/\\/g, "/");
   if (!trimmed) return -1;
   const tokens = trimmed.split(/\s+/).filter(Boolean);
   const slashIdx = candidatePosix.lastIndexOf("/");
@@ -1993,9 +2011,19 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     try {
       regex = new RegExp(query.pattern, flags);
     } catch (err) {
-      throw new Error(
-        `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
-      );
+      if (flags.includes("u")) {
+        try {
+          regex = new RegExp(query.pattern, flags.replace("u", ""));
+        } catch {
+          throw new Error(
+            `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      } else {
+        throw new Error(
+          `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
