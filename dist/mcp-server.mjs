@@ -1419,6 +1419,57 @@ ${formatted}`
 // src/tools/batch-search.ts
 import { promises as fs3 } from "node:fs";
 import path3 from "node:path";
+
+// src/utils/fuzzy-match.ts
+function subsequenceCost(needle, haystack) {
+  if (!needle) return 2147483647;
+  const lowered = [...haystack].flatMap((ch) => [...ch.toLowerCase()]);
+  const query = [...needle.toLowerCase()];
+  let cursor = 0;
+  let first = -1;
+  let last = -1;
+  for (const ch of query) {
+    while (cursor < lowered.length && lowered[cursor] !== ch) cursor++;
+    if (cursor === lowered.length) return void 0;
+    if (first < 0) first = cursor;
+    last = cursor++;
+  }
+  return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 100 : 0);
+}
+function scoreSubsequence(query, target) {
+  const cost = subsequenceCost(query, target);
+  return cost === void 0 ? -1 : Math.max(1, 1e3 - cost);
+}
+function fuzzyScorePath(query, candidatePosix) {
+  const trimmed = query.trim();
+  if (!trimmed) return -1;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const slashIdx = candidatePosix.lastIndexOf("/");
+  const basename = slashIdx === -1 ? candidatePosix : candidatePosix.slice(slashIdx + 1);
+  let totalScore = 0;
+  for (const token of tokens) {
+    const fullScore = scoreSubsequence(token, candidatePosix);
+    if (fullScore < 0) return -1;
+    const baseScore = !token.includes("/") ? scoreSubsequence(token, basename) : -1;
+    totalScore += baseScore >= 0 ? Math.max(fullScore, baseScore + 45) : fullScore;
+    if (basename.toLowerCase() === token.toLowerCase()) totalScore += 60;
+  }
+  return totalScore;
+}
+function rankFuzzyPaths(query, candidates, maxResults) {
+  const scored = [];
+  for (const candidate of candidates) {
+    const score = fuzzyScorePath(query, candidate);
+    if (score >= 0) scored.push({ path: candidate, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path));
+  return {
+    matches: scored.slice(0, maxResults),
+    totalMatched: scored.length
+  };
+}
+
+// src/tools/batch-search.ts
 var READONLY_GIT_SUBCOMMANDS = /* @__PURE__ */ new Set([
   "status",
   "diff",
@@ -1684,22 +1735,88 @@ function validateReadonlyGitArgs(pattern) {
   }
   return ["--no-pager", subcmd, ...rest];
 }
+var FILE_TYPE_GLOBS = {
+  ts: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  typescript: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  js: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  javascript: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  py: ["*.py", "*.pyi"],
+  python: ["*.py", "*.pyi"],
+  go: ["*.go"],
+  gd: ["*.gd"],
+  gdscript: ["*.gd"],
+  rust: ["*.rs"],
+  rs: ["*.rs"],
+  java: ["*.java"],
+  kt: ["*.kt", "*.kts"],
+  kotlin: ["*.kt", "*.kts"],
+  c: ["*.c", "*.h"],
+  cpp: ["*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h"],
+  cs: ["*.cs"],
+  csharp: ["*.cs"],
+  swift: ["*.swift"],
+  rb: ["*.rb"],
+  ruby: ["*.rb"],
+  php: ["*.php"],
+  css: ["*.css", "*.scss", "*.sass", "*.less"],
+  html: ["*.html", "*.htm"],
+  vue: ["*.vue"],
+  svelte: ["*.svelte"],
+  md: ["*.md", "*.mdx", "*.markdown"],
+  markdown: ["*.md", "*.mdx", "*.markdown"],
+  json: ["*.json", "*.jsonc"],
+  yaml: ["*.yml", "*.yaml"],
+  yml: ["*.yml", "*.yaml"],
+  toml: ["*.toml"],
+  xml: ["*.xml"],
+  sql: ["*.sql"],
+  sh: ["*.sh", "*.bash", "*.zsh"],
+  shell: ["*.sh", "*.bash", "*.zsh"]
+};
+function resolveFileTypeGlobs(fileType) {
+  if (fileType === void 0) return null;
+  if (typeof fileType !== "string") throw new Error("fileType must be a string");
+  const key = fileType.trim().toLowerCase().replace(/^\./, "");
+  if (!key) return null;
+  const mapped = FILE_TYPE_GLOBS[key];
+  if (Object.hasOwn(FILE_TYPE_GLOBS, key)) return mapped;
+  if (/^[a-z0-9]+$/i.test(key)) return [`*.${key}`];
+  throw new Error(`Unsupported fileType '${fileType}'`);
+}
+function fileTypeMatcher(fileType) {
+  const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path3.basename(file)));
+}
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const args = [
-    "--json",
-    "--no-messages",
-    "--max-filesize",
-    "2M"
-  ];
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const typeGlobs = resolveFileTypeGlobs(query.fileType);
+  const matchesType = fileTypeMatcher(query.fileType);
+  if (typeGlobs && !matchesType(searchRoot) && (await fs3.stat(searchRoot)).isFile()) {
+    return { files: [], totalMatches: 0, truncated: false };
+  }
+  const args = ["--no-messages", "--max-filesize", "2M"];
+  if (summary || typeGlobs || query.multiline) args.push("--no-config");
+  if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
+  if (query.outputMode === "count") {
+    args.push(query.multiline ? "--count-matches" : "--count", "--with-filename", "--null");
+  } else if (query.outputMode === "files_with_matches") {
+    args.push("--files-with-matches", "--null");
+  } else {
+    args.push("--json");
+  }
+  if (typeGlobs) {
+    for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
+    args.push("--type", "agyfilter");
+  }
   if (query.type === "text") {
     args.push("--fixed-strings");
   }
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
   }
-  if (contextLines > 0) {
+  if (!summary && contextLines > 0) {
     args.push("-C", String(contextLines));
   }
   if (query.glob) {
@@ -1721,7 +1838,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  args.push("--max-count", String(Math.min(maxResults, 50)));
+  if (!summary && !query.multiline) args.push("--max-count", String(Math.min(maxResults, 50)));
   args.push("--", query.pattern, searchRoot);
   const res = await execBinaryAsync("rg", args, {
     cwd: baseCwd,
@@ -1733,6 +1850,20 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   }
   if (res.exitCode === 2) {
     throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
+  }
+  if (summary) {
+    const files2 = [];
+    const records = query.outputMode === "count" ? res.stdout.matchAll(/([^\0]+)\0(\d+)\r?\n/g) : res.stdout.matchAll(/([^\0]+)\0/g);
+    for (const [, rawFile, count] of records) {
+      if (!rawFile || !matchesType(rawFile)) continue;
+      files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number(count ?? 0) });
+    }
+    files2.sort((a, b) => a.file.localeCompare(b.file));
+    return {
+      files: files2.slice(0, maxResults),
+      totalMatches: 0,
+      truncated: files2.length > maxResults || res.truncated || res.timedOut || res.exitCode === null
+    };
   }
   const byFile = /* @__PURE__ */ new Map();
   let totalMatches = 0;
@@ -1774,7 +1905,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     const lineNumber = ev.data?.line_number;
     const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
     const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || typeof lineNumber !== "number") continue;
+    if (!rawFile || !matchesType(rawFile) || typeof lineNumber !== "number") continue;
     const absFile = path3.isAbsolute(rawFile) ? rawFile : path3.resolve(baseCwd, rawFile);
     const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
     if (ev.type === "context") {
@@ -1790,7 +1921,6 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       pendingBeforeContext = [];
       continue;
     }
-    totalMatches += 1;
     for (const ctx of pendingBeforeContext) {
       if (ctx.relFile === relFile) {
         upsertLine(ctx.relFile, {
@@ -1801,24 +1931,67 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       }
     }
     pendingBeforeContext = [];
-    upsertLine(relFile, { lineNumber, text: lineText, isMatch: true });
+    const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
     lastKeptMatchFile = relFile;
-    lastKeptMatchLine = lineNumber;
+    for (const [offset, text] of segments.entries()) {
+      const line = lineNumber + offset;
+      if (byFile.get(relFile)?.get(line)?.isMatch) continue;
+      if (totalMatches >= maxResults) {
+        truncated = true;
+        break;
+      }
+      upsertLine(relFile, { lineNumber: line, text, isMatch: true });
+      lastKeptMatchLine = line;
+      totalMatches++;
+    }
   }
   const files = [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([file, lineMap]) => ({
     file,
     lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
   }));
-  return { files, totalMatches, truncated: truncated || res.truncated };
+  return { files, totalMatches, truncated: truncated || res.truncated || Boolean(query.multiline && res.timedOut) };
+}
+function* multilineMatches(content, regex) {
+  let previousEnd = -1;
+  for (const match of content.matchAll(regex)) {
+    const start = match.index;
+    if (start === content.length && (content.length === 0 || content.endsWith("\n"))) break;
+    if (match[0] === "") {
+      if (start === previousEnd || content[start - 1] === "\r" && content[start] === "\n") continue;
+    }
+    previousEnd = start + match[0].length;
+    yield match;
+  }
+}
+function multilineMatchLines(content, regex, limit) {
+  const indices = [];
+  let line = 0;
+  let nextBreak = content.indexOf("\n");
+  for (const match of multilineMatches(content, regex)) {
+    const start = match.index;
+    const end = start + Math.max(0, match[0].length - 1);
+    while (nextBreak !== -1 && nextBreak < start) {
+      line++;
+      nextBreak = content.indexOf("\n", nextBreak + 1);
+    }
+    while (true) {
+      if (indices.at(-1) !== line) indices.push(line);
+      if (indices.length >= limit) return indices;
+      if (nextBreak === -1 || nextBreak >= end) break;
+      line++;
+      nextBreak = content.indexOf("\n", nextBreak + 1);
+    }
+  }
+  return indices;
 }
 async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const caseSensitive = query.caseSensitive !== false;
+  const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
     try {
-      regex = new RegExp(query.pattern, caseSensitive ? "" : "i");
+      regex = new RegExp(query.pattern, flags);
     } catch (err) {
       throw new Error(
         `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`
@@ -1826,10 +1999,14 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    regex = new RegExp(escaped, caseSensitive ? "" : "i");
+    regex = new RegExp(escaped, flags);
   }
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const matchesType = fileTypeMatcher(query.fileType);
+  let discoveryTruncated = false;
   const globRegex = query.glob ? globToRegExp(query.glob) : null;
   const globMatchesFile = (relPosix) => {
+    if (!matchesType(relPosix)) return false;
     if (!globRegex) return true;
     if (globRegex.test(relPosix)) return true;
     if (!query.glob.includes("/")) {
@@ -1852,7 +2029,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       includeHidden,
       fileFilter: globMatchesFile
     });
+    discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path3.join(searchRoot, rel));
+    if (summary) targetFiles.sort((a, b) => relativeFile(baseCwd, a).localeCompare(relativeFile(baseCwd, b)));
   }
   const files = [];
   let totalMatches = 0;
@@ -1887,17 +2066,30 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs3.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
-          const lines = buf.toString("utf8").replace(/\r\n/g, "\n").split("\n");
-          const matchedIndices = [];
-          for (let idx = 0; idx < lines.length; idx++) {
-            if (regex.test(lines[idx])) {
-              matchedIndices.push(idx);
-              if (matchedIndices.length >= 50) break;
+          const content = buf.toString("utf8");
+          const lines = content.split(/\r?\n/);
+          if ((summary || query.multiline) && lines.at(-1) === "") lines.pop();
+          const relFile = relativeFile(baseCwd, absFile);
+          let matchedIndices = [];
+          let count = 0;
+          if (query.multiline && summary) {
+            for (const _match of multilineMatches(content, regex)) {
+              count++;
+              if (query.outputMode === "files_with_matches") break;
             }
+          } else if (query.multiline) {
+            matchedIndices = multilineMatchLines(content, regex, maxResults + 1);
+            count = matchedIndices.length;
+          } else {
+            for (let idx = 0; idx < lines.length; idx++) {
+              if (regex.test(lines[idx])) {
+                matchedIndices.push(idx);
+                if (query.outputMode === "files_with_matches" || !summary && matchedIndices.length >= 50) break;
+              }
+            }
+            count = matchedIndices.length;
           }
-          if (matchedIndices.length === 0) return null;
-          const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
-          return { relFile, lines, matchedIndices };
+          return count ? { relFile, lines, matchedIndices, count } : null;
         } catch {
           return null;
         }
@@ -1905,6 +2097,14 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     );
     for (const item of results) {
       if (!item) continue;
+      if (summary) {
+        if (files.length === maxResults) {
+          truncated = true;
+          break;
+        }
+        files.push({ file: item.relFile, lines: [], count: item.count });
+        continue;
+      }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
@@ -1919,7 +2119,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       totalMatches += item.matchedIndices.length;
     }
   }
-  return { files, totalMatches, truncated };
+  return { files, totalMatches, truncated: truncated || (summary || query.multiline === true) && discoveryTruncated };
 }
 function buildGlobFallbackPlan(pattern) {
   if (!pattern.includes("{") && pattern.includes("|")) {
@@ -1957,9 +2157,19 @@ function buildGlobFallbackPlan(pattern) {
   }
   return null;
 }
-function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefix) {
+async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  if (sortBy === "mtime") {
+    const mtimes = /* @__PURE__ */ new Map();
+    for (let i = 0; i < sortedFiles.length; i += 32) {
+      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+        const stat = await fs3.lstat(path3.join(searchRoot, file)).catch(() => void 0);
+        mtimes.set(file, stat?.mtimeMs ?? -Infinity);
+      }));
+    }
+    sortedFiles.sort((a, b) => mtimes.get(b) - mtimes.get(a) || a.localeCompare(b));
+  }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
@@ -2016,7 +2226,7 @@ ${rel}` : fallback2.emptyMessage;
     }
   });
   if (walked.files.length > 0) {
-    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
   }
   const fallback = buildGlobFallbackPlan(pattern);
   if (fallback) {
@@ -2034,12 +2244,29 @@ ${rel}` : fallback2.emptyMessage;
         searchRoot,
         baseCwd,
         maxResults,
+        query.sortBy,
         fallback.matchedNote
       );
     }
     return fallback.emptyMessage;
   }
   return "(no files matched)";
+}
+function relativeFile(baseCwd, file) {
+  return toPosixPath(path3.relative(baseCwd, path3.resolve(baseCwd, file))) || path3.basename(file);
+}
+async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
+  const pattern = query.pattern.trim();
+  if (!pattern) throw new Error("Fuzzy pattern must not be blank");
+  const matchesType = fileTypeMatcher(query.fileType);
+  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path3.resolve(searchRoot, file)));
+  const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
+  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const footer = walked.truncated || totalMatched > maxResults ? `
+... [truncated; showing ${matches.length} files]` : "";
+  return body + footer;
 }
 async function runGitQuery(query, searchRoot) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
@@ -2085,6 +2312,15 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
     if (!query.pattern || typeof query.pattern !== "string") {
       throw new Error("Query 'pattern' must be a non-empty string");
     }
+    if (query.multiline !== void 0 && typeof query.multiline !== "boolean") {
+      throw new Error("multiline must be a boolean");
+    }
+    if (query.outputMode !== void 0 && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
+      throw new Error("Invalid outputMode");
+    }
+    if (query.sortBy !== void 0 && !["path", "mtime"].includes(query.sortBy)) {
+      throw new Error("Invalid sortBy");
+    }
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
@@ -2103,6 +2339,11 @@ ${out}`;
       return `${header}
 ${out}`;
     }
+    if (query.type === "fuzzy") {
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      return `${header}
+${out}`;
+    }
     if (query.type === "text" || query.type === "regex") {
       let res;
       if (useRg) {
@@ -2117,6 +2358,13 @@ ${out}`;
         }
       } else {
         res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+      }
+      if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
+        const body = res.files.map(({ file, count }) => query.outputMode === "count" ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}` : file).join("\n") || "(no matches)";
+        const footer = res.truncated ? `
+... [truncated; showing ${res.files.length} files]` : "";
+        return `${header}
+${body}${footer}`;
       }
       return `${header}
 ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
@@ -3765,7 +4013,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run multiple read-only text/regex searches, file globs, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+      description: "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3783,11 +4031,11 @@ function createAgyFastServer() {
               properties: {
                 type: {
                   type: "string",
-                  enum: ["text", "regex", "glob", "git"]
+                  enum: ["text", "regex", "glob", "fuzzy", "git"]
                 },
                 pattern: {
                   type: "string",
-                  description: "Literal text, regex, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
+                  description: "Literal text, regex, fuzzy path query, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
                 },
                 path: {
                   type: "string",
@@ -3796,6 +4044,24 @@ function createAgyFastServer() {
                 glob: {
                   type: "string",
                   description: "Optional file filter glob for text/regex queries (e.g. '*.ts')."
+                },
+                multiline: {
+                  type: "boolean",
+                  description: "Allow text/regex to span lines. In multiline regex, dot matches newlines."
+                },
+                outputMode: {
+                  type: "string",
+                  enum: ["content", "files_with_matches", "count"],
+                  description: "Text/regex output (default content). Count reports matching lines per file, or occurrences in multiline mode."
+                },
+                fileType: {
+                  type: "string",
+                  description: "Language or extension filter for text, regex, or fuzzy queries (e.g. typescript or ts)."
+                },
+                sortBy: {
+                  type: "string",
+                  enum: ["path", "mtime"],
+                  description: "Glob order (default path). Use mtime for newest first."
                 },
                 caseSensitive: {
                   type: "boolean",

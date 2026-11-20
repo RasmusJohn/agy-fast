@@ -6,7 +6,7 @@ Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote
 | :--- | :--- | :--- |
 | Outline unknown large files (>300 lines; prefer 10-20 files/batch, max 40: TS/JS/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML) | `read_slices({ outlines: [...] })` | 1 call maps exact symbol/section line ranges without blind full-file dumps |
 | Read small files (<300 lines) OR **any** known line ranges after outlining (even 4-8 scattered ranges) | Built-in `read_file` (parallel in one turn, with `StartLine`/`EndLine` <=200 lines) | Locally allowlisted (~7ms, **0 remote check**) + **46 KB/call** inline vs MCP's 8.8 KB total cap |
-| Run >=2 text/regex/glob/read-only `git` queries (even across multiple directories/repos) | `batch_search` (pack ALL queries into **one** call via per-query `path`) | 1 remote check + concurrent local execution (<70ms), hard-capped <=8.8 KB inline |
+| Run >=2 text/regex/glob/fuzzy/read-only `git` queries (even across multiple directories/repos) | `batch_search` (pack ALL queries into **one** call via per-query `path`) | 1 remote check + concurrent local execution (<70ms), hard-capped <=8.8 KB inline |
 | Edit >=2 blocks in one file, edit/create/overwrite >=2 files in one turn, OR any edit + verify | `apply_edits` (`bestEffort: true` for >=3 files; optional `verify`) | Replaces N serial checks + verify turn; `bestEffort` commits valid files & returns closest-line / drifted-line hints |
 | Run >=2 independent non-interactive shell commands in one turn | `run_checks` (`outputMode: "compact"` for build/lint/test; `"full"` for diagnostic/inspection scripts) | 1 remote check + concurrent execution instead of N serial `run_command` checks |
 
@@ -21,7 +21,7 @@ Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote
 
 ## Quick Schemas (`ServerName: "agy-fast_fast"`)
 
-- **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"git", pattern, path?, glob?, caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars?: 500..8800 }` (1-20 queries; glob uses `*`/`{a,b}`, not regex `|`; `path` relative or absolute; read-only git only).
+- **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"fuzzy"|"git", pattern, path?, glob?, fileType?, multiline?, outputMode?: "content"|"files_with_matches"|"count", sortBy?: "path"|"mtime", caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars?: 500..8800 }` (1-20 queries; glob uses `*`/`{a,b}`, not regex `|`; `path` relative or absolute; read-only git only).
 - **`apply_edits`**: `{ cwd?, edits: [{ path, hunks?: [{ target, replacement, startLine?, endLine?, replaceAll? }], create?: string, overwrite?: boolean }], dryRun?, bestEffort?, verify?: string, verifyTimeoutSec?, maxVerifyChars?: 300..7500 }` (1-50 files; `create` is mutually exclusive with `hunks`).
 - **`read_slices`**: `{ cwd?, outlines?: string[], slices?: [{ path, ranges: [[startLine, endLine], ...] }], maxChars?: 1000..8800 }` (prefer 10-20 outlines/batch, max 40; 1-based inclusive line ranges).
 - **`run_checks`**: `{ cwd?, commands: [{ name?, command, cwd?, timeoutSec? }], concurrency?: 1..8, timeoutSec?, outputMode?: "compact"|"full", maxChars?: 500..8800 }` (1-12 commands).

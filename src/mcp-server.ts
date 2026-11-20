@@ -16,7 +16,7 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "batch_search",
       description:
-        "Run multiple read-only text/regex searches, file globs, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+        "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
       inputSchema: {
         type: "object",
         properties: {
@@ -34,12 +34,12 @@ export function createAgyFastServer(): McpStdioServer {
               properties: {
                 type: {
                   type: "string",
-                  enum: ["text", "regex", "glob", "git"],
+                  enum: ["text", "regex", "glob", "fuzzy", "git"],
                 },
                 pattern: {
                   type: "string",
                   description:
-                    "Literal text, regex, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline').",
+                    "Literal text, regex, fuzzy path query, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline').",
                 },
                 path: {
                   type: "string",
@@ -48,6 +48,24 @@ export function createAgyFastServer(): McpStdioServer {
                 glob: {
                   type: "string",
                   description: "Optional file filter glob for text/regex queries (e.g. '*.ts').",
+                },
+                multiline: {
+                  type: "boolean",
+                  description: "Allow text/regex to span lines. In multiline regex, dot matches newlines.",
+                },
+                outputMode: {
+                  type: "string",
+                  enum: ["content", "files_with_matches", "count"],
+                  description: "Text/regex output (default content). Count reports matching lines per file, or occurrences in multiline mode.",
+                },
+                fileType: {
+                  type: "string",
+                  description: "Language or extension filter for text, regex, or fuzzy queries (e.g. typescript or ts).",
+                },
+                sortBy: {
+                  type: "string",
+                  enum: ["path", "mtime"],
+                  description: "Glob order (default path). Use mtime for newest first.",
                 },
                 caseSensitive: {
                   type: "boolean",

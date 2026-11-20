@@ -13,6 +13,107 @@ import {
 describe("batch_search", () => {
   let tmpDir: string;
 
+  for (const forceNodeFallback of [false, true]) {
+    it(`supports file-only output, line counts and language filtering (forceNodeFallback=${forceNodeFallback})`, async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-modes-"));
+      try {
+        await fs.writeFile(path.join(cwd, "a.ts"), "needle needle\r\n".repeat(75));
+        await fs.writeFile(path.join(cwd, "b.tsx"), "needle\n");
+        await fs.writeFile(path.join(cwd, "c.py"), "needle\n");
+        const search = { type: "text", pattern: "needle", fileType: "TypeScript" } as const;
+        const { text } = await runBatchSearch({
+          cwd,
+          queries: [
+            { ...search, outputMode: "count", glob: "*", maxResults: 1 },
+            { ...search, outputMode: "files_with_matches", glob: "b.*" },
+            { ...search, path: "c.py" },
+            { type: "regex", pattern: "^$", outputMode: "count" },
+          ],
+        }, { forceNodeFallback });
+        const sections = text.split("\n\n");
+        assert.match(sections[0]!, /a\.ts: 75 matching lines/);
+        assert.match(sections[0]!, /truncated; showing 1 files/);
+        assert.equal(sections[1]!.split("\n").at(-1), "b.tsx");
+        assert.match(sections[2]!, /\(no matches\)/);
+        assert.match(sections[3]!, /\(no matches\)/);
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const forceNodeFallback of [false, true]) {
+    it(`supports multiline content, file lists and counts (forceNodeFallback=${forceNodeFallback})`, async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-multiline-"));
+      try {
+        await fs.writeFile(path.join(cwd, "a.ts"), "before\r\nstart one\r\nend\r\nafter\r\n");
+        await fs.writeFile(path.join(cwd, "b.ts"), "begin end begin end\n");
+        await fs.writeFile(path.join(cwd, "c.py"), "start two\nend\n");
+        await fs.writeFile(path.join(cwd, "emoji.ts"), "A😀B\n");
+        const search = { type: "regex", pattern: "^start.*?end$", fileType: "ts" } as const;
+        const { text } = await runBatchSearch({
+          cwd,
+          queries: [
+            { ...search, multiline: true, contextLines: 1 },
+            { ...search, multiline: true, maxResults: 1 },
+            { ...search, multiline: true, outputMode: "files_with_matches" },
+            { ...search, multiline: true, outputMode: "count", pattern: "begin.*?end" },
+            { ...search, multiline: true, outputMode: "count" },
+            { ...search },
+            { type: "text", pattern: "start one\r\nend", multiline: true, outputMode: "files_with_matches" },
+            { ...search, path: "a.ts", multiline: true, outputMode: "count", pattern: "^$" },
+            { ...search, path: "a.ts", multiline: true, outputMode: "count", pattern: "one|$" },
+            { ...search, path: "emoji.ts", multiline: true, outputMode: "count", pattern: "A.B" },
+          ],
+        }, { forceNodeFallback });
+        const sections = text.split("\n\n");
+        assert.deepEqual(sections[0]!.split("\n").slice(1), [
+          "a.ts", "  1- before", "  2: start one", "  3: end", "  4- after",
+        ]);
+        assert.match(sections[1]!, /2: start one\n\.\.\. \[truncated/);
+        assert.equal(sections[2]!.split("\n").at(-1), "a.ts");
+        assert.match(sections[3]!, /b\.ts: 2 matches/);
+        assert.match(sections[4]!, /a\.ts: 1 matches/);
+        assert.match(sections[5]!, /\(no matches\)/);
+        assert.equal(sections[6]!.split("\n").at(-1), "a.ts");
+        assert.match(sections[7]!, /\(no matches\)/);
+        assert.match(sections[8]!, /a\.ts: 4 matches/);
+        assert.match(sections[9]!, /emoji\.ts: 1 matches/);
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("ranks fuzzy paths and optionally sorts glob results by newest mtime", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-paths-"));
+    try {
+      for (const [file, seconds] of [["mcp-server.ts", 1000], ["mcpserv.ts", 2000], ["mcpserv.py", 3000]] as const) {
+        const target = path.join(cwd, file);
+        await fs.writeFile(target, "");
+        await fs.utimes(target, seconds, seconds);
+      }
+      const { text } = await runBatchSearch({
+        cwd,
+        queries: [
+          { type: "fuzzy", pattern: "MCPSERV", fileType: "ts" },
+          { type: "fuzzy", pattern: "SERV MCP", fileType: "ts", maxResults: 1 },
+          { type: "glob", pattern: "*.ts", sortBy: "mtime", maxResults: 1 },
+          { type: "glob", pattern: "*.ts" },
+        ],
+      });
+      const sections = text.split("\n\n");
+      assert.deepEqual(sections[0]!.split("\n").slice(1), ["mcpserv.ts", "mcp-server.ts"]);
+      assert.equal(sections[1]!.split("\n")[1], "mcpserv.ts");
+      assert.match(sections[1]!, /truncated; showing 1 files/);
+      assert.equal(sections[2]!.split("\n")[1], "mcpserv.ts");
+      assert.deepEqual(sections[3]!.split("\n").slice(1), ["mcp-server.ts", "mcpserv.ts"]);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
   before(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-"));
     await fs.mkdir(path.join(tmpDir, "src", "api"), { recursive: true });

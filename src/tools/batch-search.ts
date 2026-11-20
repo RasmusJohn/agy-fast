@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { execBinaryAsync, isRipgrepAvailable } from "../utils/exec-utils.js";
+import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
   globToRegExp,
   isLikelyBinary,
@@ -13,13 +14,17 @@ import {
   fitSectionsToByteBudget,
 } from "../utils/output-filter.js";
 
-export type SearchQueryType = "text" | "regex" | "glob" | "git";
+export type SearchQueryType = "text" | "regex" | "glob" | "fuzzy" | "git";
 
 export interface SearchQuery {
   type: SearchQueryType;
   pattern: string;
   path?: string;
   glob?: string;
+  fileType?: string;
+  multiline?: boolean;
+  outputMode?: "content" | "files_with_matches" | "count";
+  sortBy?: "path" | "mtime";
   caseSensitive?: boolean;
   contextLines?: number;
   maxResults?: number;
@@ -323,6 +328,61 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
   return ["--no-pager", subcmd, ...rest];
 }
 
+const FILE_TYPE_GLOBS: Record<string, string[]> = {
+  ts: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  typescript: ["*.ts", "*.tsx", "*.mts", "*.cts"],
+  js: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  javascript: ["*.js", "*.jsx", "*.mjs", "*.cjs"],
+  py: ["*.py", "*.pyi"],
+  python: ["*.py", "*.pyi"],
+  go: ["*.go"],
+  gd: ["*.gd"],
+  gdscript: ["*.gd"],
+  rust: ["*.rs"],
+  rs: ["*.rs"],
+  java: ["*.java"],
+  kt: ["*.kt", "*.kts"],
+  kotlin: ["*.kt", "*.kts"],
+  c: ["*.c", "*.h"],
+  cpp: ["*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h"],
+  cs: ["*.cs"],
+  csharp: ["*.cs"],
+  swift: ["*.swift"],
+  rb: ["*.rb"],
+  ruby: ["*.rb"],
+  php: ["*.php"],
+  css: ["*.css", "*.scss", "*.sass", "*.less"],
+  html: ["*.html", "*.htm"],
+  vue: ["*.vue"],
+  svelte: ["*.svelte"],
+  md: ["*.md", "*.mdx", "*.markdown"],
+  markdown: ["*.md", "*.mdx", "*.markdown"],
+  json: ["*.json", "*.jsonc"],
+  yaml: ["*.yml", "*.yaml"],
+  yml: ["*.yml", "*.yaml"],
+  toml: ["*.toml"],
+  xml: ["*.xml"],
+  sql: ["*.sql"],
+  sh: ["*.sh", "*.bash", "*.zsh"],
+  shell: ["*.sh", "*.bash", "*.zsh"],
+};
+
+function resolveFileTypeGlobs(fileType?: string): string[] | null {
+  if (fileType === undefined) return null;
+  if (typeof fileType !== "string") throw new Error("fileType must be a string");
+  const key = fileType.trim().toLowerCase().replace(/^\./, "");
+  if (!key) return null;
+  const mapped = FILE_TYPE_GLOBS[key];
+  if (Object.hasOwn(FILE_TYPE_GLOBS, key)) return mapped!;
+  if (/^[a-z0-9]+$/i.test(key)) return [`*.${key}`];
+  throw new Error(`Unsupported fileType '${fileType}'`);
+}
+
+function fileTypeMatcher(fileType?: string): (file: string) => boolean {
+  const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path.basename(file)));
+}
+
 interface SearchLine {
   lineNumber: number;
   text: string;
@@ -332,6 +392,7 @@ interface SearchLine {
 interface FileMatches {
   file: string;
   lines: SearchLine[];
+  count?: number;
 }
 
 async function runTextOrRegexWithRg(
@@ -341,12 +402,27 @@ async function runTextOrRegexWithRg(
 ): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const args: string[] = [
-    "--json",
-    "--no-messages",
-    "--max-filesize",
-    "2M",
-  ];
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const typeGlobs = resolveFileTypeGlobs(query.fileType);
+  const matchesType = fileTypeMatcher(query.fileType);
+  if (typeGlobs && !matchesType(searchRoot) && (await fs.stat(searchRoot)).isFile()) {
+    return { files: [], totalMatches: 0, truncated: false };
+  }
+
+  const args = ["--no-messages", "--max-filesize", "2M"];
+  if (summary || typeGlobs || query.multiline) args.push("--no-config");
+  if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
+  if (query.outputMode === "count") {
+    args.push(query.multiline ? "--count-matches" : "--count", "--with-filename", "--null");
+  } else if (query.outputMode === "files_with_matches") {
+    args.push("--files-with-matches", "--null");
+  } else {
+    args.push("--json");
+  }
+  if (typeGlobs) {
+    for (const glob of typeGlobs) args.push("--type-add", `agyfilter:${glob}`);
+    args.push("--type", "agyfilter");
+  }
 
   if (query.type === "text") {
     args.push("--fixed-strings");
@@ -354,7 +430,7 @@ async function runTextOrRegexWithRg(
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
   }
-  if (contextLines > 0) {
+  if (!summary && contextLines > 0) {
     args.push("-C", String(contextLines));
   }
   if (query.glob) {
@@ -378,7 +454,7 @@ async function runTextOrRegexWithRg(
     }
   }
   // Cap per-file matches so a single minified file cannot consume the budget
-  args.push("--max-count", String(Math.min(maxResults, 50)));
+  if (!summary && !query.multiline) args.push("--max-count", String(Math.min(maxResults, 50)));
   args.push("--", query.pattern, searchRoot);
 
   const res = await execBinaryAsync("rg", args, {
@@ -393,6 +469,23 @@ async function runTextOrRegexWithRg(
   // rg exit code 0 = matches found, 1 = no matches, 2 = error (e.g. bad regex)
   if (res.exitCode === 2) {
     throw new Error(res.stderr.trim() || `rg failed for pattern: ${query.pattern}`);
+  }
+
+  if (summary) {
+    const files: FileMatches[] = [];
+    const records = query.outputMode === "count"
+      ? res.stdout.matchAll(/([^\0]+)\0(\d+)\r?\n/g)
+      : res.stdout.matchAll(/([^\0]+)\0/g);
+    for (const [, rawFile, count] of records) {
+      if (!rawFile || !matchesType(rawFile)) continue;
+      files.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number(count ?? 0) });
+    }
+    files.sort((a, b) => a.file.localeCompare(b.file));
+    return {
+      files: files.slice(0, maxResults),
+      totalMatches: 0,
+      truncated: files.length > maxResults || res.truncated || res.timedOut || res.exitCode === null,
+    };
   }
 
   const byFile = new Map<string, Map<number, SearchLine>>();
@@ -449,7 +542,7 @@ async function runTextOrRegexWithRg(
       ev.data?.lines?.text ??
       (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
     const lineText = rawText.replace(/\r?\n$/, "");
-    if (!rawFile || typeof lineNumber !== "number") continue;
+    if (!rawFile || !matchesType(rawFile) || typeof lineNumber !== "number") continue;
 
     const absFile = path.isAbsolute(rawFile) ? rawFile : path.resolve(baseCwd, rawFile);
     const relFile = toPosixPath(path.relative(baseCwd, absFile)) || path.basename(absFile);
@@ -474,7 +567,6 @@ async function runTextOrRegexWithRg(
       pendingBeforeContext = [];
       continue;
     }
-    totalMatches += 1;
     for (const ctx of pendingBeforeContext) {
       if (ctx.relFile === relFile) {
         upsertLine(ctx.relFile, {
@@ -485,9 +577,19 @@ async function runTextOrRegexWithRg(
       }
     }
     pendingBeforeContext = [];
-    upsertLine(relFile, { lineNumber, text: lineText, isMatch: true });
+    const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
     lastKeptMatchFile = relFile;
-    lastKeptMatchLine = lineNumber;
+    for (const [offset, text] of segments.entries()) {
+      const line = lineNumber + offset;
+      if (byFile.get(relFile)?.get(line)?.isMatch) continue;
+      if (totalMatches >= maxResults) {
+        truncated = true;
+        break;
+      }
+      upsertLine(relFile, { lineNumber: line, text, isMatch: true });
+      lastKeptMatchLine = line;
+      totalMatches++;
+    }
   }
 
   const files: FileMatches[] = [...byFile.entries()]
@@ -497,7 +599,45 @@ async function runTextOrRegexWithRg(
       lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber),
     }));
 
-  return { files, totalMatches, truncated: truncated || res.truncated };
+  return { files, totalMatches, truncated: truncated || res.truncated || Boolean(query.multiline && res.timedOut) };
+}
+
+function* multilineMatches(content: string, regex: RegExp): Generator<RegExpMatchArray> {
+  let previousEnd = -1;
+  for (const match of content.matchAll(regex)) {
+    const start = match.index!;
+    if (start === content.length && (content.length === 0 || content.endsWith("\n"))) break;
+    if (match[0] === "") {
+      // Match rg's CRLF boundaries and omit empty matches adjacent to the prior match.
+      if (start === previousEnd || (content[start - 1] === "\r" && content[start] === "\n")) continue;
+    }
+    previousEnd = start + match[0].length;
+    yield match;
+  }
+}
+
+function multilineMatchLines(content: string, regex: RegExp, limit: number): number[] {
+  const indices: number[] = [];
+  let line = 0;
+  let nextBreak = content.indexOf("\n");
+
+  // Matches arrive in offset order. Track line boundaries as the matches advance.
+  for (const match of multilineMatches(content, regex)) {
+    const start = match.index!;
+    const end = start + Math.max(0, match[0].length - 1);
+    while (nextBreak !== -1 && nextBreak < start) {
+      line++;
+      nextBreak = content.indexOf("\n", nextBreak + 1);
+    }
+    while (true) {
+      if (indices.at(-1) !== line) indices.push(line);
+      if (indices.length >= limit) return indices;
+      if (nextBreak === -1 || nextBreak >= end) break;
+      line++;
+      nextBreak = content.indexOf("\n", nextBreak + 1);
+    }
+  }
+  return indices;
 }
 
 async function runTextOrRegexWithNode(
@@ -507,12 +647,12 @@ async function runTextOrRegexWithNode(
 ): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
   const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
-  const caseSensitive = query.caseSensitive !== false;
+  const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
 
   let regex: RegExp;
   if (query.type === "regex") {
     try {
-      regex = new RegExp(query.pattern, caseSensitive ? "" : "i");
+      regex = new RegExp(query.pattern, flags);
     } catch (err) {
       throw new Error(
         `Invalid regex '${query.pattern}': ${err instanceof Error ? err.message : String(err)}`,
@@ -520,11 +660,15 @@ async function runTextOrRegexWithNode(
     }
   } else {
     const escaped = query.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    regex = new RegExp(escaped, caseSensitive ? "" : "i");
+    regex = new RegExp(escaped, flags);
   }
 
+  const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
+  const matchesType = fileTypeMatcher(query.fileType);
+  let discoveryTruncated = false;
   const globRegex = query.glob ? globToRegExp(query.glob) : null;
   const globMatchesFile = (relPosix: string): boolean => {
+    if (!matchesType(relPosix)) return false;
     if (!globRegex) return true;
     if (globRegex.test(relPosix)) return true;
     // Also match basename when pattern has no slash (like '*.ts')
@@ -550,7 +694,9 @@ async function runTextOrRegexWithNode(
       includeHidden,
       fileFilter: globMatchesFile,
     });
+    discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path.join(searchRoot, rel));
+    if (summary) targetFiles.sort((a, b) => relativeFile(baseCwd, a).localeCompare(relativeFile(baseCwd, b)));
   }
 
   const files: FileMatches[] = [];
@@ -586,26 +732,36 @@ async function runTextOrRegexWithNode(
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
-      batch.map(async (absFile): Promise<{ relFile: string; lines: string[]; matchedIndices: number[] } | null> => {
+      batch.map(async (absFile): Promise<{ relFile: string; lines: string[]; matchedIndices: number[]; count: number } | null> => {
         try {
           const st = await fs.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
-          const lines = buf.toString("utf8").replace(/\r\n/g, "\n").split("\n");
-
-          const matchedIndices: number[] = [];
-          for (let idx = 0; idx < lines.length; idx++) {
-            if (regex.test(lines[idx]!)) {
-              matchedIndices.push(idx);
-              if (matchedIndices.length >= 50) break;
+          const content = buf.toString("utf8");
+          const lines = content.split(/\r?\n/);
+          if ((summary || query.multiline) && lines.at(-1) === "") lines.pop();
+          const relFile = relativeFile(baseCwd, absFile);
+          let matchedIndices: number[] = [];
+          let count = 0;
+          if (query.multiline && summary) {
+            for (const _match of multilineMatches(content, regex)) {
+              count++;
+              if (query.outputMode === "files_with_matches") break;
             }
+          } else if (query.multiline) {
+            matchedIndices = multilineMatchLines(content, regex, maxResults + 1);
+            count = matchedIndices.length;
+          } else {
+            for (let idx = 0; idx < lines.length; idx++) {
+              if (regex.test(lines[idx]!)) {
+                matchedIndices.push(idx);
+                if (query.outputMode === "files_with_matches" || (!summary && matchedIndices.length >= 50)) break;
+              }
+            }
+            count = matchedIndices.length;
           }
-          if (matchedIndices.length === 0) return null;
-
-          const relFile =
-            toPosixPath(path.relative(baseCwd, absFile)) || path.basename(absFile);
-          return { relFile, lines, matchedIndices };
+          return count ? { relFile, lines, matchedIndices, count } : null;
         } catch {
           return null;
         }
@@ -614,6 +770,14 @@ async function runTextOrRegexWithNode(
 
     for (const item of results) {
       if (!item) continue;
+      if (summary) {
+        if (files.length === maxResults) {
+          truncated = true;
+          break;
+        }
+        files.push({ file: item.relFile, lines: [], count: item.count });
+        continue;
+      }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
@@ -629,7 +793,7 @@ async function runTextOrRegexWithNode(
     }
   }
 
-  return { files, totalMatches, truncated };
+  return { files, totalMatches, truncated: truncated || ((summary || query.multiline === true) && discoveryTruncated) };
 }
 
 interface GlobFallbackPlan {
@@ -684,15 +848,26 @@ function buildGlobFallbackPlan(pattern: string): GlobFallbackPlan | null {
   return null;
 }
 
-function formatGlobWalkResult(
+async function formatGlobWalkResult(
   walked: { files: string[]; truncated: boolean },
   searchRoot: string,
   baseCwd: string,
   maxResults: number,
+  sortBy: SearchQuery["sortBy"],
   notePrefix?: string,
-): string {
+): Promise<string> {
   const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  if (sortBy === "mtime") {
+    const mtimes = new Map<string, number>();
+    for (let i = 0; i < sortedFiles.length; i += 32) {
+      await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
+        const stat = await fs.lstat(path.join(searchRoot, file)).catch(() => undefined);
+        mtimes.set(file, stat?.mtimeMs ?? -Infinity);
+      }));
+    }
+    sortedFiles.sort((a, b) => mtimes.get(b)! - mtimes.get(a)! || a.localeCompare(b));
+  }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
     return `${relPrefix}/${f}`;
@@ -766,7 +941,7 @@ async function runGlobQuery(
   });
 
   if (walked.files.length > 0) {
-    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, query.sortBy);
   }
 
   const fallback = buildGlobFallbackPlan(pattern);
@@ -785,6 +960,7 @@ async function runGlobQuery(
         searchRoot,
         baseCwd,
         maxResults,
+        query.sortBy,
         fallback.matchedNote,
       );
     }
@@ -792,6 +968,34 @@ async function runGlobQuery(
   }
 
   return "(no files matched)";
+}
+
+function relativeFile(baseCwd: string, file: string): string {
+  return toPosixPath(path.relative(baseCwd, path.resolve(baseCwd, file))) || path.basename(file);
+}
+
+async function runFuzzyQuery(
+  query: SearchQuery,
+  searchRoot: string,
+  baseCwd: string,
+  isFileTarget: boolean,
+): Promise<string> {
+  const pattern = query.pattern.trim();
+  if (!pattern) throw new Error("Fuzzy pattern must not be blank");
+  const matchesType = fileTypeMatcher(query.fileType);
+  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const walked = isFileTarget
+    ? { files: [searchRoot], truncated: false }
+    : await walkFiles(searchRoot, { maxFiles: 8000, fileFilter: matchesType });
+  const candidates = walked.files
+    .filter(matchesType)
+    .map((file) => relativeFile(baseCwd, path.resolve(searchRoot, file)));
+  const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
+  const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
+  const footer = walked.truncated || totalMatched > maxResults
+    ? `\n... [truncated; showing ${matches.length} files]`
+    : "";
+  return body + footer;
 }
 
 async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<string> {
@@ -849,6 +1053,15 @@ async function executeSingleQuery(
     if (!query.pattern || typeof query.pattern !== "string") {
       throw new Error("Query 'pattern' must be a non-empty string");
     }
+    if (query.multiline !== undefined && typeof query.multiline !== "boolean") {
+      throw new Error("multiline must be a boolean");
+    }
+    if (query.outputMode !== undefined && !["content", "files_with_matches", "count"].includes(query.outputMode)) {
+      throw new Error("Invalid outputMode");
+    }
+    if (query.sortBy !== undefined && !["path", "mtime"].includes(query.sortBy)) {
+      throw new Error("Invalid sortBy");
+    }
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
@@ -868,6 +1081,11 @@ async function executeSingleQuery(
       return `${header}\n${out}`;
     }
 
+    if (query.type === "fuzzy") {
+      const out = await runFuzzyQuery(query, searchRoot, baseCwd, targetStat.isFile());
+      return `${header}\n${out}`;
+    }
+
     if (query.type === "text" || query.type === "regex") {
       let res;
       if (useRg) {
@@ -883,6 +1101,13 @@ async function executeSingleQuery(
         }
       } else {
         res = await runTextOrRegexWithNode(query, searchRoot, baseCwd);
+      }
+      if (query.outputMode === "count" || query.outputMode === "files_with_matches") {
+        const body = res.files.map(({ file, count }) => query.outputMode === "count"
+          ? `${file}: ${count} ${query.multiline ? "matches" : "matching lines"}`
+          : file).join("\n") || "(no matches)";
+        const footer = res.truncated ? `\n... [truncated; showing ${res.files.length} files]` : "";
+        return `${header}\n${body}${footer}`;
       }
       return `${header}\n${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
     }
