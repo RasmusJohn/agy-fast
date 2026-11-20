@@ -29,6 +29,38 @@ Read the full sanitized data breakdown in **[docs/ANALYSIS_REPORT.md](docs/ANALY
 
 ---
 
+## Real-World Impact (Sanitized Telemetry)
+
+Across **10 days of real coding transcripts** (**14 baseline main sessions / 5,771 turns** vs. **7 `agy-fast` main sessions / 901 turns**, plus **104 baseline vs. 4 `agy-fast` subagent sessions**; all repository names, paths, and session identifiers stripped), each `agy-fast` call batched an average of **4.89 logical operations** (`5.95×` in subagents) and delivered measurable savings across **latency, quota/token cost, and upload bandwidth**:
+
+| Metric (normalized per logical action) | Main Sessions (Baseline) | Main Sessions (`agy-fast`) | Delta | `>=150k` Long Context | Subagents |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **LLM turns / 10 actions** | 5.23 | **3.47** | **-33.7%** | **-38.2%** | **-58.8%** |
+| **Upstream requests / 10 actions** *(LLM + remote checks)* | 9.82 | **6.05** | **-38.4%** | **-42.6%** | **-62.0%** |
+| **Prompt Cache hit rate** *(miss spikes)* | 89.6% *(7.5%)* | **94.0%** *(4.8%)* | **+4.4 pp** | **95.0%** *(3.3%)* | 92.4% *(2.8%)* |
+| **Uncached fresh input / action** | 10,413 tok | **4,822 tok** | **-53.7%** | **-61.5%** | **-51.3%** |
+| **Est. billable quota / action** *(1 : 0.1 : 5)* | 22,458 eq | **15,387 eq** | **-31.5%** | **-36.5%** | **-54.0%** |
+| **Tool-return upload / action** *(actual local bytes)* | 5.06 KB | **3.05 KB** | **-39.7%** | **-42.6%** | **-13.3%** |
+| **Incremental text upload / action** *(fresh input est.)* | 35.6 KB | **16.5 KB** | **-53.7%** | **-61.6%** | **-51.3%** |
+| **Full-context text upload / action** *(stateless resend est.)* | 342.2 KB | **276.2 KB** | **-19.3%** | **-21.9%** | **-58.9%** |
+
+**Production hardening highlights (`v0.2.x`):**
+- **0 disk spills** across 134 consecutive `v0.2.x` MCP calls (strict `<= 8.8 KB` UTF-8 inline cap prevents Antigravity's `output.txt` spill-to-disk extra turns).
+- **+75% effective throughput (`35.1 → 61.5 tok/s`)** and **>60s stall turns cut from `31.2% → 7.4%`** in a same-session before/after `v0.2.1` comparison (99 vs. 374 turns) once multimodal screenshots were isolated out of `>180k`-token main sessions (`0` screenshots loaded in main coding sessions post-upgrade).
+- **0 lazy-load schema-read turns** (`rules/AGENTS.md` inlines compact tool schemas directly).
+
+<details>
+<summary>Methodology &amp; overhead transparency</summary>
+
+- **Logical actions**: A single `batch_search` with 5 queries counts as 5 actions, an `apply_edits` touching 6 hunks + `verify` counts as 7 actions, and a built-in `read_file`/`edit_file`/`run_command` counts as 1 action—ensuring an apples-to-apples comparison per unit of work rather than raw tool call counts.
+- **Quota sensitivity check**: Standard weighting (`1.0×` uncached input, `0.1×` cache read, `5.0×` output) yields **-31.5%** on main sessions (`-36.5%` on `>=150k` sessions). Results remain consistent under conservative cache discounts (`1 : 0.25 : 4` → **-25.8%**) and high-output weighting (`1 : 0.1 : 8` → **-29.4%**).
+- **Fixed prompt overhead**: `rules/AGENTS.md` + `SessionStart` snapshot add **~1.7k tokens** once per session (cached from turn 2 onward, ~170 eq tokens/turn). Saving a single redundant turn (~44k eq tokens) or blind full-file read pays back this overhead **>20×**.
+- **Reproduce locally**: Run `node dist/benchmark.mjs analyze --local --split-usage` on your own transcripts.
+
+</details>
+
+---
+
 ## Quick Installation
 
 Requires **Node.js >= 20**. **No `npm install` is needed** — pre-built zero-dependency bundles (`dist/*.mjs`) are included. Optional: install [`ripgrep` (`rg`)](https://github.com/BurntSushi/ripgrep) for faster code search (falls back to pure Node.js automatically if `rg` is absent).
