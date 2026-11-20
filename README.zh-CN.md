@@ -12,6 +12,9 @@
 
 </div>
 
+> [!NOTE]
+> **无侵入声明 —— 不会影响 Antigravity 本身的表现与原生行为：** `agy-fast` 仅作为标准本地 MCP 插件运行，绝不修改、屏蔽或干扰 Antigravity 的任何内置功能，包括 **Diff 差异对比窗口**、**文件修改列表**、检查点（Checkpoint）、原生工具与安全校验。
+
 ---
 
 ## 为什么开发 `agy-fast`
@@ -221,10 +224,27 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 ## 合规与安全说明
 
 - 仅使用 Antigravity 官方文档定义的插件扩展接口（`plugin.json`、`mcp_config.json`、`hooks.json`、`rules/AGENTS.md`）。
+- **完全无侵入**：不会影响 Antigravity 本身的任何表现与原生行为，**Diff 对比窗口**、**文件修改列表**、检查点与内置工具均保持原样正常工作。
 - **不绕过、不禁用、不修改**任何内置安全评估机制、客户端程序文件或认证流程。
 - **不注册** `PreToolUse`、`PostToolUse`、`PreInvocation` 等每步同步阻塞钩子。
 - `SessionStart` 采用失败放行策略：遇到异常输入或不可读目录时返回 `{}` 并正常退出，绝不阻断会话启动。
 - 打包产物不混淆，全部源码与产物均可直接审计。
+
+---
+
+## 常见问题（FAQ）
+
+**安装 `agy-fast` 会影响 Antigravity 的 Diff 窗口、文件修改列表或原生交互行为吗？**
+不会。`agy-fast` 完全通过官方本地 MCP 与 `SessionStart` 插件接口运行，不修改客户端程序，也不会干扰 Antigravity 原生的 Diff 窗口、文件修改列表、检查点、内置工具或安全校验。
+
+**除了提速，插件还能省 Token 额度和上传流量吗？**
+可以。在 10 天脱敏真实编码日志实测中，单次 MCP 调用平均打包约 4.9 个操作，使每 10 次操作的模型轮次降低 **33.7%**、综合折算 Token 额度降低 **31.5%**（`>=150k` 长上下文省 **36.5%**，子代理省 **54.0%**）、工具回传上传字节降低 **39.7%**，且 >60s 长卡顿轮次从 **31.2% 降至 7.4%**。
+
+**支持哪些 Antigravity 客户端与操作系统？**
+同时支持 **Antigravity CLI（`agy`）**、**Antigravity Desktop 2.0** 与 **Antigravity IDE**，兼容 **macOS、Linux 与 Windows**（仅需 Node.js >= 20，零运行期依赖；可选 `ripgrep`/`rg`，缺失时自动回退 Node.js）。
+
+**如何本地验证效果或彻底卸载？**
+运行 `node dist/benchmark.mjs analyze --local --split-usage` 即可纯离线分析本机日志（零数据上传）。随时可通过 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` 一键干净卸载。
 
 ---
 

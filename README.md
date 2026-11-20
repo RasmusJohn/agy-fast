@@ -12,6 +12,9 @@ English · [简体中文](README.zh-CN.md) · [Changelog](CHANGELOG.md) · [Late
 
 </div>
 
+> [!NOTE]
+> **Non-invasive — zero impact on Antigravity's native UI or behavior:** `agy-fast` runs strictly as a standard local MCP plugin and never alters, disables, or interferes with Antigravity's built-in features — including the **diff viewer/window**, **modified-files list**, checkpoints, native tools, or safety checks.
+
 ---
 
 ## Why `agy-fast` Exists
@@ -221,10 +224,27 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 ## Policy Compliance and Safety
 
 - Uses only documented Antigravity extension interfaces (`plugin.json`, `mcp_config.json`, `hooks.json`, `rules/AGENTS.md`).
+- **Non-invasive by design**: does **not** alter Antigravity's native behavior, UI, **diff viewer/window**, **modified-files list**, checkpoints, or built-in tools.
 - Does **not** bypass, disable, or tamper with Antigravity's safety checks, client binaries, or authentication.
 - Registers **zero** per-step hooks (`PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`).
 - Fails open on `SessionStart`: if a workspace is unreadable or stdin is malformed, the hook outputs `{}` and never blocks session startup.
 - Unminified ESM bundles so every line executed locally is straightforward to audit.
+
+---
+
+## FAQ
+
+**Does `agy-fast` affect Antigravity's native UI, diff window, or modified-files list?**
+No. `agy-fast` operates strictly through Antigravity's official local MCP and `SessionStart` plugin APIs. It does not patch the client or interfere with Antigravity's diff viewer, modified-files list, checkpoints, native tools, or safety checks.
+
+**Does `agy-fast` save token quota and upload traffic in addition to making tasks faster?**
+Yes. Across 10 days of sanitized real coding sessions, batching ~4.9 operations per MCP call reduced LLM turns by **33.7%**, estimated billable token quota by **31.5%** (**36.5%** in `>=150k`-token sessions; **54.0%** in subagents), tool-return upload bytes by **39.7%**, and >60s stall turns from **31.2% → 7.4%**.
+
+**Which Antigravity editions and operating systems are supported?**
+Antigravity CLI (`agy`), Antigravity Desktop 2.0, and Antigravity IDE on **macOS, Linux, and Windows** (requires Node.js >= 20, zero runtime dependencies; optional `ripgrep`/`rg` with automatic Node.js fallback).
+
+**How do I verify the speedup or uninstall cleanly?**
+Run `node dist/benchmark.mjs analyze --local --split-usage` to benchmark your own transcripts 100% offline. To remove `agy-fast` completely at any time, run `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall`.
 
 ---
 
