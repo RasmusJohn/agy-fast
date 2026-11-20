@@ -5,6 +5,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.3] - 2026-11-20
+
+### Added
+
+- **Godot GDScript (`.gd`) symbol outlining in `read_slices` (#2, thanks `@star-dino`)**
+  - Extracts `class_name`, nested inner `class` (with accurate `depth`), `func` / `static func`, single- and multiline `signal`, and named/anonymous single- and multiline `enum` blocks.
+  - Handles Godot 4 annotations (`@tool`, `@rpc(...)`, `@abstract`, etc.), multiline typed signatures, `#`/`##` comments, `"""`/`'''` triple-quoted strings, Tab/space indentation, and UTF-8 BOM / CRLF line endings.
+- **Extended `batch_search` modes, language filtering, multiline matching, fuzzy path lookup & mtime sorting (#3, thanks `@onezero-harmony`)**
+  - Added `outputMode` (`"content"` | `"files_with_matches"` | `"count"`) to return only matching file paths or per-file match counts within the 8.8 KB inline budget.
+  - Added `fileType` language/extension filtering (e.g., `typescript`, `ts`, `python`, `gdscript`) across `text`, `regex`, and `fuzzy` queries.
+  - Added `multiline: true` cross-line `text`/`regex` matching across both `rg` and Node.js fallback (with automatic retry without strict `u` mode for ripgrep-valid identity escapes like `\:` / `\#`).
+  - Added `type: "fuzzy"` case-insensitive multi-token path lookup (`src/utils/fuzzy-match.ts`) with Windows backslash normalization and contiguous-substring-first ranking.
+  - Added `sortBy: "mtime"` for `glob` queries to list recently modified files first.
+
+### Documentation
+
+- Added sanitized 10-day real-world latency, token-quota, and upload-bandwidth benchmarks, an explicit non-invasive UI/diff guarantee, and a concise FAQ to [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md).
+
+### 简体中文摘要（v0.2.3）
+
+- **`read_slices` 新增 Godot GDScript（`.gd`）大纲提取（#2，感谢 `@star-dino`）**：完整支持 `class_name`、嵌套内部 `class`、`func`/`static func`、单行/多行 `signal` 与具名/匿名 `enum`，兼容 Godot 4 行内注解、三引号字符串、Tab/空格缩进及 BOM/CRLF。
+- **`batch_search` 新增多模式检索、语言过滤、跨行匹配、模糊路径与按修改时间排序（#3，感谢 `@onezero-harmony`）**：支持 `outputMode`（`content`/`files_with_matches`/`count`）、`fileType`、`multiline: true`（`rg` 与 Node 双路径一致，且兼容 `\:`/`\#` 等转义）、`type: "fuzzy"`（兼容 Windows 反斜杠与连续子串优先排序）以及 `glob` 的 `sortBy: "mtime"` 最新优先排序。
+- **文档增强**：中英文 README 新增 10 天脱敏实测数据（耗时、额度、上传流量）、无侵入声明（不影响原生 Diff 窗口与文件修改列表）及常见问题 FAQ。
+
+---
+
 ## [0.2.2] - 2026-11-20
 
 ### Improved
