@@ -4,7 +4,7 @@ Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote
 
 | Task | Preferred Tool | Reason |
 | :--- | :--- | :--- |
-| Outline unknown large files (>300 lines; prefer 10-20 files/batch, max 40: TS/JS/Vue/Svelte/CSS/Py/Go/Rust/Java/MD/JSON/YAML) | `read_slices({ outlines: [...] })` | 1 call maps exact symbol/section line ranges without blind full-file dumps |
+| Outline unknown large files (>300 lines; prefer 10-20 files/batch, max 40: TS/JS/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML) | `read_slices({ outlines: [...] })` | 1 call maps exact symbol/section line ranges without blind full-file dumps |
 | Read small files (<300 lines) OR **any** known line ranges after outlining (even 4-8 scattered ranges) | Built-in `read_file` (parallel in one turn, with `StartLine`/`EndLine` <=200 lines) | Locally allowlisted (~7ms, **0 remote check**) + **46 KB/call** inline vs MCP's 8.8 KB total cap |
 | Run >=2 text/regex/glob/read-only `git` queries (even across multiple directories/repos) | `batch_search` (pack ALL queries into **one** call via per-query `path`) | 1 remote check + concurrent local execution (<70ms), hard-capped <=8.8 KB inline |
 | Edit >=2 blocks in one file, edit/create/overwrite >=2 files in one turn, OR any edit + verify | `apply_edits` (`bestEffort: true` for >=3 files; optional `verify`) | Replaces N serial checks + verify turn; `bestEffort` commits valid files & returns closest-line / drifted-line hints |

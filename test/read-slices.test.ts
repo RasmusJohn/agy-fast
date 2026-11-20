@@ -447,4 +447,118 @@ describe("read_slices", () => {
     assert.match(denseRes.text, /module_29\.ts/);
     assert.match(denseRes.text, /batch 10-20 files per call/);
   });
+
+  it("extracts Godot GDScript (.gd) outlines across comments, triple strings, nested inner classes, multiline enums, and Windows BOM/CRLF", async () => {
+    const gdLines = [
+      "\uFEFF@tool",
+      "class_name CharacterController extends CharacterBody2D",
+      "## Base controller for playable characters.",
+      "",
+      "signal health_changed(current: int, maximum: int)",
+      "signal combo_triggered(",
+      "\tcombo_name: StringName,",
+      "\thit_count: int,",
+      ")",
+      "",
+      "enum MoveState { IDLE, RUN, AIR }",
+      "",
+      "enum DamageType {",
+      "\tPHYSICAL = 0,",
+      "\tMAGICAL = 1, # ignores { fake } braces in comment",
+      "\tTRUE_DMG = 2,",
+      "}",
+      "",
+      "enum {",
+      "\tLAYER_WORLD = 1,",
+      "\tLAYER_ACTOR = 2,",
+      "}",
+      "",
+      'const SHADER_STUB := """',
+      "class FakeShaderClass:",
+      "\tfunc fake_func():",
+      "\t\tpass",
+      '"""',
+      "",
+      "const DOC_SINGLE := '''",
+      "signal fake_signal",
+      "enum FakeEnum { A, B }",
+      "'''",
+      "",
+      "# func commented_out_func():",
+      "# \tpass",
+      "",
+      "static func calc_mitigation(raw: float, armor: float) -> float:",
+      "\treturn raw * (100.0 / (100.0 + armor))",
+      "",
+      "## Applies damage to this character.",
+      '@rpc("any_peer", "call_local")',
+      "func apply_damage(",
+      "\tamount: int,",
+      "\tkind: DamageType = DamageType.PHYSICAL,",
+      ") -> void:",
+      '\tvar note := """',
+      "unindented multiline text inside function",
+      '"""',
+      "\tif amount > 0:",
+      "\t\thealth_changed.emit(0, 100)",
+      "",
+      "class StateMachine:",
+      "\tsignal state_entered(state_name: StringName)",
+      "",
+      "\tclass SubState:",
+      "\t\tfunc tick(delta: float) -> void:",
+      "\t\t\tpass",
+      "",
+      "\t## Transitions to target state.",
+      "\tfunc transition_to(target: StringName) -> void:",
+      "\t\tstate_entered.emit(target)",
+    ];
+
+    const gdContentCrlf = gdLines.join("\r\n");
+    const gdSyms = extractSymbols("player.gd", gdContentCrlf);
+    assert.deepEqual(
+      gdSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "class_name:CharacterController:2-2:d0",
+        "signal:health_changed:5-5:d0",
+        "signal:combo_triggered:6-9:d0",
+        "enum:MoveState:11-11:d0",
+        "enum:DamageType:13-17:d0",
+        "enum:<anonymous>:19-22:d0",
+        "function:calc_mitigation:38-39:d0",
+        "function:apply_damage:43-51:d0",
+        "class:StateMachine:53-62:d0",
+        "signal:state_entered:54-54:d1",
+        "class:SubState:56-58:d1",
+        "method:tick:57-58:d2",
+        "method:transition_to:61-62:d1",
+      ],
+    );
+
+    // Also verify BOM on line 1 inline `@tool class_name` + 4-space indentation + runReadSlices formatting
+    const spaceGdPath = path.join(tmpDir, "inventory.gd");
+    await fs.writeFile(
+      spaceGdPath,
+      [
+        "\uFEFF@tool class_name Inventory",
+        "class Slot:",
+        "    static func empty() -> Slot:",
+        "        return Slot.new()",
+        "",
+        '@rpc("authority") func sync_slots() -> void:',
+        "    pass",
+      ].join("\r\n"),
+      "utf8",
+    );
+
+    const sliceRes = await runReadSlices({
+      cwd: tmpDir,
+      outlines: ["inventory.gd"],
+    });
+    assert.equal(sliceRes.isError, false);
+    assert.match(sliceRes.text, /L1 \[class_name\] Inventory/);
+    assert.match(sliceRes.text, /L2-L4 \[class\] Slot/);
+    assert.match(sliceRes.text, /  L3-L4 \[method\] empty/);
+    assert.match(sliceRes.text, /L6-L7 \[function\] sync_slots/);
+  });
 });

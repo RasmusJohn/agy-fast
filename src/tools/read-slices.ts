@@ -643,6 +643,317 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   return symbols;
 }
 
+function stripLeadingGdAnnotations(text: string): string {
+  let rest = text;
+  while (rest.startsWith("@")) {
+    const m = /^@[A-Za-z_]\w*/.exec(rest);
+    if (!m) break;
+    let idx = m[0].length;
+    while (idx < rest.length && (rest[idx] === " " || rest[idx] === "\t")) idx++;
+    if (rest[idx] === "(") {
+      let depth = 0;
+      let quote: string | null = null;
+      while (idx < rest.length) {
+        const ch = rest[idx]!;
+        if (quote) {
+          if (ch === "\\") {
+            idx += 2;
+            continue;
+          }
+          if (ch === quote) quote = null;
+        } else {
+          if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === "(") depth++;
+          else if (ch === ")") {
+            depth--;
+            if (depth === 0) {
+              idx++;
+              break;
+            }
+          }
+        }
+        idx++;
+      }
+    }
+    while (idx < rest.length && (rest[idx] === " " || rest[idx] === "\t")) idx++;
+    rest = rest.slice(idx);
+  }
+  return rest;
+}
+
+function extractGdScriptSymbols(rawLines: string[]): SymbolEntry[] {
+  const lines = rawLines.map((l, idx) => {
+    const clean = l.endsWith("\r") ? l.slice(0, -1) : l;
+    return idx === 0 ? clean.replace(/^\uFEFF/, "") : clean;
+  });
+
+  interface GdLineInfo {
+    startsInTriple: boolean;
+    openBrace: number;
+    closeBrace: number;
+    openParen: number;
+    closeParen: number;
+    hasCode: boolean;
+  }
+
+  const info: GdLineInfo[] = new Array<GdLineInfo>(lines.length);
+  let activeTriple: '"""' | "'''" | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const startsInTriple = activeTriple !== null;
+    let openBrace = 0;
+    let closeBrace = 0;
+    let openParen = 0;
+    let closeParen = 0;
+    let hasCode = startsInTriple;
+
+    let j = 0;
+    while (j < line.length) {
+      if (activeTriple) {
+        if (line[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (line.startsWith(activeTriple, j)) {
+          activeTriple = null;
+          j += 3;
+          continue;
+        }
+        j++;
+      } else {
+        const ch = line[j]!;
+        if (ch === "#") break;
+        if (line.startsWith('"""', j) || line.startsWith("'''", j)) {
+          activeTriple = line.startsWith('"""', j) ? '"""' : "'''";
+          hasCode = true;
+          j += 3;
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          hasCode = true;
+          j++;
+          while (j < line.length && line[j] !== ch) {
+            if (line[j] === "\\") j += 2;
+            else j++;
+          }
+          if (j < line.length) j++;
+          continue;
+        }
+        if (ch !== " " && ch !== "\t") {
+          hasCode = true;
+          if (ch === "{") openBrace++;
+          else if (ch === "}") closeBrace++;
+          else if (ch === "(") openParen++;
+          else if (ch === ")") closeParen++;
+        }
+        j++;
+      }
+    }
+
+    info[i] = {
+      startsInTriple,
+      openBrace,
+      closeBrace,
+      openParen,
+      closeParen,
+      hasCode,
+    };
+  }
+
+  type GdRawKind = "class_name" | "class" | "func" | "signal" | "enum";
+  const raw: Array<{
+    indent: number;
+    rawKind: GdRawKind;
+    name: string;
+    startIdx: number;
+  }> = [];
+
+  const classNameRe = /^class_name\s+([A-Za-z_]\w*)\b/;
+  const classRe = /^class\s+([A-Za-z_]\w*)\b/;
+  const funcRe = /^(?:static\s+)?func\s+([A-Za-z_]\w*)\s*\(/;
+  const signalRe = /^signal\s+([A-Za-z_]\w*)\b/;
+  const enumRe = /^enum(?:\s+([A-Za-z_]\w*))?\s*(?:\{|$|#)/;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (info[i]!.startsInTriple) continue;
+    const line = lines[i]!;
+    const indentStr = /^[ \t]*/.exec(line)?.[0] ?? "";
+    const afterIndent = line.slice(indentStr.length);
+    if (!afterIndent || afterIndent.startsWith("#")) continue;
+
+    const rest = stripLeadingGdAnnotations(afterIndent);
+    if (!rest || rest.startsWith("#")) continue;
+
+    const indent = indentStr.replace(/\t/g, "    ").length;
+
+    let m = classNameRe.exec(rest);
+    if (m && m[1]) {
+      raw.push({ indent, rawKind: "class_name", name: m[1], startIdx: i });
+      continue;
+    }
+
+    m = classRe.exec(rest);
+    if (m && m[1]) {
+      raw.push({ indent, rawKind: "class", name: m[1], startIdx: i });
+      continue;
+    }
+
+    m = funcRe.exec(rest);
+    if (m && m[1]) {
+      raw.push({ indent, rawKind: "func", name: m[1], startIdx: i });
+      continue;
+    }
+
+    m = signalRe.exec(rest);
+    if (m && m[1]) {
+      raw.push({ indent, rawKind: "signal", name: m[1], startIdx: i });
+      continue;
+    }
+
+    m = enumRe.exec(rest);
+    if (m) {
+      // Anonymous `enum` without `{` on same line must open `{` on next code line
+      if (!m[1] && info[i]!.openBrace === 0) {
+        let nextCodeIdx = i + 1;
+        while (nextCodeIdx < lines.length && !info[nextCodeIdx]!.hasCode) {
+          nextCodeIdx++;
+        }
+        if (nextCodeIdx >= lines.length || info[nextCodeIdx]!.openBrace === 0) {
+          continue;
+        }
+      }
+      raw.push({
+        indent,
+        rawKind: "enum",
+        name: m[1] ?? "<anonymous>",
+        startIdx: i,
+      });
+    }
+  }
+
+  const symbols: SymbolEntry[] = [];
+  const classStack: Array<{ indent: number; endLine: number }> = [];
+
+  for (const item of raw) {
+    let endIdx = item.startIdx;
+
+    if (item.rawKind === "class_name") {
+      endIdx = item.startIdx;
+    } else if (item.rawKind === "signal") {
+      let parenDepth = info[item.startIdx]!.openParen - info[item.startIdx]!.closeParen;
+      const maxSigScan = Math.min(lines.length - 1, item.startIdx + 40);
+      while (parenDepth > 0 && endIdx < maxSigScan) {
+        endIdx++;
+        parenDepth += info[endIdx]!.openParen - info[endIdx]!.closeParen;
+      }
+      if (parenDepth > 0) endIdx = item.startIdx;
+    } else if (item.rawKind === "enum") {
+      let braceDepth = 0;
+      let seenOpen = false;
+      const maxEnumScan = Math.min(lines.length - 1, item.startIdx + 500);
+      for (let k = item.startIdx; k <= maxEnumScan; k++) {
+        const li = info[k]!;
+        if (li.openBrace > 0) seenOpen = true;
+        braceDepth += li.openBrace - li.closeBrace;
+        if (seenOpen && braceDepth <= 0) {
+          endIdx = k;
+          break;
+        }
+        if (!seenOpen && k > item.startIdx && li.hasCode && li.openBrace === 0) {
+          break;
+        }
+      }
+      if (seenOpen && braceDepth > 0) {
+        endIdx = maxEnumScan;
+      }
+    } else {
+      // `class` or `func` / `static func`: advance past multiline signature parens first
+      let headerEndIdx = item.startIdx;
+      let parenDepth = info[item.startIdx]!.openParen - info[item.startIdx]!.closeParen;
+      const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
+      while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
+        headerEndIdx++;
+        parenDepth += info[headerEndIdx]!.openParen - info[headerEndIdx]!.closeParen;
+      }
+      if (parenDepth > 0) headerEndIdx = item.startIdx;
+
+      endIdx = lines.length - 1;
+      for (let j = headerEndIdx + 1; j < lines.length; j++) {
+        if (info[j]!.startsInTriple) continue;
+        const l = lines[j]!;
+        const trimmed = l.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
+        if (curIndent <= item.indent) {
+          endIdx = j - 1;
+          break;
+        }
+      }
+
+      while (endIdx > headerEndIdx) {
+        if (info[endIdx]!.startsInTriple) break;
+        const endLineStr = lines[endIdx]!;
+        const endTrimmed = endLineStr.trim();
+        if (!endTrimmed) {
+          endIdx--;
+          continue;
+        }
+        if (endTrimmed.startsWith("#")) {
+          const commentIndent = (/^[ \t]*/.exec(endLineStr)?.[0] ?? "").replace(
+            /\t/g,
+            "    ",
+          ).length;
+          if (commentIndent <= item.indent) {
+            endIdx--;
+            continue;
+          }
+        }
+        break;
+      }
+    }
+
+    const startLine = item.startIdx + 1;
+    const endLine = Math.max(startLine, endIdx + 1);
+
+    while (
+      classStack.length > 0 &&
+      (classStack[classStack.length - 1]!.endLine < startLine ||
+        classStack[classStack.length - 1]!.indent >= item.indent)
+    ) {
+      classStack.pop();
+    }
+
+    const depth =
+      classStack.length > 0
+        ? classStack.length
+        : item.indent > 0
+          ? Math.max(1, Math.floor(item.indent / 4))
+          : 0;
+
+    const kind =
+      item.rawKind === "func"
+        ? item.indent > 0
+          ? "method"
+          : "function"
+        : item.rawKind;
+
+    symbols.push({
+      kind,
+      name: item.name,
+      startLine,
+      endLine,
+      depth,
+    });
+
+    if (item.rawKind === "class") {
+      classStack.push({ indent: item.indent, endLine });
+    }
+  }
+
+  return symbols;
+}
+
 function extractGoSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
@@ -1158,6 +1469,8 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
       return extractCssSymbols(lines);
     case ".py":
       return extractPythonSymbols(lines);
+    case ".gd":
+      return extractGdScriptSymbols(lines);
     case ".go":
       return extractGoSymbols(lines);
     case ".rs":
