@@ -397,6 +397,7 @@ describe("read_slices", () => {
     // Depth-0 tailHelper must survive even though HugeStore has 60 methods
     assert.match(outlineRes.text, /tailHelper/);
     assert.match(outlineRes.text, /fn23/);
+    assert.match(outlineRes.text, /\(\+52 more symbols\)/);
 
     const tooMany = await runReadSlices({
       cwd: tmpDir,
@@ -423,5 +424,27 @@ describe("read_slices", () => {
       `Expected <= 8800B, got ${Buffer.byteLength(capped.text, "utf8")}`,
     );
     assert.match(capped.text, /use parallel read_file/);
+
+    // Outlining >20 dense files stays <= 8800 bytes and surfaces batch-size tip when over budget
+    const denseDir = path.join(tmpDir, "dense-outlines");
+    await fs.mkdir(denseDir, { recursive: true });
+    const densePaths: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      const rel = `dense-outlines/module_${String(i).padStart(2, "0")}.ts`;
+      densePaths.push(rel);
+      const body = Array.from(
+        { length: 25 },
+        (_, k) => `export function handler_${i}_${k}_veryLongSymbolNameForBudgetTest() { return ${k}; }`,
+      ).join("\n");
+      await fs.writeFile(path.join(tmpDir, rel), body, "utf8");
+    }
+    const denseRes = await runReadSlices({ cwd: tmpDir, outlines: densePaths });
+    assert.equal(denseRes.isError, false);
+    assert.ok(
+      Buffer.byteLength(denseRes.text, "utf8") <= 8_800,
+      `Expected <= 8800B, got ${Buffer.byteLength(denseRes.text, "utf8")}`,
+    );
+    assert.match(denseRes.text, /module_29\.ts/);
+    assert.match(denseRes.text, /batch 10-20 files per call/);
   });
 });

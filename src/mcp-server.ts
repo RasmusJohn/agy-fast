@@ -39,7 +39,7 @@ export function createAgyFastServer(): McpStdioServer {
                 pattern: {
                   type: "string",
                   description:
-                    "Literal text, regex, glob pattern, or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline').",
+                    "Literal text, regex, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline').",
                 },
                 path: {
                   type: "string",
@@ -177,7 +177,7 @@ export function createAgyFastServer(): McpStdioServer {
     {
       name: "read_slices",
       description:
-        "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across up to 40 files in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
+        "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
       inputSchema: {
         type: "object",
         properties: {
@@ -186,7 +186,7 @@ export function createAgyFastServer(): McpStdioServer {
             type: "array",
             maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (max 40).",
+            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40).",
           },
           slices: {
             type: "array",

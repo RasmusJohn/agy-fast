@@ -1921,30 +1921,43 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   }
   return { files, totalMatches, truncated };
 }
-async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
-  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
-  const pattern = query.pattern.trim() || "**/*";
-  const matcher = globToRegExp(pattern);
-  const matchBasename = !pattern.includes("/");
-  if (isFileTarget) {
-    const rel = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
-    const base = path3.basename(searchRoot);
-    const matched = matcher.test(rel) || matchBasename && matcher.test(base);
-    return matched ? rel : "(no files matched)";
-  }
-  const scanLimit = Math.max(maxResults + 1, 2e3);
-  const walked = await walkFiles(searchRoot, {
-    maxFiles: scanLimit,
-    includeHidden: pattern.startsWith(".") || pattern.includes("/."),
-    fileFilter: (relPosix) => {
-      if (matcher.test(relPosix)) return true;
-      if (matchBasename) {
-        const base = relPosix.split("/").pop() ?? relPosix;
-        return matcher.test(base);
-      }
-      return false;
+function buildGlobFallbackPlan(pattern) {
+  if (!pattern.includes("{") && pattern.includes("|")) {
+    const terms = pattern.split("|").map((part) => part.trim()).filter(Boolean);
+    if (terms.length >= 2) {
+      const termMatchers = terms.map((term) => {
+        const hasGlobMeta = /[*?[\]{}]/.test(term);
+        if (hasGlobMeta) {
+          try {
+            const re = globToRegExp(term);
+            const matchBase = !term.includes("/");
+            return (relPosix, base) => re.test(relPosix) || matchBase && re.test(base);
+          } catch {
+          }
+        }
+        const needle = term.toLowerCase();
+        return (relPosix) => relPosix.toLowerCase().includes(needle);
+      });
+      const allBare = terms.every((t) => !/[*?[\]{}/]/.test(t));
+      const label = allBare ? `**/*{${terms.join(",")}}*` : `{${terms.join(",")}}`;
+      return {
+        match: (relPosix, base) => termMatchers.some((fn) => fn(relPosix, base)),
+        matchedNote: `[note: exact glob matched 0 files; auto-expanded regex '|' to "${label}" (glob uses * and {a,b}, not |)]`,
+        emptyMessage: "(no files matched; hint: glob uses * and {a,b}, not regex |)"
+      };
     }
-  });
+  }
+  if (/^[A-Za-z0-9_-]+$/.test(pattern)) {
+    const needle = pattern.toLowerCase();
+    return {
+      match: (relPosix) => relPosix.toLowerCase().includes(needle),
+      matchedNote: `[note: exact glob "${pattern}" matched 0 files; showing case-insensitive path matches for "*${pattern}*"]`,
+      emptyMessage: "(no files matched)"
+    };
+  }
+  return null;
+}
+function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, notePrefix) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
   const items = sortedFiles.slice(0, maxResults).map((f) => {
@@ -1952,11 +1965,10 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
     return `${relPrefix}/${f}`;
   });
   const truncated = walked.truncated || sortedFiles.length > maxResults;
-  if (items.length === 0) {
-    return "(no files matched)";
-  }
+  const header = notePrefix ? `${notePrefix}
+` : "";
   if (!truncated) {
-    return items.join("\n");
+    return `${header}${items.join("\n")}`;
   }
   const omitted = sortedFiles.slice(maxResults);
   const dirCounts = /* @__PURE__ */ new Map();
@@ -1970,7 +1982,64 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `
 ... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
-  return `${items.join("\n")}${suffix}`;
+  return `${header}${items.join("\n")}${suffix}`;
+}
+async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
+  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
+  const pattern = query.pattern.trim() || "**/*";
+  const matcher = globToRegExp(pattern);
+  const matchBasename = !pattern.includes("/");
+  const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+  if (isFileTarget) {
+    const rel = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
+    const base = path3.basename(searchRoot);
+    const matched = matcher.test(rel) || matchBasename && matcher.test(base);
+    if (matched) return rel;
+    const fallback2 = buildGlobFallbackPlan(pattern);
+    if (fallback2) {
+      return fallback2.match(rel, base) ? `${fallback2.matchedNote}
+${rel}` : fallback2.emptyMessage;
+    }
+    return "(no files matched)";
+  }
+  const scanLimit = Math.max(maxResults + 1, 2e3);
+  const walked = await walkFiles(searchRoot, {
+    maxFiles: scanLimit,
+    includeHidden,
+    fileFilter: (relPosix) => {
+      if (matcher.test(relPosix)) return true;
+      if (matchBasename) {
+        const base = relPosix.split("/").pop() ?? relPosix;
+        return matcher.test(base);
+      }
+      return false;
+    }
+  });
+  if (walked.files.length > 0) {
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+  }
+  const fallback = buildGlobFallbackPlan(pattern);
+  if (fallback) {
+    const fallbackWalked = await walkFiles(searchRoot, {
+      maxFiles: scanLimit,
+      includeHidden,
+      fileFilter: (relPosix) => {
+        const base = relPosix.split("/").pop() ?? relPosix;
+        return fallback.match(relPosix, base);
+      }
+    });
+    if (fallbackWalked.files.length > 0) {
+      return formatGlobWalkResult(
+        fallbackWalked,
+        searchRoot,
+        baseCwd,
+        maxResults,
+        fallback.matchedNote
+      );
+    }
+    return fallback.emptyMessage;
+  }
+  return "(no files matched)";
 }
 async function runGitQuery(query, searchRoot) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
@@ -3117,6 +3186,7 @@ function extractSymbolsFromLines(filePath, lines) {
 var MAX_OUTLINES = 40;
 var MAX_SLICE_FILES = 30;
 var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
+var OUTLINE_BATCH_TIP = "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
 function selectOutlineSymbols(symbols, limit) {
   if (symbols.length <= limit) return symbols;
   const keptIndices = /* @__PURE__ */ new Set();
@@ -3149,7 +3219,7 @@ async function runReadSlices(input) {
     Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(input.maxChars ?? 8500))
   );
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : 20;
+  const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : outlines.length <= 20 ? 16 : 10;
   const fileCache = /* @__PURE__ */ new Map();
   async function loadLines(absPath) {
     const cached = fileCache.get(absPath);
@@ -3179,7 +3249,8 @@ async function runReadSlices(input) {
             const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
             return `${indent}${span} [${s.kind}] ${s.name}`;
           });
-          const extra = symbols.length > picked.length ? `
+          const extra = symbols.length > picked.length ? outlines.length > 10 ? `
+... (+${symbols.length - picked.length} more symbols)` : `
 ... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)` : "";
           return `## Outline: ${relPath} (${lines.length} lines)
 ${formatted.join("\n")}${extra}`;
@@ -3252,17 +3323,18 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
   }
   const rawJoined = sections.join("\n\n");
   const rawBytes = Buffer.byteLength(rawJoined, "utf8");
-  const needsSliceTip = slices.length > 0 && (rawJoined.length > maxChars || rawBytes > maxBytes);
-  if (needsSliceTip && maxChars > SLICE_TRUNCATION_TIP.length + 200) {
-    const tipBytes = Buffer.byteLength(SLICE_TRUNCATION_TIP, "utf8");
+  const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
+  const activeTip = isOverBudget && slices.length > 0 ? SLICE_TRUNCATION_TIP : isOverBudget && outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
+  if (activeTip && maxChars > activeTip.length + 200) {
+    const tipBytes = Buffer.byteLength(activeTip, "utf8");
     const body = fitSectionsToByteBudget(
       sections,
-      maxChars - SLICE_TRUNCATION_TIP.length,
+      maxChars - activeTip.length,
       maxBytes - tipBytes,
       "\n\n"
     );
     return {
-      text: `${body}${SLICE_TRUNCATION_TIP}`,
+      text: `${body}${activeTip}`,
       isError: false
     };
   }
@@ -3461,7 +3533,7 @@ function createAgyFastServer() {
                 },
                 pattern: {
                   type: "string",
-                  description: "Literal text, regex, glob pattern, or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
+                  description: "Literal text, regex, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
                 },
                 path: {
                   type: "string",
@@ -3593,7 +3665,7 @@ function createAgyFastServer() {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across up to 40 files in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
+      description: "Batch-extract symbol/section outlines (TS/JS/Vue/Svelte/CSS/Python/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
       inputSchema: {
         type: "object",
         properties: {
@@ -3602,7 +3674,7 @@ function createAgyFastServer() {
             type: "array",
             maxItems: 40,
             items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (max 40)."
+            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40)."
           },
           slices: {
             type: "array",

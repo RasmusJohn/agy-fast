@@ -632,38 +632,65 @@ async function runTextOrRegexWithNode(
   return { files, totalMatches, truncated };
 }
 
-async function runGlobQuery(
-  query: SearchQuery,
-  searchRoot: string,
-  baseCwd: string,
-  isFileTarget: boolean,
-): Promise<string> {
-  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
-  const pattern = query.pattern.trim() || "**/*";
-  const matcher = globToRegExp(pattern);
-  const matchBasename = !pattern.includes("/");
+interface GlobFallbackPlan {
+  match: (relPosix: string, base: string) => boolean;
+  matchedNote: string;
+  emptyMessage: string;
+}
 
-  if (isFileTarget) {
-    const rel = toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
-    const base = path.basename(searchRoot);
-    const matched = matcher.test(rel) || (matchBasename && matcher.test(base));
-    return matched ? rel : "(no files matched)";
+function buildGlobFallbackPlan(pattern: string): GlobFallbackPlan | null {
+  // Case 1: Regex alternation (`a|b|c`) accidentally passed to a glob query
+  if (!pattern.includes("{") && pattern.includes("|")) {
+    const terms = pattern
+      .split("|")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (terms.length >= 2) {
+      const termMatchers = terms.map((term) => {
+        const hasGlobMeta = /[*?[\]{}]/.test(term);
+        if (hasGlobMeta) {
+          try {
+            const re = globToRegExp(term);
+            const matchBase = !term.includes("/");
+            return (relPosix: string, base: string) =>
+              re.test(relPosix) || (matchBase && re.test(base));
+          } catch {
+            // Fall through to case-insensitive substring matching
+          }
+        }
+        const needle = term.toLowerCase();
+        return (relPosix: string) => relPosix.toLowerCase().includes(needle);
+      });
+      const allBare = terms.every((t) => !/[*?[\]{}/]/.test(t));
+      const label = allBare ? `**/*{${terms.join(",")}}*` : `{${terms.join(",")}}`;
+      return {
+        match: (relPosix, base) => termMatchers.some((fn) => fn(relPosix, base)),
+        matchedNote: `[note: exact glob matched 0 files; auto-expanded regex '|' to "${label}" (glob uses * and {a,b}, not |)]`,
+        emptyMessage: "(no files matched; hint: glob uses * and {a,b}, not regex |)",
+      };
+    }
   }
 
-  const scanLimit = Math.max(maxResults + 1, 2000);
-  const walked = await walkFiles(searchRoot, {
-    maxFiles: scanLimit,
-    includeHidden: pattern.startsWith(".") || pattern.includes("/."),
-    fileFilter: (relPosix) => {
-      if (matcher.test(relPosix)) return true;
-      if (matchBasename) {
-        const base = relPosix.split("/").pop() ?? relPosix;
-        return matcher.test(base);
-      }
-      return false;
-    },
-  });
+  // Case 2: Bare keyword without glob wildcards, slashes, or extension dot (e.g. "proxy")
+  if (/^[A-Za-z0-9_-]+$/.test(pattern)) {
+    const needle = pattern.toLowerCase();
+    return {
+      match: (relPosix) => relPosix.toLowerCase().includes(needle),
+      matchedNote: `[note: exact glob "${pattern}" matched 0 files; showing case-insensitive path matches for "*${pattern}*"]`,
+      emptyMessage: "(no files matched)",
+    };
+  }
 
+  return null;
+}
+
+function formatGlobWalkResult(
+  walked: { files: string[]; truncated: boolean },
+  searchRoot: string,
+  baseCwd: string,
+  maxResults: number,
+  notePrefix?: string,
+): string {
   const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
   const items = sortedFiles.slice(0, maxResults).map((f) => {
@@ -671,13 +698,10 @@ async function runGlobQuery(
     return `${relPrefix}/${f}`;
   });
   const truncated = walked.truncated || sortedFiles.length > maxResults;
-
-  if (items.length === 0) {
-    return "(no files matched)";
-  }
+  const header = notePrefix ? `${notePrefix}\n` : "";
 
   if (!truncated) {
-    return items.join("\n");
+    return `${header}${items.join("\n")}`;
   }
 
   // Summarize omitted matches by top-level directory so callers can scope follow-ups
@@ -698,7 +722,76 @@ async function runGlobQuery(
   const dirSummary =
     topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `\n... [truncated at ${maxResults} of ${totalLabel} files${dirSummary}]`;
-  return `${items.join("\n")}${suffix}`;
+  return `${header}${items.join("\n")}${suffix}`;
+}
+
+async function runGlobQuery(
+  query: SearchQuery,
+  searchRoot: string,
+  baseCwd: string,
+  isFileTarget: boolean,
+): Promise<string> {
+  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
+  const pattern = query.pattern.trim() || "**/*";
+  const matcher = globToRegExp(pattern);
+  const matchBasename = !pattern.includes("/");
+  const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+
+  if (isFileTarget) {
+    const rel = toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
+    const base = path.basename(searchRoot);
+    const matched = matcher.test(rel) || (matchBasename && matcher.test(base));
+    if (matched) return rel;
+    const fallback = buildGlobFallbackPlan(pattern);
+    if (fallback) {
+      return fallback.match(rel, base)
+        ? `${fallback.matchedNote}\n${rel}`
+        : fallback.emptyMessage;
+    }
+    return "(no files matched)";
+  }
+
+  const scanLimit = Math.max(maxResults + 1, 2000);
+  const walked = await walkFiles(searchRoot, {
+    maxFiles: scanLimit,
+    includeHidden,
+    fileFilter: (relPosix) => {
+      if (matcher.test(relPosix)) return true;
+      if (matchBasename) {
+        const base = relPosix.split("/").pop() ?? relPosix;
+        return matcher.test(base);
+      }
+      return false;
+    },
+  });
+
+  if (walked.files.length > 0) {
+    return formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults);
+  }
+
+  const fallback = buildGlobFallbackPlan(pattern);
+  if (fallback) {
+    const fallbackWalked = await walkFiles(searchRoot, {
+      maxFiles: scanLimit,
+      includeHidden,
+      fileFilter: (relPosix) => {
+        const base = relPosix.split("/").pop() ?? relPosix;
+        return fallback.match(relPosix, base);
+      },
+    });
+    if (fallbackWalked.files.length > 0) {
+      return formatGlobWalkResult(
+        fallbackWalked,
+        searchRoot,
+        baseCwd,
+        maxResults,
+        fallback.matchedNote,
+      );
+    }
+    return fallback.emptyMessage;
+  }
+
+  return "(no files matched)";
 }
 
 async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<string> {

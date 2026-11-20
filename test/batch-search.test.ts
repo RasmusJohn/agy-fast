@@ -363,4 +363,42 @@ describe("batch_search", () => {
     assert.match(globTrunc.text, /omitted dirs:/);
     assert.match(globTrunc.text, /views\/ \(6\)/);
   });
+
+  it("auto-recovers regex alternation and bare keywords passed to glob queries", async () => {
+    const globDir = path.join(tmpDir, "glob-fallback");
+    await fs.mkdir(path.join(globDir, "proxy"), { recursive: true });
+    await fs.mkdir(path.join(globDir, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(globDir, "proxy", "network.ts"), "export {};", "utf8");
+    await fs.writeFile(path.join(globDir, "scripts", "live-smoke.ts"), "export {};", "utf8");
+    await fs.writeFile(path.join(globDir, "scripts", "mission-check.mjs"), "export {};", "utf8");
+
+    const res = await runBatchSearch({
+      cwd: globDir,
+      queries: [
+        { type: "glob", pattern: "proxy" },
+        { type: "glob", pattern: "smoke|mission|lock", path: "scripts" },
+        { type: "glob", pattern: "foo|bar", path: "scripts" },
+        { type: "glob", pattern: "missing.ts" },
+      ],
+    });
+    assert.equal(res.isError, false);
+    assert.match(res.text, /auto-expanded regex '\|'/);
+    assert.match(res.text, /showing case-insensitive path matches for "\*proxy\*"/);
+    assert.match(res.text, /proxy\/network\.ts/);
+    assert.match(res.text, /scripts\/live-smoke\.ts/);
+    assert.match(res.text, /scripts\/mission-check\.mjs/);
+    assert.match(res.text, /hint: glob uses \* and \{a,b\}, not regex \|/);
+    // Missing exact filename with extension stays clean "(no files matched)"
+    assert.match(res.text, /## Query 4 \[glob\] missing\.ts\n\(no files matched\)/);
+
+    // If an exact bare file exists, exact match wins without triggering fallback note
+    await fs.writeFile(path.join(globDir, "proxy", "exactfile"), "x", "utf8");
+    const exactRes = await runBatchSearch({
+      cwd: globDir,
+      queries: [{ type: "glob", pattern: "exactfile" }],
+    });
+    assert.equal(exactRes.isError, false);
+    assert.match(exactRes.text, /proxy\/exactfile/);
+    assert.doesNotMatch(exactRes.text, /auto-expanded|showing case-insensitive/);
+  });
 });

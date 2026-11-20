@@ -1199,6 +1199,8 @@ const MAX_OUTLINES = 40;
 const MAX_SLICE_FILES = 30;
 const SLICE_TRUNCATION_TIP =
   "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
+const OUTLINE_BATCH_TIP =
+  "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
 
 function selectOutlineSymbols(symbols: SymbolEntry[], limit: number): SymbolEntry[] {
   if (symbols.length <= limit) return symbols;
@@ -1248,7 +1250,9 @@ export async function runReadSlices(
         ? 60
         : outlines.length <= 10
           ? 30
-          : 20;
+          : outlines.length <= 20
+            ? 16
+            : 10;
 
   const fileCache = new Map<string, { lines: string[]; size: number }>();
   async function loadLines(absPath: string): Promise<{ lines: string[]; size: number }> {
@@ -1287,7 +1291,9 @@ export async function runReadSlices(
           });
           const extra =
             symbols.length > picked.length
-              ? `\n... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)`
+              ? outlines.length > 10
+                ? `\n... (+${symbols.length - picked.length} more symbols)`
+                : `\n... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)`
               : "";
           return `## Outline: ${relPath} (${lines.length} lines)\n${formatted.join("\n")}${extra}`;
         } catch (err) {
@@ -1364,19 +1370,24 @@ export async function runReadSlices(
 
   const rawJoined = sections.join("\n\n");
   const rawBytes = Buffer.byteLength(rawJoined, "utf8");
-  const needsSliceTip =
-    slices.length > 0 && (rawJoined.length > maxChars || rawBytes > maxBytes);
+  const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
+  const activeTip =
+    isOverBudget && slices.length > 0
+      ? SLICE_TRUNCATION_TIP
+      : isOverBudget && outlines.length > 20
+        ? OUTLINE_BATCH_TIP
+        : null;
 
-  if (needsSliceTip && maxChars > SLICE_TRUNCATION_TIP.length + 200) {
-    const tipBytes = Buffer.byteLength(SLICE_TRUNCATION_TIP, "utf8");
+  if (activeTip && maxChars > activeTip.length + 200) {
+    const tipBytes = Buffer.byteLength(activeTip, "utf8");
     const body = fitSectionsToByteBudget(
       sections,
-      maxChars - SLICE_TRUNCATION_TIP.length,
+      maxChars - activeTip.length,
       maxBytes - tipBytes,
       "\n\n",
     );
     return {
-      text: `${body}${SLICE_TRUNCATION_TIP}`,
+      text: `${body}${activeTip}`,
       isError: false,
     };
   }
