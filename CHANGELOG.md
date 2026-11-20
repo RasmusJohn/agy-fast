@@ -5,6 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.2] - 2026-11-20
+
+### Improved
+
+- **Smart fallback & hints for `batch_search` `glob` queries (`src/tools/batch-search.ts`)**
+  - Preserves exact glob matching first; only when exact matching returns 0 files, automatically recovers two common LLM mistakes observed in live transcripts:
+    - Regex alternation passed to `glob` (e.g., `test|smoke|live`) is auto-expanded with a concise inline note (or returns a syntax hint when still empty).
+    - Bare keywords without wildcards, slashes, or extension dots (e.g., `proxy`) fall back to case-insensitive path substring matching (`*proxy*`) while keeping missing explicit filenames (e.g., `missing.ts`) cleanly as `(no files matched)`.
+- **Higher-density large outline batches (`src/tools/read-slices.ts`)**
+  - Tuned `perFileSymbolLimit` for larger batches (`11–20` files: `16` symbols; `>20` files: `10` depth-0-prioritized symbols) and shortened per-file omission footers (`... (+N more symbols)`) so 30–40 file calls spend less of the 8.8 KB cap on truncation boilerplate.
+  - Appends a 1-line batching tip when outlining `>20` files exceeds the 8.8 KB inline budget, steering callers toward 10–20 files per batch.
+- **Swarm worker & schema guidance (`rules/AGENTS.md`, `src/mcp-server.ts`)**
+  - Added concise guidance in Rule 6 to remind swarm workers in their brief to batch searches/edits via `agy-fast_fast` (if available) or parallel ranged `read_file` instead of serial `ls`/`grep` shell calls, since swarm workers do not receive the `SessionStart` snapshot.
+  - Clarified `batch_search` glob syntax (`*`/`{a,b}`, not regex `|`) and recommended `read_slices` outline batch sizes (`10–20` files, max 40) in both `AGENTS.md` and MCP tool schemas.
+
+### 简体中文摘要（v0.2.2）
+
+- **`batch_search` 的 `glob` 智能容错与提示**：精确匹配优先不变；仅在精确命中为 0 时，自动恢复实测对话中常见的两类误传——正则交替符 `|`（如 `test|smoke|live`）与无通配符/扩展名的裸关键词（如 `proxy`），并在输出头部附带简短语法提示，同时保持明确缺失文件名（如 `missing.ts`）的原样空结果。
+- **`read_slices` 大批量大纲预算优化**：收紧 `11–20` 文件（16 符号）与 `>20` 文件（10 顶层优先符号）的单文件上限并精简省略提示，减少 8.8 KB 上限内被截断尾注吃掉的字节；一次请求 `>20` 文件超预算时尾部提示改用 10–20 文件分批。
+- **Swarm Worker 路由与 Schema 补充**：在 `rules/AGENTS.md` 补充协调者拉起 swarm worker 时在 `brief` 中提示使用 `agy-fast_fast` 或并行带行号 `read_file`（避免因缺少 `SessionStart` 快照而退化为串行 `ls`/`grep`），并在规则与 MCP Schema 同步注明 `glob` 语法及大纲推荐批量。
+
+---
+
 ## [0.2.1] - 2026-11-19
 
 ### Added
