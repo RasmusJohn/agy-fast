@@ -5,6 +5,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.5] - 2026-11-21
+
+### Security & Fixed
+
+- **Read-only `git branch` / `git tag` optional-value flag sandbox bypass (#5, thanks `@ErrantSnow`)**
+  - Separated optional-value flags (`--merged`, `--no-merged`, `--abbrev`, `--color`, `--column`) from value-consuming flags in `src/tools/batch-search.ts` so they accept `=`-attached values without setting `expectValue = true` to skip allowlist validation on the following space-separated token (blocking bypasses like `branch --color -D --column target`, `branch --color -m main hacked`, `branch --abbrev new-branch`, and `tag --color -d --column v0.2.2`).
+  - Removed `--abbrev`, `--color`, and `--column` from `GIT_BRANCH_VALUE_FLAGS` in `src/benchmark-core.ts`.
+- **Installer source-repo protection & `--target` ownership verification (#5, thanks `@ErrantSnow`)**
+  - Resolves `fs.realpath` with case folding on `win32`/`darwin` in `scripts/install.mjs` to prevent same-repo deletion across symlinked paths or case variants.
+  - Blocks deleting `REPO_ROOT` or any strict ancestor directory of `REPO_ROOT`.
+  - Requires non-empty, non-symlink target directories to contain `plugin.json` with `"name": "agy-fast"` before deletion, and unlinks symlinks/junctions (including broken links) directly without touching link targets.
+- **`apply_edits` Phase-2 fallback truncation & `create` rollback safety (#5, thanks `@ErrantSnow`)**
+  - Isolates temp-file `writeFile`/`chmod` failures in `src/tools/apply-edits.ts` (cleans up the temp file and rethrows without falling back to `O_TRUNC` direct writes on the target).
+  - Records the file in `written` before the rename-fallback direct write so mid-write failures roll back original content/permissions or remove a newly created file.
+  - Treats only `ENOENT` as missing in Phase-1 `create`, failing fast on `EACCES`/`EBUSY`/`ENOTDIR` instead of misclassifying an existing file as non-existent.
+
+### 简体中文摘要（v0.2.5）
+
+- **封堵只读 `git branch`/`tag` 沙箱绕过（#5，感谢 `@ErrantSnow`）**：将 `--merged`/`--no-merged`/`--abbrev`/`--color`/`--column` 拆入可选值白名单，不再误消费下一个空格参数，彻底拦截 `branch --color -D ...`、`branch --color -m ...`、`tag --color -d ...` 等绕过，并同步修正 `benchmark-core.ts`。
+- **安装器防误删源仓库与 `--target` 归属校验（#5）**：改用 `fs.realpath` 与 `win32`/`darwin` 大小写归一化对比；拦截对源仓库及任意祖先目录的删除；非空非软链目录删除前强制校验 `plugin.json` 归属为 `agy-fast`；软链/Windows junction/死链直接 `fs.unlink` 不触碰目标。
+- **修复 `apply_edits` 写盘截断与 `create` 回滚误删（#5）**：隔离临时文件写/`chmod` 失败与 `rename` 回退路径，避免 `ENOSPC`/`EIO` 误触发直写截断原文件；回退直写前先加入回滚队列；Phase-1 `create` 仅将 `ENOENT` 视作文件不存在，遇 `EACCES`/`EBUSY` 快速失败，防止回滚误删已有文件。
+
+---
+
 ## [0.2.4] - 2026-11-21
 
 ### Fixed
