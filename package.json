@@ -21,7 +21,7 @@
     "mcp_config.json",
     "hooks.json",
     "rules/AGENTS.md",
-    "assets/logo.svg",
+    "assets/*.svg",
     "dist/*.mjs",
     "scripts/install.mjs",
     "docs/*.md",

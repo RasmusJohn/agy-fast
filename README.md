@@ -1,6 +1,10 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="agy-fast logo" width="80" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-light.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-dark.svg" />
+  <img src="assets/logo.svg" alt="agy-fast logo" width="80" />
+</picture>
 
 # agy-fast
 

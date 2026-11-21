@@ -24,6 +24,8 @@ const RUNTIME_FILES = [
 ];
 
 const OPTIONAL_DOC_FILES = [
+  "assets/logo-light.svg",
+  "assets/logo-dark.svg",
   "README.md",
   "README.zh-CN.md",
   "CHANGELOG.md",
