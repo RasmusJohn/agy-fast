@@ -120,7 +120,7 @@ Empirical analysis of **55 real Antigravity sessions** (**8,446 LLM turns**, **1
 | Component | Path | Role |
 | :--- | :--- | :--- |
 | **Plugin Manifest** | [`plugin.json`](plugin.json) | Standard Antigravity manifest; passes `agy plugin validate --strict` |
-| **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 4 composite tools under `agy-fast_fast` |
+| **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 4 eagerly loaded composite tools (`"eager": true`) under `agy-fast_fast` |
 | **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (`~35–50 ms`), emitting a `≤1.5 KB` workspace snapshot |
 | **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~2.2 KB`) routing guide with inlined schemas (zero schema-read turns) |
 | **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 12 h release checker with staged 4-tool MCP smoke verification |
@@ -258,7 +258,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *(default; `1..720`)* | Background check interval in hours |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *(default)* \| `main` | Track stable semver release tags or `main` |
 | `AGY_FAST_REPO` | Git URL | Use a custom mirror or fork |
-| `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on Desktop/IDE/other hosts and switches to JSON array strings on affected Antigravity CLI 1.5.x builds; server always accepts both) |
+| `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on eager-capable CLI ≥1.5.8, Desktop 2.0, IDE, and third-party hosts, and switches to JSON array strings on pre-eager CLI 1.5.0–1.5.7; server always accepts both) |
 | `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
 
 **Applying updates:** Updated `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop 2.0 / IDE, reload or restart the window once to refresh the resident MCP server process.

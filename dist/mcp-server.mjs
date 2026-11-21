@@ -1226,10 +1226,14 @@ var HOST_COMPAT_RULES = [
     id: "agy-cli-1.5-call-mcp-tool-empty-edits",
     surface: "cli",
     minVersion: "1.5.0",
-    // Set maxVersionExclusive once an Antigravity CLI release fixes long nested
-    // array loss (`edits: []`) in lazy call_mcp_tool Arguments.
+    // Antigravity CLI >= 1.5.8 supports `"eager": true` in mcp_config.json,
+    // which registers typed native mcp_agy-fast_fast_* tools and bypasses
+    // lazy call_mcp_tool altogether (keeping token-saving native array edits).
+    // Pre-eager CLI 1.5.0-1.5.7 keeps the JSON-string workaround automatically;
+    // any lazy/custom setup can still opt in via AGY_FAST_EDITS_FORMAT=string.
+    maxVersionExclusive: "1.5.8",
     editsFormat: "string",
-    reason: "Antigravity CLI 1.5.x can deliver long native edits arrays as [] in lazy call_mcp_tool; JSON array string avoids payload loss"
+    reason: "Pre-eager Antigravity CLI 1.5.0-1.5.7 loads tools lazily via call_mcp_tool where long native edits arrays can drop to []; JSON array string avoids payload loss"
   }
 ];
 function parseHostSemverParts(raw) {

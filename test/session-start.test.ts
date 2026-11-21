@@ -361,19 +361,30 @@ describe("session-start hook", () => {
     }
   });
 
-  it("injects [agy-fast compat] notice only on affected CLI 1.5.x and adds 0 bytes on Desktop/IDE", async () => {
-    const cliRes = await runHook(
+  it("injects [agy-fast compat] notice only on pre-eager CLI 1.5.0-1.5.7 and adds 0 bytes on CLI >=1.5.8 / Desktop / IDE", async () => {
+    const cliOldRes = await runHook(
+      JSON.stringify({
+        cwd: plainDir,
+        transcriptPath: "/Users/dev/.gemini/antigravity-cli/brain/1/transcript.jsonl",
+      }),
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.7" },
+    );
+    assert.equal(cliOldRes.code, 0);
+    const cliOldMsg: string = JSON.parse(cliOldRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.ok(Buffer.byteLength(cliOldMsg, "utf8") <= 1500);
+    assert.match(cliOldMsg, /\[agy-fast compat\] host=cli@1\.5\.7/);
+    assert.match(cliOldMsg, /JSON array string/);
+
+    // Eager-capable CLI >=1.5.8 omits the compat notice (0 extra tokens/bytes; avoids conflicting with typed eager tools)
+    const cliEagerRes = await runHook(
       JSON.stringify({
         cwd: plainDir,
         transcriptPath: "/Users/dev/.gemini/antigravity-cli/brain/1/transcript.jsonl",
       }),
       { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" },
     );
-    assert.equal(cliRes.code, 0);
-    const cliMsg: string = JSON.parse(cliRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
-    assert.ok(Buffer.byteLength(cliMsg, "utf8") <= 1500);
-    assert.match(cliMsg, /\[agy-fast compat\] host=cli@1\.5\.13/);
-    assert.match(cliMsg, /JSON array string/);
+    const cliEagerMsg: string = JSON.parse(cliEagerRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.doesNotMatch(cliEagerMsg, /\[agy-fast compat\]/);
 
     // Desktop 2.0 & IDE omit the compat line (0 extra tokens/bytes)
     const desktopRes = await runHook(
@@ -386,23 +397,30 @@ describe("session-start hook", () => {
     const desktopMsg: string = JSON.parse(desktopRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
     assert.doesNotMatch(desktopMsg, /\[agy-fast compat\]/);
 
-    // IDE path with conflicting ambient CLI env still resolves IDE (no compat notice)
+    // IDE path with conflicting ambient pre-eager CLI env still resolves IDE (no compat notice)
     const ideRes = await runHook(
       JSON.stringify({
         cwd: plainDir,
         transcriptPath: "/Users/dev/.gemini/antigravity-ide/brain/1/transcript.jsonl",
       }),
-      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" },
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.7" },
     );
     const ideMsg: string = JSON.parse(ideRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
     assert.doesNotMatch(ideMsg, /\[agy-fast compat\]/);
 
-    // Explicit AGY_FAST_EDITS_FORMAT=array suppresses notice even on CLI 1.5.13
-    const overrideRes = await runHook(
+    // Explicit AGY_FAST_EDITS_FORMAT=array suppresses notice even on CLI 1.5.7; =string forces it on CLI 1.5.13
+    const overrideArrRes = await runHook(
       JSON.stringify({ cwd: plainDir }),
-      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13", AGY_FAST_EDITS_FORMAT: "array" },
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.7", AGY_FAST_EDITS_FORMAT: "array" },
     );
-    const overrideMsg: string = JSON.parse(overrideRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
-    assert.doesNotMatch(overrideMsg, /\[agy-fast compat\]/);
+    const overrideArrMsg: string = JSON.parse(overrideArrRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.doesNotMatch(overrideArrMsg, /\[agy-fast compat\]/);
+
+    const overrideStrRes = await runHook(
+      JSON.stringify({ cwd: plainDir }),
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13", AGY_FAST_EDITS_FORMAT: "string" },
+    );
+    const overrideStrMsg: string = JSON.parse(overrideStrRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.match(overrideStrMsg, /\[agy-fast compat\] host=cli@1\.5\.13/);
   });
 });

@@ -116,9 +116,9 @@ describe("host-compat version & surface controller", () => {
     assert.equal(parseHostOverride("invalid-host"), null);
   });
 
-  it("biases toward token-saving native arrays by default and activates JSON string only on affected CLI 1.5.x", () => {
-    // Affected CLI 1.5.12 / 1.5.13 / 1.5.14 -> JSON array string
-    for (const ver of ["1.5.0", "1.5.12", "1.5.13", "1.5.14"]) {
+  it("biases toward token-saving native arrays on eager-capable hosts (CLI >=1.5.8, Desktop, IDE) and activates JSON string on pre-eager CLI 1.5.0-1.5.7", () => {
+    // Pre-eager CLI 1.5.0-1.5.7 (and 1.5.8 prereleases) -> JSON array string
+    for (const ver of ["1.5.0", "1.5.4", "1.5.7", "1.5.8-rc.1"]) {
       const c = resolveHostCompat({ env: { ANTIGRAVITY_LS_VERSION: `cli-${ver}` } });
       assert.equal(c.editsFormat, "string");
       assert.equal(c.editsFormatSource, "compat-rule");
@@ -127,14 +127,18 @@ describe("host-compat version & surface controller", () => {
       assert.ok(notice && notice.includes(`host=cli@${ver}`) && notice.includes("JSON array string"));
     }
 
-    // Token-saving default (native array, 0 extra SessionStart bytes) on Desktop, IDE, older CLI, unknown CLI version, unknown hosts
+    // Token-saving default (native array, 0 extra SessionStart bytes) on eager-capable CLI >=1.5.8,
+    // Desktop 2.0, IDE, older CLI <1.5.0, unknown CLI version, and unknown hosts
     const tokenSavingCases = [
       { env: {} },
       { env: { ANTIGRAVITY_LS_VERSION: "cli-1.4.9" } },
+      { env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.8" } },
+      { env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" } },
+      { env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.14" } },
       { transcriptPath: "/Users/dev/.gemini/antigravity-cli/brain/id/transcript.jsonl", env: {} },
       { clientInfo: { name: "Antigravity 2.0", version: "2.34.0" }, env: {} },
       { clientInfo: { name: "antigravity-ide", version: "2.7.0" }, env: {} },
-      { clientInfo: { name: "claude-code", version: "1.5.13" }, env: {} },
+      { clientInfo: { name: "claude-code", version: "1.5.7" }, env: {} },
     ];
     for (const sig of tokenSavingCases) {
       const c = resolveHostCompat(sig);
@@ -143,7 +147,7 @@ describe("host-compat version & surface controller", () => {
       assert.equal(formatSessionStartCompatNotice(c), null);
     }
 
-    // Future upstream fix version retires the workaround cleanly via maxVersionExclusive (incl. prerelease)
+    // Custom rule table upper-bound (incl. prerelease) retires cleanly via maxVersionExclusive
     const futureRules: HostCompatRule[] = [
       { ...HOST_COMPAT_RULES[0]!, maxVersionExclusive: "1.5.16" },
     ];
@@ -162,9 +166,9 @@ describe("host-compat version & surface controller", () => {
   });
 
   it("enforces override precedence (AGY_FAST_EDITS_FORMAT > config.json > compat rules) and reads saved config", async () => {
-    // Env override beats affected CLI rule
+    // Env override beats pre-eager CLI compat rule
     const forceArray = resolveHostCompat({
-      env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.14", AGY_FAST_EDITS_FORMAT: "array" },
+      env: { ANTIGRAVITY_LS_VERSION: "cli-1.5.7", AGY_FAST_EDITS_FORMAT: "array" },
       configEditsFormat: "string",
     });
     assert.equal(forceArray.editsFormat, "array");

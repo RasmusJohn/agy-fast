@@ -267,38 +267,51 @@ describe("MCP Stdio Server end-to-end", () => {
       return tools.find((t) => t.name === "apply_edits")!.inputSchema.properties.edits.type;
     };
 
-    // Affected Antigravity CLI 1.5.x switches edits schema to "string" (via clientInfo or LS env)
-    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.5.14" }), "string");
+    // Pre-eager Antigravity CLI 1.5.0-1.5.7 switches edits schema to "string" (via clientInfo or LS env)
+    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.5.7" }), "string");
     assert.equal(
-      await probeSchema({ name: "mcp-client", version: "1.0.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      await probeSchema({ name: "mcp-client", version: "1.0.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.6" }),
+      "string",
+    );
+    assert.equal(
+      await probeSchema({ name: "antigravity-cli", version: "1.5.7.4" }),
       "string",
     );
 
-    // Desktop 2.0, IDE, older CLI, and third-party clients keep token-saving "array" schema
+    // Eager-capable CLI >=1.5.8, Desktop 2.0, IDE, older CLI <1.5.0, and third-party clients keep token-saving "array" schema
+    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.5.8" }), "array");
+    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.5.13" }), "array");
+    assert.equal(
+      await probeSchema({ name: "mcp-client", version: "1.0.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      "array",
+    );
     assert.equal(await probeSchema({ name: "Antigravity 2.0", version: "2.34.0" }), "array");
     assert.equal(await probeSchema({ name: "antigravity-ide", version: "2.7.0" }), "array");
     assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.4.9" }), "array");
-    // Third-party clients launched inside an agy shell must NOT inherit ambient CLI LS version
+    // Third-party clients launched inside a pre-eager agy shell must NOT inherit ambient CLI LS version
     assert.equal(
-      await probeSchema({ name: "claude-code", version: "1.5.13" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      await probeSchema({ name: "claude-code", version: "1.5.7" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.7" }),
       "array",
     );
     assert.equal(
-      await probeSchema({ name: "cursor", version: "0.49.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      await probeSchema({ name: "cursor", version: "0.49.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.7" }),
       "array",
-    );
-    assert.equal(
-      await probeSchema({ name: "antigravity-cli", version: "1.5.13.4" }),
-      "string",
     );
 
     // Explicit AGY_FAST_EDITS_FORMAT override works in both directions
     assert.equal(
       await probeSchema(
-        { name: "antigravity-cli", version: "1.5.14" },
+        { name: "antigravity-cli", version: "1.5.7" },
         { AGY_FAST_EDITS_FORMAT: "array" },
       ),
       "array",
+    );
+    assert.equal(
+      await probeSchema(
+        { name: "antigravity-cli", version: "1.5.13" },
+        { AGY_FAST_EDITS_FORMAT: "string" },
+      ),
+      "string",
     );
     assert.equal(
       await probeSchema(
