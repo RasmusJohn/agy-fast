@@ -107,27 +107,13 @@ Empirical analysis of **55 real Antigravity sessions** (**8,446 LLM turns**, **1
 
 `agy-fast` never replaces fast native reads. It combines batched local MCP tools with Antigravity's locally allowlisted `read_file` (`~7 ms`, `46 KB/call` inline, zero remote check):
 
-```mermaid
-flowchart LR
-    H["SessionStart Hook (~40 ms, ≤1.5 KB snapshot)"] --> R["AGENTS.md Rules (inlined schemas)"]
-
-    R --> M["Local Stdio MCP Server (≤8.8 KB inline cap)"]
-    R --> N["Built-in read_file (~7 ms, 46 KB, 0 remote check)"]
-
-    subgraph MCP["agy-fast_fast — 4 Composite Tools"]
-        direction TB
-        T1["batch_search (≤20 search/glob/fuzzy/git)"]
-        T2["read_slices (≤40 multi-lang outlines)"]
-        T3["apply_edits (≤50 files atomic + verify)"]
-        T4["run_checks (≤12 parallel commands)"]
-    end
-
-    M --> T1
-    M --> T2
-    M --> T3
-    M --> T4
-    T2 -. "exact line ranges" .-> N
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-light.svg" />
+    <img alt="agy-fast Hybrid Execution Architecture" src="assets/architecture-light.svg" width="100%" />
+  </picture>
+</p>
 
 ### Plugin Components
 

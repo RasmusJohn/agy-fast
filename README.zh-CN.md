@@ -107,27 +107,13 @@ node scripts/install.mjs install --project /path/to/your-repo
 
 `agy-fast` 不会取代原本就极快的内置读取，而是将“批量合并型操作”交给本地 MCP，同时把小文件与已知行段直接路由给本地白名单内置 `read_file`（`~7 ms`、单次 `46 KB` 内联、零远端校验）：
 
-```mermaid
-flowchart LR
-    H["SessionStart 钩子 (~40 ms, ≤1.5 KB 快照)"] --> R["AGENTS.md 路由规则 (内联 Schema)"]
-
-    R --> M["本地常驻 Stdio MCP (≤8.8 KB 硬上限)"]
-    R --> N["内置 read_file (~7 ms, 46 KB 内联, 零远端校验)"]
-
-    subgraph MCP["agy-fast_fast — 4 个核心合并工具"]
-        direction TB
-        T1["batch_search (≤20 条搜索/glob/模糊/git)"]
-        T2["read_slices (≤40 文件多语言大纲)"]
-        T3["apply_edits (≤50 文件原子编辑 + verify)"]
-        T4["run_checks (≤12 条并发检查命令)"]
-    end
-
-    M --> T1
-    M --> T2
-    M --> T3
-    M --> T4
-    T2 -. "返回精确起止行号" .-> N
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-zh-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/architecture-zh-light.svg" />
+    <img alt="agy-fast 混合执行架构图" src="assets/architecture-zh-light.svg" width="100%" />
+  </picture>
+</p>
 
 ### 插件组成
 
