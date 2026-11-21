@@ -1464,14 +1464,22 @@ export async function runBatchSearch(
   const parsedQueries = parseMaybeJsonArray(input?.queries);
   if (!parsedQueries.ok) {
     if (
-      parsedQueries.kind === "wrong_type" &&
-      (typeof input?.queries === "boolean" || input?.queries === null)
+      parsedQueries.kind === "corrupted_literal" ||
+      (parsedQueries.kind === "wrong_type" &&
+        (typeof input?.queries === "boolean" || input?.queries === null))
     ) {
       return {
         text: formatCorruptedArrayError({
           header: "Validation failed",
           toolName: "batch_search",
-          items: [{ label: "queries", value: input.queries, expected: "an array of query objects" }],
+          items: [
+            {
+              label: "queries",
+              value:
+                parsedQueries.kind === "corrupted_literal" ? parsedQueries.value : input.queries,
+              expected: "an array of query objects",
+            },
+          ],
           fallbackAdvice:
             "split into smaller queries or use a single compound read-only run_command.",
         }),

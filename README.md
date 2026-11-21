@@ -258,6 +258,8 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *(default; `1..720`)* | Background check interval in hours |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *(default)* \| `main` | Track stable semver release tags or `main` |
 | `AGY_FAST_REPO` | Git URL | Use a custom mirror or fork |
+| `AGY_FAST_EDITS_FORMAT` | `auto` *(default)* \| `array` \| `string` | Controls `apply_edits.edits` schema (`auto` uses token-saving native arrays on Desktop/IDE/other hosts and switches to JSON array strings on affected Antigravity CLI 1.5.x builds; server always accepts both) |
+| `AGY_FAST_HOST` | e.g. `cli@1.5.14`, `ide@2.7.0`, `desktop@2.34.0` | Overrides auto-detected Antigravity host surface & version |
 
 **Applying updates:** Updated `rules/AGENTS.md` and `dist/session-start.mjs` take effect automatically on the next new session. In Antigravity Desktop 2.0 / IDE, reload or restart the window once to refresh the resident MCP server process.
 

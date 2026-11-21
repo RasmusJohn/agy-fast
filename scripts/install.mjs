@@ -102,6 +102,7 @@ function parseArgs(argv) {
   let intervalHours = null;
   let channel = "";
   let repoUrl = "";
+  let editsFormat = "";
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -146,6 +147,14 @@ function parseArgs(argv) {
         throw new Error("Missing repository URL after --repo");
       }
       repoUrl = args[++i];
+    } else if (a === "--edits-format") {
+      const next = args[i + 1];
+      if (!next || !["auto", "array", "string"].includes(next.toLowerCase())) {
+        throw new Error(
+          "Invalid value after --edits-format (expected: auto | array | string)",
+        );
+      }
+      editsFormat = args[++i].toLowerCase();
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -198,6 +207,7 @@ function parseArgs(argv) {
     intervalHours,
     channel,
     repoUrl,
+    editsFormat,
   };
 }
 
@@ -227,6 +237,8 @@ Options:
   --interval <hours>            Configure background check interval in hours (default 12)
   --channel release|main        Configure update channel (default release)
   --repo <url>                  Override git repository URL for updates
+  --edits-format auto|array|string
+                                Configure apply_edits.edits schema preference (default auto)
   -h, --help                    Show this help
 `);
 }
@@ -398,9 +410,13 @@ async function verifyMcpServerLive(mcpScriptPath) {
           reject(new Error("Invalid MCP JSON-RPC responses"));
           return;
         }
+        const applyEditsTool = tools.find((t) => t.name === "apply_edits");
+        const applyEditsSchemaType =
+          applyEditsTool?.inputSchema?.properties?.edits?.type || "unknown";
         resolve({
           protocolVersion: initResp.result.protocolVersion,
           tools: tools.map((t) => t.name),
+          applyEditsSchemaType,
         });
       } catch (err) {
         reject(err);
@@ -724,6 +740,25 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     process.env.AGY_FAST_UPDATE_CHANNEL?.trim().toLowerCase() ||
     updaterCfg.channel ||
     "release";
+  const rawEnvEditsFormat = process.env.AGY_FAST_EDITS_FORMAT?.trim().toLowerCase() || "";
+  const validEnvEditsFormat = ["auto", "array", "string"].includes(rawEnvEditsFormat)
+    ? rawEnvEditsFormat
+    : "";
+  const validCfgEditsFormat =
+    typeof updaterCfg.editsFormat === "string" &&
+    ["auto", "array", "string"].includes(updaterCfg.editsFormat.trim().toLowerCase())
+      ? updaterCfg.editsFormat.trim().toLowerCase()
+      : "";
+  const effectiveEditsFormat = validEnvEditsFormat || validCfgEditsFormat || "auto";
+  const rawHostOverride = process.env.AGY_FAST_HOST?.trim() || "";
+  const validHostOverride =
+    /^(?:cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s]v?\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)?$/i.test(
+      rawHostOverride,
+    )
+      ? rawHostOverride
+      : "";
+  const hostEnvLabel =
+    validHostOverride || process.env.ANTIGRAVITY_LS_VERSION?.trim() || "auto";
 
   const isolatedProfiles = doctorOpts.checkIsolated
     ? await Promise.all(
@@ -744,6 +779,9 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     );
     console.log(
       `  - MCP server  : OK (${mcpCheck.tools.length} tools: ${mcpCheck.tools.join(", ")})`,
+    );
+    console.log(
+      `  - Host compat : editsFormat=${effectiveEditsFormat} (active edits schema: ${mcpCheck.applyEditsSchemaType}; host=${hostEnvLabel})`,
     );
     console.log(
       `  - SessionStart: ${hookCheck.bytes > 0 ? "OK" : "EMPTY (FAILED)"} (${hookCheck.durationMs}ms, ${hookCheck.bytes} bytes)`,
@@ -853,12 +891,19 @@ async function runInstall(opts) {
     }
   }
 
-  if (opts.autoUpdate || opts.intervalHours !== null || opts.channel || opts.repoUrl) {
+  if (
+    opts.autoUpdate ||
+    opts.intervalHours !== null ||
+    opts.channel ||
+    opts.repoUrl ||
+    opts.editsFormat
+  ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
     if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
     if (opts.channel) patch.channel = opts.channel;
     if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
+    if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -886,6 +931,7 @@ async function runConfig(opts) {
   if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
   if (opts.channel) patch.channel = opts.channel;
   if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
+  if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
 
   let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
   let cfg;
@@ -903,6 +949,7 @@ async function runConfig(opts) {
     console.log(`  - checkIntervalHours: ${cfg.checkIntervalHours || 12}`);
     console.log(`  - channel           : ${cfg.channel || "release"}`);
     console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
+    console.log(`  - editsFormat       : ${cfg.editsFormat || "auto"}`);
   }
 }
 

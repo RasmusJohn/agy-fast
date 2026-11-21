@@ -38,7 +38,8 @@ export interface VerifySpec {
 
 export interface ApplyEditsInput {
   cwd?: string;
-  edits: FileEdit[];
+  /** A JSON array string of file edits, or the array itself. */
+  edits: string | FileEdit[];
   dryRun?: boolean;
   bestEffort?: boolean;
   verify?: string | VerifySpec;
@@ -522,34 +523,55 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
   }
 }
 
+function corruptedEditsError(items: CorruptedItem[]): { text: string; isError: boolean } {
+  return {
+    text: formatCorruptedArrayError({
+      header: "Validation failed (0 files modified)",
+      toolName: "apply_edits",
+      items,
+      fallbackAdvice:
+        "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
+    }),
+    isError: true,
+  };
+}
+
 export async function runApplyEdits(
   input: ApplyEditsInput,
 ): Promise<{ text: string; isError: boolean }> {
   const parsedEdits = parseMaybeJsonArray(input?.edits);
   if (!parsedEdits.ok) {
-    if (parsedEdits.kind === "wrong_type" && (typeof input?.edits === "boolean" || input?.edits === null)) {
+    if (
+      parsedEdits.kind === "corrupted_literal" ||
+      (parsedEdits.kind === "wrong_type" &&
+        (typeof input?.edits === "boolean" || input?.edits === null))
+    ) {
+      return corruptedEditsError([
+        {
+          label: "edits",
+          value: parsedEdits.kind === "corrupted_literal" ? parsedEdits.value : input.edits,
+          expected: "an array of edit objects",
+        },
+      ]);
+    }
+    if (parsedEdits.kind === "invalid_json") {
       return {
-        text: formatCorruptedArrayError({
-          header: "Validation failed (0 files modified)",
-          toolName: "apply_edits",
-          items: [{ label: "edits", value: input.edits, expected: "an array of edit objects" }],
-          fallbackAdvice:
-            "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
-        }),
+        text: `Error: 'edits' is not a valid JSON array (0 files modified): ${parsedEdits.detail}`,
         isError: true,
       };
     }
     return {
-      text: "Error: 'edits' must be a non-empty array of file edit objects.",
+      text: "Error: 'edits' must be a non-empty JSON array string (or array) of file edit objects.",
       isError: true,
     };
   }
   const rawEdits = parsedEdits.value;
+  // A model never means to send zero edits; on agy CLI 1.5.x a long native
+  // array of edit objects can reach the server as [] with the payload lost.
   if (rawEdits.length === 0) {
-    return {
-      text: "Error: 'edits' must be a non-empty array of file edit objects.",
-      isError: true,
-    };
+    return corruptedEditsError([
+      { label: "edits", value: rawEdits, expected: "a non-empty array of edit objects" },
+    ]);
   }
   if (rawEdits.length > 50) {
     return {
@@ -574,7 +596,7 @@ export async function runApplyEdits(
       if (!parsedHunks.ok) {
         corruptedItems.push({
           label: `edits[${i}].hunks`,
-          value: rawEntry.hunks,
+          value: parsedHunks.kind === "corrupted_literal" ? parsedHunks.value : rawEntry.hunks,
           expected: "an array of hunk objects",
         });
         continue;
@@ -601,16 +623,7 @@ export async function runApplyEdits(
     });
   }
   if (corruptedItems.length > 0) {
-    return {
-      text: formatCorruptedArrayError({
-        header: "Validation failed (0 files modified)",
-        toolName: "apply_edits",
-        items: corruptedItems,
-        fallbackAdvice:
-          "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
-      }),
-      isError: true,
-    };
+    return corruptedEditsError(corruptedItems);
   }
 
   // Validate optional verify spec up front before touching any files on disk

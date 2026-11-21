@@ -256,6 +256,8 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | `AGY_FAST_UPDATE_INTERVAL_HOURS` | `12` *（默认；`1..720`）* | 后台检查间隔（小时） |
 | `AGY_FAST_UPDATE_CHANNEL` | `release` *（默认）* \| `main` | 跟踪稳定发版标签或 `main` 分支 |
 | `AGY_FAST_REPO` | Git 仓库地址 | 自定义镜像或 Fork 仓库地址 |
+| `AGY_FAST_EDITS_FORMAT` | `auto` *（默认）* \| `array` \| `string` | 控制 `apply_edits.edits` 参数格式策略（`auto` 在桌面端/IDE/其他客户端优先走省 token 的原生数组，在受影响的 Antigravity CLI 1.5.x 自动切换为 JSON 数组字符串以防 `[]` 丢参；服务端始终同时兼容两种格式） |
+| `AGY_FAST_HOST` | 如 `cli@1.5.14`、`ide@2.7.0`、`desktop@2.34.0` | 手动覆盖自动探测到的 Antigravity 宿主端类型与版本 |
 
 **更新生效提示：** 新版 `rules/AGENTS.md` 与 `dist/session-start.mjs` 在下一次开启新会话时自动生效；Antigravity Desktop 2.0 / IDE 若需立即刷新常驻 MCP 服务，重载窗口或重启一次即可。
 

@@ -3,10 +3,11 @@
 
 // src/session-start.ts
 import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
+import path5 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/utils/output-filter.ts
+var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
@@ -64,8 +65,9 @@ function sliceSafeChars(text, maxChars) {
   return text.slice(0, end);
 }
 
-// src/utils/snapshot.ts
-import { promises as fs } from "node:fs";
+// src/utils/host-compat.ts
+import { promises as fsp } from "node:fs";
+import os from "node:os";
 import path2 from "node:path";
 
 // src/utils/exec-utils.ts
@@ -174,6 +176,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     }
   }
 }
+var MCP_CALL_BUDGET_SEC = 170;
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -315,6 +318,297 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
   });
 }
+
+// src/utils/host-compat.ts
+var HOST_COMPAT_RULES = [
+  {
+    id: "agy-cli-1.5-call-mcp-tool-empty-edits",
+    surface: "cli",
+    minVersion: "1.5.0",
+    // Set maxVersionExclusive once an Antigravity CLI release fixes long nested
+    // array loss (`edits: []`) in lazy call_mcp_tool Arguments.
+    editsFormat: "string",
+    reason: "Antigravity CLI 1.5.x can deliver long native edits arrays as [] in lazy call_mcp_tool; JSON array string avoids payload loss"
+  }
+];
+function parseHostSemverParts(raw) {
+  const m = /(?:^|[^0-9.])v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:-([0-9A-Za-z.-]+))?(?:$|[^0-9.])/.exec(
+    raw.trim()
+  );
+  if (!m) return null;
+  const major = Number.parseInt(m[1], 10);
+  const minor = Number.parseInt(m[2], 10);
+  const patch = Number.parseInt(m[3], 10);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch) || major > 999999 || minor > 999999 || patch > 999999) {
+    return null;
+  }
+  return { major, minor, patch, prerelease: m[4] ?? null };
+}
+function formatHostSemverParts(parts) {
+  const base = `${parts.major}.${parts.minor}.${parts.patch}`;
+  return parts.prerelease ? `${base}-${parts.prerelease}` : base;
+}
+function comparePrerelease(a, b) {
+  const aParts = a.split(".");
+  const bParts = b.split(".");
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const ai = aParts[i];
+    const bi = bParts[i];
+    if (ai === void 0) return -1;
+    if (bi === void 0) return 1;
+    if (ai === bi) continue;
+    const aNum = /^\d+$/.test(ai);
+    const bNum = /^\d+$/.test(bi);
+    if (aNum && bNum) {
+      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
+      if (diff !== 0) return diff > 0 ? 1 : -1;
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else {
+      return ai < bi ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function compareHostSemver(a, b) {
+  const pa = parseHostSemverParts(a);
+  const pb = parseHostSemverParts(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
+  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
+  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
+  if (pa.prerelease === pb.prerelease) return 0;
+  if (pa.prerelease === null) return 1;
+  if (pb.prerelease === null) return -1;
+  return comparePrerelease(pa.prerelease, pb.prerelease);
+}
+function parseEditsFormatMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "auto" || v === "array" || v === "string") return v;
+  return null;
+}
+function parseHostOverride(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  const m = /^(cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s](.+))?$/.exec(trimmed);
+  if (!m) return null;
+  const surface = m[1] === "app" || m[1] === "antigravity" ? "desktop" : m[1];
+  if (m[2] !== void 0) {
+    const parts = parseHostSemverParts(m[2]);
+    if (!parts) return null;
+    return { surface, version: formatHostSemverParts(parts) };
+  }
+  return { surface, version: null };
+}
+var EXPLICIT_THIRD_PARTY_CLIENT_RE = /^(?:claude(?:[-_\s]|$)|cursor(?:[-_\s]|$)|windsurf(?:[-_\s]|$)|vscode(?:[-_\s]|$)|visual[\s_-]+studio[\s_-]+code|codex(?:[-_\s]|$)|zed(?:[-_\s]|$)|cline(?:[-_\s]|$)|roo[-_\s]?code|continue(?:[-_\s]|$)|opencode(?:[-_\s]|$)|aider(?:[-_\s]|$)|goose(?:[-_\s]|$)|jetbrains(?:[-_\s]|$)|neovim(?:[-_\s]|$)|nvim(?:[-_\s]|$)|emacs(?:[-_\s]|$)|mcp[-_\s]?inspector(?:[-_\s]|$))/i;
+function isExplicitThirdPartyClient(rawName) {
+  if (typeof rawName !== "string") return false;
+  return EXPLICIT_THIRD_PARTY_CLIENT_RE.test(rawName.trim());
+}
+function parseSurfaceFromClientName(rawName) {
+  if (typeof rawName !== "string") return null;
+  const s = rawName.trim().toLowerCase();
+  if (!s || s.startsWith("agy-fast")) return null;
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?cli$/.test(s) || /^agy(?:[-_\s]?cli)?$/.test(s)) {
+    return "cli";
+  }
+  if (/^(?:google[-_\s]?)?antigravity[-_\s]?ide$/.test(s)) {
+    return "ide";
+  }
+  if (/^(?:google[-_\s]?)?antigravity(?:[-_\s]?(?:2\.0|app|desktop))?$/.test(s)) {
+    return "desktop";
+  }
+  return null;
+}
+function parseLsVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = parseHostSemverParts(trimmed);
+  const version = parts ? formatHostSemverParts(parts) : null;
+  if (/^(?:antigravity[-_\s]?)?cli(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "cli", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?ide(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "ide", version };
+  }
+  if (/^(?:antigravity[-_\s]?)?(?:desktop|app)(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (/^antigravity(?:[-_/@\s]|$)/i.test(trimmed)) {
+    return { surface: "desktop", version };
+  }
+  if (version) {
+    return { surface: null, version };
+  }
+  return null;
+}
+function parseSurfaceFromPath(rawPath, allowTrailingAppDir = false) {
+  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
+  const segs = rawPath.trim().replace(/\\/g, "/").split("/").filter(Boolean).map((s) => s.toLowerCase());
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (segs[i] !== ".gemini") continue;
+    const next = segs[i + 1];
+    if (next === "antigravity-cli") return "cli";
+    if (next === "antigravity-ide") return "ide";
+    if (next === "antigravity") return "desktop";
+  }
+  if (allowTrailingAppDir && segs.length > 0) {
+    const tail = segs[segs.length - 1];
+    if (tail === "antigravity-cli") return "cli";
+    if (tail === "antigravity-ide") return "ide";
+    if (tail === "antigravity") return "desktop";
+  }
+  return null;
+}
+function detectHostIdentity(signals = {}) {
+  const env = signals.env ?? process.env;
+  const rawClientName = typeof signals.clientInfo?.name === "string" && signals.clientInfo.name.trim() ? signals.clientInfo.name.trim() : void 0;
+  const rawClientVersion = typeof signals.clientInfo?.version === "string" && signals.clientInfo.version.trim() ? signals.clientInfo.version.trim() : void 0;
+  const modelName = typeof signals.modelName === "string" && signals.modelName.trim() ? signals.modelName.trim() : void 0;
+  const override = parseHostOverride(env.AGY_FAST_HOST);
+  if (override) {
+    return {
+      surface: override.surface,
+      version: override.version,
+      source: "override",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  if (isExplicitThirdPartyClient(rawClientName)) {
+    return {
+      surface: "unknown",
+      version: null,
+      source: "mcp:client-info",
+      rawClientName,
+      rawClientVersion,
+      modelName
+    };
+  }
+  const clientSurface = parseSurfaceFromClientName(rawClientName);
+  const clientVerParts = clientSurface && rawClientVersion ? parseHostSemverParts(rawClientVersion) : null;
+  const clientVersion = clientVerParts ? formatHostSemverParts(clientVerParts) : null;
+  const hookSurface = parseSurfaceFromPath(signals.transcriptPath) ?? parseSurfaceFromPath(signals.artifactDirectoryPath);
+  const lsInfo = parseLsVersion(env.ANTIGRAVITY_LS_VERSION);
+  const appDataSurface = parseSurfaceFromPath(env.ANTIGRAVITY_APP_DATA_DIR, true);
+  let surface = "unknown";
+  let source = "unknown";
+  if (clientSurface) {
+    surface = clientSurface;
+    source = "mcp:client-info";
+  } else if (hookSurface) {
+    surface = hookSurface;
+    source = "hook:path";
+  } else if (lsInfo?.surface) {
+    surface = lsInfo.surface;
+    source = "env:ls-version";
+  } else if (appDataSurface) {
+    surface = appDataSurface;
+    source = "env:app-data-dir";
+  }
+  let version = null;
+  if (clientSurface === surface && clientVersion) {
+    version = clientVersion;
+  } else if (surface !== "unknown" && lsInfo?.version && (lsInfo.surface === null || lsInfo.surface === surface)) {
+    version = lsInfo.version;
+  }
+  return {
+    surface,
+    version,
+    source,
+    rawClientName,
+    rawClientVersion,
+    modelName
+  };
+}
+function ruleMatchesIdentity(rule, identity) {
+  if (rule.surface !== identity.surface) return false;
+  if (rule.minVersion !== void 0 || rule.maxVersionExclusive !== void 0) {
+    if (!identity.version) return false;
+    if (rule.minVersion !== void 0 && compareHostSemver(identity.version, rule.minVersion) < 0) {
+      return false;
+    }
+    if (rule.maxVersionExclusive !== void 0 && compareHostSemver(identity.version, rule.maxVersionExclusive) >= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
+  const env = signals.env ?? process.env;
+  const identity = detectHostIdentity(signals);
+  let ruleEditsFormat;
+  let callBudgetSec = MCP_CALL_BUDGET_SEC;
+  let inlineMaxBytes = DEFAULT_INLINE_MAX_BYTES;
+  const matchedRuleIds = [];
+  const reasons = [];
+  for (const rule of rules) {
+    if (!ruleMatchesIdentity(rule, identity)) continue;
+    matchedRuleIds.push(rule.id);
+    if (rule.editsFormat !== void 0) ruleEditsFormat = rule.editsFormat;
+    if (rule.callBudgetSec !== void 0) callBudgetSec = rule.callBudgetSec;
+    if (rule.inlineMaxBytes !== void 0) inlineMaxBytes = rule.inlineMaxBytes;
+    if (rule.reason) reasons.push(rule.reason);
+  }
+  const envMode = parseEditsFormatMode(env.AGY_FAST_EDITS_FORMAT);
+  const cfgMode = parseEditsFormatMode(signals.configEditsFormat);
+  let editsFormat = "array";
+  let editsFormatSource = "token-saving-default";
+  let reason = reasons[0] ?? "Defaulting to native array edits for lower output token usage (~2.6-3.3x cheaper than double-escaped JSON strings)";
+  if (envMode === "array" || envMode === "string") {
+    editsFormat = envMode;
+    editsFormatSource = "env-override";
+    reason = `Forced by AGY_FAST_EDITS_FORMAT=${envMode}`;
+  } else if (envMode !== "auto" && (cfgMode === "array" || cfgMode === "string")) {
+    editsFormat = cfgMode;
+    editsFormatSource = "config-override";
+    reason = `Configured in agy-fast config.json (editsFormat=${cfgMode})`;
+  } else if (ruleEditsFormat !== void 0) {
+    editsFormat = ruleEditsFormat;
+    editsFormatSource = "compat-rule";
+  }
+  return {
+    identity,
+    editsFormat,
+    editsFormatSource,
+    callBudgetSec,
+    inlineMaxBytes,
+    matchedRuleIds,
+    reason
+  };
+}
+function formatHostLabel(identity) {
+  return identity.version ? `${identity.surface}@${identity.version}` : identity.surface;
+}
+function formatSessionStartCompatNotice(compat) {
+  if (compat.editsFormat !== "string") return null;
+  const hostLabel = formatHostLabel(compat.identity);
+  return `[agy-fast compat] host=${hostLabel} | apply_edits.edits: pass as JSON array string (not native array) to avoid call_mcp_tool [] drops.`;
+}
+function getConfigPath(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+  const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
+  return path2.join(cacheDir, "config.json");
+}
+async function readSavedEditsFormat(env = process.env) {
+  try {
+    const raw = await fsp.readFile(getConfigPath(env), "utf8");
+    const parsed = JSON.parse(raw);
+    return parseEditsFormatMode(parsed?.editsFormat) ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
+
+// src/utils/snapshot.ts
+import { promises as fs } from "node:fs";
+import path3 from "node:path";
 
 // src/utils/fs-utils.ts
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
@@ -518,7 +812,7 @@ async function getTwoLevelTree(workspaceDir) {
         };
       }
       try {
-        const sub = await fs.readdir(path2.join(workspaceDir, entry.name), {
+        const sub = await fs.readdir(path3.join(workspaceDir, entry.name), {
           withFileTypes: true
         });
         const valid = sub.filter(
@@ -588,7 +882,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // package.json
     (async () => {
       try {
-        const raw = await fs.readFile(path2.join(dirPath, "package.json"), "utf8");
+        const raw = await fs.readFile(path3.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw);
         const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
         const label = pkg.name ? `${prefix}package.json (${pkg.name})` : `${prefix}package.json`;
@@ -603,7 +897,7 @@ async function detectManifestsInDir(dirPath, prefix) {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
         try {
-          const raw = await fs.readFile(path2.join(dirPath, name), "utf8");
+          const raw = await fs.readFile(path3.join(dirPath, name), "utf8");
           const targets = [];
           for (const line of raw.split(/\r?\n/)) {
             const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
@@ -623,7 +917,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pom.xml (Maven)
     (async () => {
       try {
-        const raw = await fs.readFile(path2.join(dirPath, "pom.xml"), "utf8");
+        const raw = await fs.readFile(path3.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
         const m = /<artifactId>\s*([^<\s]+)\s*<\/artifactId>/i.exec(stripped);
         hints.push(
@@ -636,7 +930,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
         try {
-          await fs.access(path2.join(dirPath, name));
+          await fs.access(path3.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
           break;
         } catch {
@@ -646,7 +940,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pyproject.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path2.join(dirPath, "pyproject.toml"), "utf8");
+        const raw = await fs.readFile(path3.join(dirPath, "pyproject.toml"), "utf8");
         const tools = [];
         if (/\[tool\.pytest/.test(raw)) tools.push("pytest");
         if (/\[tool\.ruff/.test(raw)) tools.push("ruff");
@@ -662,7 +956,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // Cargo.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path2.join(dirPath, "Cargo.toml"), "utf8");
+        const raw = await fs.readFile(path3.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
         hints.push(
           isWorkspace ? `${prefix}Cargo.toml (workspace)` : `${prefix}Cargo.toml`
@@ -673,7 +967,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // go.mod
     (async () => {
       try {
-        const raw = await fs.readFile(path2.join(dirPath, "go.mod"), "utf8");
+        const raw = await fs.readFile(path3.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
@@ -692,7 +986,7 @@ async function getProjectManifestSummary(workspaceDir) {
     ).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 8);
     const nested = await Promise.all(
       subdirs.map(
-        (d) => detectManifestsInDir(path2.join(workspaceDir, d.name), `${d.name}/`)
+        (d) => detectManifestsInDir(path3.join(workspaceDir, d.name), `${d.name}/`)
       )
     );
     for (const list of nested) {
@@ -817,22 +1111,22 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
 // src/utils/updater-core.ts
 import { spawn as spawn2 } from "node:child_process";
 import { promises as fs2 } from "node:fs";
-import os from "node:os";
-import path3 from "node:path";
+import os2 from "node:os";
+import path4 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 12;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
 function getHomeDir(env = process.env) {
-  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const cacheDir = custom ? path3.resolve(custom) : path3.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  const cacheDir = custom ? path4.resolve(custom) : path4.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
   return {
     cacheDir,
-    stateFile: path3.join(cacheDir, "update-state.json"),
-    configFile: path3.join(cacheDir, "config.json"),
-    lockFile: path3.join(cacheDir, "update.lock")
+    stateFile: path4.join(cacheDir, "update-state.json"),
+    configFile: path4.join(cacheDir, "config.json"),
+    lockFile: path4.join(cacheDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -886,7 +1180,7 @@ async function readJsonFile(filePath) {
   return null;
 }
 async function writeJsonAtomically(filePath, data) {
-  await fs2.mkdir(path3.dirname(filePath), { recursive: true });
+  await fs2.mkdir(path4.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
@@ -938,7 +1232,7 @@ async function resolveUpdaterSettings(env = process.env) {
 }
 async function readInstalledVersion(pluginDir) {
   const manifest = await readJsonFile(
-    path3.join(pluginDir, "plugin.json")
+    path4.join(pluginDir, "plugin.json")
   );
   if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
     return manifest.version.trim();
@@ -972,13 +1266,13 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     ).catch(() => {
     });
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path3.join(pluginDir, "scripts", "install.mjs");
+    const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
     return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
   }
   return null;
 }
 function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
-  const updaterPath = path3.join(pluginDir, "dist", "updater.mjs");
+  const updaterPath = path4.join(pluginDir, "dist", "updater.mjs");
   try {
     const child = spawn2(
       process.execPath,
@@ -1086,8 +1380,8 @@ async function main() {
     }
     let updateNotice = null;
     try {
-      const pluginDir = path4.resolve(
-        path4.dirname(fileURLToPath(import.meta.url)),
+      const pluginDir = path5.resolve(
+        path5.dirname(fileURLToPath(import.meta.url)),
         ".."
       );
       const settings = await resolveUpdaterSettings();
@@ -1101,7 +1395,7 @@ async function main() {
           currentVersion
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
-          const updaterPath = path4.join(pluginDir, "dist", "updater.mjs");
+          const updaterPath = path5.join(pluginDir, "dist", "updater.mjs");
           const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
             await writeUpdateState({
@@ -1114,17 +1408,34 @@ async function main() {
       }
     } catch {
     }
+    let compatNotice = null;
+    try {
+      const configEditsFormat = await readSavedEditsFormat(process.env);
+      const hostCompat = resolveHostCompat({
+        transcriptPath: typeof payload.transcriptPath === "string" ? payload.transcriptPath : typeof payload.transcript_path === "string" ? payload.transcript_path : void 0,
+        artifactDirectoryPath: typeof payload.artifactDirectoryPath === "string" ? payload.artifactDirectoryPath : typeof payload.artifact_directory_path === "string" ? payload.artifact_directory_path : void 0,
+        modelName: typeof payload.modelName === "string" ? payload.modelName : typeof payload.model_name === "string" ? payload.model_name : void 0,
+        env: process.env,
+        configEditsFormat
+      });
+      compatNotice = formatSessionStartCompatNotice(hostCompat);
+    } catch {
+    }
+    const trailingNotices = [compatNotice, updateNotice].filter(
+      (n) => Boolean(n)
+    );
     let messageText = snapshot;
-    if (updateNotice) {
+    if (trailingNotices.length > 0) {
+      const suffix = trailingNotices.join("\n");
       const combined = `${snapshot}
-${updateNotice}`;
+${suffix}`;
       if (Buffer.byteLength(combined, "utf8") <= MAX_SNAPSHOT_BYTES) {
         messageText = combined;
       } else {
-        const noticeBytes = Buffer.byteLength(updateNotice, "utf8") + 1;
+        const noticeBytes = Buffer.byteLength(suffix, "utf8") + 1;
         const snapshotBudget = MAX_SNAPSHOT_BYTES - noticeBytes;
         messageText = snapshotBudget >= 64 ? `${truncateWithByteNotice(snapshot, snapshotBudget)}
-${updateNotice}` : truncateWithByteNotice(combined, MAX_SNAPSHOT_BYTES);
+${suffix}` : truncateWithByteNotice(combined, MAX_SNAPSHOT_BYTES);
       }
     }
     const response = {

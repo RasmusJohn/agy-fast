@@ -2,6 +2,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { truncateWithByteNotice } from "./utils/output-filter.js";
+import {
+  formatSessionStartCompatNotice,
+  readSavedEditsFormat,
+  resolveHostCompat,
+} from "./utils/host-compat.js";
 import { buildWorkspaceSnapshot } from "./utils/snapshot.js";
 import {
   consumeSnapshotUpdateNotice,
@@ -19,6 +24,12 @@ interface SessionStartPayload {
   workspace_paths?: string[];
   workspaceRoots?: string[];
   workspace_roots?: string[];
+  transcriptPath?: string;
+  transcript_path?: string;
+  artifactDirectoryPath?: string;
+  artifact_directory_path?: string;
+  modelName?: string;
+  model_name?: string;
   hookEventName?: string;
   hook_event_name?: string;
 }
@@ -163,17 +174,51 @@ async function main(): Promise<void> {
       // Never block or break SessionStart on updater errors
     }
 
+    let compatNotice: string | null = null;
+    try {
+      const configEditsFormat = await readSavedEditsFormat(process.env);
+      const hostCompat = resolveHostCompat({
+        transcriptPath:
+          typeof payload.transcriptPath === "string"
+            ? payload.transcriptPath
+            : typeof payload.transcript_path === "string"
+              ? payload.transcript_path
+              : undefined,
+        artifactDirectoryPath:
+          typeof payload.artifactDirectoryPath === "string"
+            ? payload.artifactDirectoryPath
+            : typeof payload.artifact_directory_path === "string"
+              ? payload.artifact_directory_path
+              : undefined,
+        modelName:
+          typeof payload.modelName === "string"
+            ? payload.modelName
+            : typeof payload.model_name === "string"
+              ? payload.model_name
+              : undefined,
+        env: process.env,
+        configEditsFormat,
+      });
+      compatNotice = formatSessionStartCompatNotice(hostCompat);
+    } catch {
+      // Never block SessionStart on host-compat inspection
+    }
+
+    const trailingNotices = [compatNotice, updateNotice].filter(
+      (n): n is string => Boolean(n),
+    );
     let messageText = snapshot;
-    if (updateNotice) {
-      const combined = `${snapshot}\n${updateNotice}`;
+    if (trailingNotices.length > 0) {
+      const suffix = trailingNotices.join("\n");
+      const combined = `${snapshot}\n${suffix}`;
       if (Buffer.byteLength(combined, "utf8") <= MAX_SNAPSHOT_BYTES) {
         messageText = combined;
       } else {
-        const noticeBytes = Buffer.byteLength(updateNotice, "utf8") + 1;
+        const noticeBytes = Buffer.byteLength(suffix, "utf8") + 1;
         const snapshotBudget = MAX_SNAPSHOT_BYTES - noticeBytes;
         messageText =
           snapshotBudget >= 64
-            ? `${truncateWithByteNotice(snapshot, snapshotBudget)}\n${updateNotice}`
+            ? `${truncateWithByteNotice(snapshot, snapshotBudget)}\n${suffix}`
             : truncateWithByteNotice(combined, MAX_SNAPSHOT_BYTES);
       }
     }

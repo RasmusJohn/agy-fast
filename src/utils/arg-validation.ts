@@ -14,11 +14,17 @@ export function describeValueType(value: unknown): string {
 
 export type ParsedArrayResult =
   | { ok: true; value: unknown[] }
-  | { ok: false; kind: "missing" | "invalid_json" | "wrong_type"; detail: string };
+  | { ok: false; kind: "corrupted_literal"; detail: string; value: boolean | null }
+  | {
+      ok: false;
+      kind: "missing" | "invalid_json" | "wrong_type";
+      detail: string;
+    };
 
 /**
  * Accept a native JSON array or a stringified JSON array (some tool wrappers
- * stringify nested array arguments). Reject primitives/objects cleanly.
+ * stringify nested array arguments). Distinguish malformed JSON strings and
+ * stringified boolean/null corruption from plain type mismatches.
  */
 export function parseMaybeJsonArray(value: unknown): ParsedArrayResult {
   if (value === undefined) {
@@ -29,19 +35,33 @@ export function parseMaybeJsonArray(value: unknown): ParsedArrayResult {
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
-    if (trimmed.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) {
-          return { ok: true, value: parsed };
-        }
-      } catch (err) {
+    if (!trimmed) {
+      return { ok: false, kind: "wrong_type", detail: "empty string" };
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return { ok: true, value: parsed };
+      }
+      if (parsed === null || typeof parsed === "boolean") {
         return {
           ok: false,
-          kind: "invalid_json",
-          detail: err instanceof Error ? err.message : String(err),
+          kind: "corrupted_literal",
+          detail: describeValueType(parsed),
+          value: parsed,
         };
       }
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: `decoded to ${describeValueType(parsed)} instead of a JSON array`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        kind: "invalid_json",
+        detail: err instanceof Error ? err.message : String(err),
+      };
     }
   }
   return {
@@ -76,6 +96,6 @@ export function formatCorruptedArrayError(options: {
     `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
     ...details,
     "",
-    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans or null. Do NOT retry the same ${options.toolName} payload — ${options.fallbackAdvice}`,
+    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans, null, or an empty array. Do NOT retry the same ${options.toolName} payload — ${options.fallbackAdvice}`,
   ].join("\n");
 }

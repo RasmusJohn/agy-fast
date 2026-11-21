@@ -939,6 +939,23 @@ describe("benchmark analyzer & CLI", () => {
     );
     const cm = analyzeTranscriptSessions([corruptedSession, swarmWorkerSession]);
     assert.equal(cm.agyCorruptedArgCalls, 1);
+    // An empty edits array is the lost-payload form seen on agy's Flash worker.
+    const emptyEditsSession = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T22:00:01Z",
+          output_tokens: 3000,
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: { ServerName: "agy-fast_fast", ToolName: "apply_edits", Arguments: { edits: [] } },
+            },
+          ],
+        }),
+      ].join("\n"),
+    );
+    assert.equal(analyzeTranscriptSessions([emptyEditsSession]).agyCorruptedArgCalls, 1);
     assert.equal(cm.agyCorruptedArgWastedSec, 72);
     assert.equal(cm.agyCorruptedArgWastedOutTokens, 9000);
     assert.equal(cm.swarmWorkerSessions, 1);

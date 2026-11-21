@@ -46,6 +46,7 @@ export interface UpdaterConfig {
   checkIntervalHours?: number;
   channel?: UpdateChannel;
   repoUrl?: string;
+  editsFormat?: "auto" | "array" | "string";
 }
 
 export interface ResolvedUpdaterSettings {

@@ -8,13 +8,31 @@ import { after, before, describe, it } from "node:test";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
+function buildCleanServerEnv(
+  extraEnv: Record<string, string | undefined> = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env.ANTIGRAVITY_LS_VERSION;
+  delete env.ANTIGRAVITY_APP_DATA_DIR;
+  delete env.AGY_FAST_HOST;
+  delete env.AGY_FAST_EDITS_FORMAT;
+  delete env.AGY_FAST_CACHE_DIR;
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return env;
+}
+
 function sendMessagesToServer(
   rawChunks: Array<string | Buffer>,
+  extraEnv: Record<string, string | undefined> = {},
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: buildCleanServerEnv(extraEnv),
     });
     let stdout = "";
     let stderr = "";
@@ -183,6 +201,11 @@ describe("MCP Stdio Server end-to-end", () => {
       toolList.map((t) => t.name),
       ["batch_search", "apply_edits", "read_slices", "run_checks"],
     );
+    // Default (unknown/third-party host) uses token-saving native array schema
+    const applySchema = toolList.find((t) => t.name === "apply_edits")?.inputSchema as {
+      properties: { edits: { type: string } };
+    };
+    assert.equal(applySchema.properties.edits.type, "array");
     // Ensure schemas avoid oneOf/anyOf/allOf for maximum client compatibility
     for (const tool of toolList) {
       assert.equal(
@@ -212,6 +235,78 @@ describe("MCP Stdio Server end-to-end", () => {
       byId.get(7)?.result as { content: Array<{ text: string }> }
     ).content[0]?.text;
     assert.match(checkText ?? "", /Checks: 1\/1 passed/);
+  });
+
+  it("adapts apply_edits inputSchema dynamically by Antigravity surface/version and honors overrides", async () => {
+    const probeSchema = async (
+      clientInfo: { name: string; version: string },
+      extraEnv: Record<string, string | undefined> = {},
+    ) => {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        extraEnv,
+      );
+      assert.equal(res.code, 0);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      const tools = lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        inputSchema: { properties: { edits: { type: string } } };
+      }>;
+      for (const tool of tools) {
+        assert.equal(hasDisallowedSchemaKeyword(tool.inputSchema), false);
+      }
+      return tools.find((t) => t.name === "apply_edits")!.inputSchema.properties.edits.type;
+    };
+
+    // Affected Antigravity CLI 1.5.x switches edits schema to "string" (via clientInfo or LS env)
+    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.5.14" }), "string");
+    assert.equal(
+      await probeSchema({ name: "mcp-client", version: "1.0.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      "string",
+    );
+
+    // Desktop 2.0, IDE, older CLI, and third-party clients keep token-saving "array" schema
+    assert.equal(await probeSchema({ name: "Antigravity 2.0", version: "2.34.0" }), "array");
+    assert.equal(await probeSchema({ name: "antigravity-ide", version: "2.7.0" }), "array");
+    assert.equal(await probeSchema({ name: "antigravity-cli", version: "1.4.9" }), "array");
+    // Third-party clients launched inside an agy shell must NOT inherit ambient CLI LS version
+    assert.equal(
+      await probeSchema({ name: "claude-code", version: "1.5.13" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      "array",
+    );
+    assert.equal(
+      await probeSchema({ name: "cursor", version: "0.49.0" }, { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" }),
+      "array",
+    );
+    assert.equal(
+      await probeSchema({ name: "antigravity-cli", version: "1.5.13.4" }),
+      "string",
+    );
+
+    // Explicit AGY_FAST_EDITS_FORMAT override works in both directions
+    assert.equal(
+      await probeSchema(
+        { name: "antigravity-cli", version: "1.5.14" },
+        { AGY_FAST_EDITS_FORMAT: "array" },
+      ),
+      "array",
+    );
+    assert.equal(
+      await probeSchema(
+        { name: "antigravity-ide", version: "2.7.0" },
+        { AGY_FAST_EDITS_FORMAT: "string" },
+      ),
+      "string",
+    );
   });
 
   it("resolves tool paths against the client's workspace root instead of its own cwd", async () => {

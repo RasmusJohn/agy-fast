@@ -965,6 +965,7 @@ function hasCorruptedAgyFastArgs(
     const eds = maybeParseJsonValue(inner.edits);
     if (typeof eds === "boolean" || eds === null) return true;
     if (Array.isArray(eds)) {
+      if (eds.length === 0) return true;
       return eds.some((e) => {
         if (!isPlainRecord(e)) return true;
         if (e.hunks !== undefined) {

@@ -76,14 +76,22 @@ export async function runChecks(
   const parsedCommands = parseMaybeJsonArray(input?.commands);
   if (!parsedCommands.ok) {
     if (
-      parsedCommands.kind === "wrong_type" &&
-      (typeof input?.commands === "boolean" || input?.commands === null)
+      parsedCommands.kind === "corrupted_literal" ||
+      (parsedCommands.kind === "wrong_type" &&
+        (typeof input?.commands === "boolean" || input?.commands === null))
     ) {
       return {
         text: formatCorruptedArrayError({
           header: "Validation failed",
           toolName: "run_checks",
-          items: [{ label: "commands", value: input.commands, expected: "an array of command specs" }],
+          items: [
+            {
+              label: "commands",
+              value:
+                parsedCommands.kind === "corrupted_literal" ? parsedCommands.value : input.commands,
+              expected: "an array of command specs",
+            },
+          ],
           fallbackAdvice: "immediately fall back to a single compound run_command call.",
         }),
         isError: true,

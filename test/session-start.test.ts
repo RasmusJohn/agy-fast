@@ -9,14 +9,24 @@ const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
 
 function runHook(
   stdinText: string,
-  extraEnv: NodeJS.ProcessEnv = {},
+  extraEnv: Record<string, string | undefined> = {},
 ): Promise<{ code: number | null; stdout: string; stderr: string; durationMs: number }> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, AGY_FAST_AUTO_UPDATE: "off" };
+    delete env.ANTIGRAVITY_LS_VERSION;
+    delete env.ANTIGRAVITY_APP_DATA_DIR;
+    delete env.AGY_FAST_HOST;
+    delete env.AGY_FAST_EDITS_FORMAT;
+    delete env.AGY_FAST_CACHE_DIR;
+    for (const [k, v] of Object.entries(extraEnv)) {
+      if (v === undefined) delete env[k];
+      else env[k] = v;
+    }
     const child = spawn(process.execPath, [HOOK_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      env: { ...process.env, AGY_FAST_AUTO_UPDATE: "off", ...extraEnv },
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -349,5 +359,50 @@ describe("session-start hook", () => {
     } finally {
       await fs.rm(cjkDir, { recursive: true, force: true });
     }
+  });
+
+  it("injects [agy-fast compat] notice only on affected CLI 1.5.x and adds 0 bytes on Desktop/IDE", async () => {
+    const cliRes = await runHook(
+      JSON.stringify({
+        cwd: plainDir,
+        transcriptPath: "/Users/dev/.gemini/antigravity-cli/brain/1/transcript.jsonl",
+      }),
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" },
+    );
+    assert.equal(cliRes.code, 0);
+    const cliMsg: string = JSON.parse(cliRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.ok(Buffer.byteLength(cliMsg, "utf8") <= 1500);
+    assert.match(cliMsg, /\[agy-fast compat\] host=cli@1\.5\.13/);
+    assert.match(cliMsg, /JSON array string/);
+
+    // Desktop 2.0 & IDE omit the compat line (0 extra tokens/bytes)
+    const desktopRes = await runHook(
+      JSON.stringify({
+        cwd: plainDir,
+        transcriptPath: "/Users/dev/.gemini/antigravity/brain/1/transcript.jsonl",
+      }),
+      { ANTIGRAVITY_LS_VERSION: "desktop-2.34.0" },
+    );
+    const desktopMsg: string = JSON.parse(desktopRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.doesNotMatch(desktopMsg, /\[agy-fast compat\]/);
+
+    // IDE path with conflicting ambient CLI env still resolves IDE (no compat notice)
+    const ideRes = await runHook(
+      JSON.stringify({
+        cwd: plainDir,
+        transcriptPath: "/Users/dev/.gemini/antigravity-ide/brain/1/transcript.jsonl",
+      }),
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13" },
+    );
+    const ideMsg: string = JSON.parse(ideRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.doesNotMatch(ideMsg, /\[agy-fast compat\]/);
+
+    // Explicit AGY_FAST_EDITS_FORMAT=array suppresses notice even on CLI 1.5.13
+    const overrideRes = await runHook(
+      JSON.stringify({ cwd: plainDir }),
+      { ANTIGRAVITY_LS_VERSION: "cli-1.5.13", AGY_FAST_EDITS_FORMAT: "array" },
+    );
+    const overrideMsg: string = JSON.parse(overrideRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+    assert.doesNotMatch(overrideMsg, /\[agy-fast compat\]/);
   });
 });

@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { McpStdioServer } from "./protocol/mcp.js";
+import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
 import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
+import {
+  readSavedEditsFormatSync,
+  resolveHostCompat,
+  type EditsFormatMode,
+  type ResolvedHostCompat,
+} from "./utils/host-compat.js";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
 import { runBatchSearch, type BatchSearchInput } from "./tools/batch-search.js";
 import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
@@ -9,7 +15,127 @@ import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
 const SERVER_VERSION = "0.2.6";
 
-export function createAgyFastServer(): McpStdioServer {
+export interface AgyFastServerOptions {
+  env?: NodeJS.ProcessEnv;
+  configEditsFormat?: EditsFormatMode;
+}
+
+function buildApplyEditsToolDefinition(
+  compat: ResolvedHostCompat,
+): McpToolDefinition {
+  const preferStringEdits = compat.editsFormat === "string";
+  const editsSchema = preferStringEdits
+    ? {
+        type: "string",
+        description:
+          'JSON array string of 1-50 files to edit or create: [{"path", "hunks"?: [{"target", "replacement", "startLine"?, "endLine"?, "replaceAll"?}], "create"?, "overwrite"?}]. A hunk replaces exact target text (optional 1-based line window; replaceAll replaces every occurrence in it); "create" writes the whole file instead of hunks, and "overwrite" allows replacing an existing file. A native array is also accepted, but this host version can deliver a long array of objects in call_mcp_tool Arguments as [] while a string arrives intact.',
+      }
+    : {
+        type: "array",
+        minItems: 1,
+        maxItems: 50,
+        description:
+          "Files to edit or create (a JSON array string of the same shape is also accepted).",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            hunks: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  target: { type: "string", description: "Exact text to replace." },
+                  replacement: { type: "string", description: "Replacement text." },
+                  startLine: {
+                    type: "integer",
+                    minimum: 1,
+                    description: "Optional 1-based start line to narrow matching.",
+                  },
+                  endLine: {
+                    type: "integer",
+                    minimum: 1,
+                    description: "Optional 1-based end line to narrow matching.",
+                  },
+                  replaceAll: {
+                    type: "boolean",
+                    description: "Replace every occurrence in range (default false).",
+                  },
+                },
+                required: ["target", "replacement"],
+              },
+            },
+            create: {
+              type: "string",
+              description: "Create file with this full content instead of hunks.",
+            },
+            overwrite: {
+              type: "boolean",
+              description: "Allow overwriting existing file when using 'create'.",
+            },
+          },
+          required: ["path"],
+        },
+      };
+
+  return {
+    name: "apply_edits",
+    description: preferStringEdits
+      ? "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command. Pass 'edits' as one JSON array string."
+      : "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: {
+          type: "string",
+          description:
+            "Base directory for relative file paths and verify command (defaults to the first workspace root).",
+        },
+        edits: editsSchema,
+        dryRun: {
+          type: "boolean",
+          description: "Validate all hunks without writing files (default false).",
+        },
+        bestEffort: {
+          type: "boolean",
+          description:
+            "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing).",
+        },
+        verify: {
+          type: "string",
+          description:
+            "Optional shell command run right after writing (e.g. 'npm run typecheck').",
+        },
+        verifyTimeoutSec: {
+          type: "integer",
+          minimum: 1,
+          maximum: MCP_CALL_BUDGET_SEC,
+          description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`,
+        },
+        maxVerifyChars: {
+          type: "integer",
+          minimum: 300,
+          maximum: 7500,
+          description:
+            "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes).",
+        },
+      },
+      required: ["edits"],
+    },
+  };
+}
+
+export function createAgyFastServer(
+  options: AgyFastServerOptions = {},
+): McpStdioServer {
+  const env = options.env ?? process.env;
+  const savedEditsFormat =
+    options.configEditsFormat ?? readSavedEditsFormatSync(env);
+  let hostCompat = resolveHostCompat({
+    env,
+    configEditsFormat: savedEditsFormat,
+  });
+
   // agy starts plugin servers in the plugin directory; resolve omitted or relative
   // tool `cwd` values against the first valid workspace root without mutating process.cwd().
   let defaultCwd: string | undefined;
@@ -43,6 +169,13 @@ export function createAgyFastServer(): McpStdioServer {
   const server = new McpStdioServer({
     name: "agy-fast",
     version: SERVER_VERSION,
+    onInitialize: ({ clientInfo }) => {
+      hostCompat = resolveHostCompat({
+        clientInfo,
+        env,
+        configEditsFormat: savedEditsFormat,
+      });
+    },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
@@ -150,93 +283,7 @@ export function createAgyFastServer(): McpStdioServer {
   );
 
   server.registerTool(
-    {
-      name: "apply_edits",
-      description:
-        "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Base directory for relative file paths and verify command (defaults to the first workspace root).",
-          },
-          edits: {
-            type: "array",
-            minItems: 1,
-            maxItems: 50,
-            description: "Files to edit or create.",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string" },
-                hunks: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      target: { type: "string", description: "Exact text to replace." },
-                      replacement: { type: "string", description: "Replacement text." },
-                      startLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based start line to narrow matching.",
-                      },
-                      endLine: {
-                        type: "integer",
-                        minimum: 1,
-                        description: "Optional 1-based end line to narrow matching.",
-                      },
-                      replaceAll: {
-                        type: "boolean",
-                        description: "Replace every occurrence in range (default false).",
-                      },
-                    },
-                    required: ["target", "replacement"],
-                  },
-                },
-                create: {
-                  type: "string",
-                  description: "Create file with this full content instead of hunks.",
-                },
-                overwrite: {
-                  type: "boolean",
-                  description: "Allow overwriting existing file when using 'create'.",
-                },
-              },
-              required: ["path"],
-            },
-          },
-          dryRun: {
-            type: "boolean",
-            description: "Validate all hunks without writing files (default false).",
-          },
-          bestEffort: {
-            type: "boolean",
-            description:
-              "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing).",
-          },
-          verify: {
-            type: "string",
-            description:
-              "Optional shell command run right after writing (e.g. 'npm run typecheck').",
-          },
-          verifyTimeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: MCP_CALL_BUDGET_SEC,
-            description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`,
-          },
-          maxVerifyChars: {
-            type: "integer",
-            minimum: 300,
-            maximum: 7500,
-            description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes).",
-          },
-        },
-        required: ["edits"],
-      },
-    },
+    () => buildApplyEditsToolDefinition(hostCompat),
     async (args) => {
       const resolved = resolveToolArgs<ApplyEditsInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };

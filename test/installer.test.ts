@@ -74,8 +74,24 @@ describe("installer", () => {
       encoding: "utf8",
     });
     assert.match(docOut, /MCP server\s+: OK/);
+    assert.match(docOut, /Host compat\s+: editsFormat=auto/);
     assert.match(docOut, /Version\s+: v\d+\.\d+\.\d+/);
     assert.match(docOut, /Auto-update\s+: auto/);
+    const cfgOut = execFileSync(
+      process.execPath,
+      [INSTALL_SCRIPT, "config", "--edits-format", "string"],
+      { env, encoding: "utf8" },
+    );
+    assert.match(cfgOut, /editsFormat\s+: string/);
+    const cfgDocOut = execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
+      env,
+      encoding: "utf8",
+    });
+    assert.match(cfgDocOut, /Host compat\s+: editsFormat=string \(active edits schema: string/);
+    execFileSync(process.execPath, [INSTALL_SCRIPT, "config", "--edits-format", "auto"], {
+      env,
+      encoding: "utf8",
+    });
     const installedDocOut = execFileSync(
       process.execPath,
       [path.join(expectedDir, "scripts", "install.mjs"), "doctor"],
@@ -83,12 +99,22 @@ describe("installer", () => {
     );
     assert.match(installedDocOut, /MCP server\s+: OK/);
 
-    // Re-install over existing directory succeeds idempotently
+    // Re-install over existing directory with --edits-format persists config cleanly
     execFileSync(
       process.execPath,
-      [INSTALL_SCRIPT, "install", "--no-enable"],
+      [INSTALL_SCRIPT, "install", "--no-enable", "--edits-format", "string"],
       { env, encoding: "utf8" },
     );
+    const afterInstallDoc = execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
+      env: { ...env, AGY_FAST_EDITS_FORMAT: "garbage", AGY_FAST_HOST: "garbage" },
+      encoding: "utf8",
+    });
+    assert.match(afterInstallDoc, /Host compat\s+: editsFormat=string \(active edits schema: string/);
+    assert.doesNotMatch(afterInstallDoc, /garbage/);
+    execFileSync(process.execPath, [INSTALL_SCRIPT, "config", "--edits-format", "auto"], {
+      env,
+      encoding: "utf8",
+    });
 
     // Uninstall removes directory
     const rmOut = execFileSync(

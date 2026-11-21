@@ -7,6 +7,15 @@ export interface McpToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
+export type McpToolDefinitionProvider =
+  | McpToolDefinition
+  | (() => McpToolDefinition);
+
+export interface McpClientInfo {
+  name?: string;
+  version?: string;
+}
+
 export interface McpToolResult {
   text: string;
   isError?: boolean;
@@ -17,7 +26,7 @@ export type McpToolHandler = (
 ) => Promise<McpToolResult>;
 
 export interface RegisteredTool {
-  definition: McpToolDefinition;
+  definition: McpToolDefinitionProvider;
   handler: McpToolHandler;
 }
 
@@ -60,6 +69,10 @@ export class McpStdioServer {
   private stdinEnded = false;
   private onDrainExit?: () => void;
   private readonly onWorkspaceRoots?: (paths: string[]) => void;
+  private readonly onInitialize?: (info: {
+    clientInfo?: McpClientInfo;
+    protocolVersion: string;
+  }) => void;
   private sendToClient?: (request: JsonRpcOutgoingRequest, useContentLength: boolean) => void;
   private clientSupportsRoots = false;
   private rootsRequestCount = 0;
@@ -75,11 +88,17 @@ export class McpStdioServer {
     version: string;
     // Receives the client's workspace root directories (MCP roots).
     onWorkspaceRoots?: (paths: string[]) => void;
+    // Receives client metadata during MCP initialize before tools/list is served.
+    onInitialize?: (info: {
+      clientInfo?: McpClientInfo;
+      protocolVersion: string;
+    }) => void;
     rootsTimeoutMs?: number;
   }) {
     this.serverName = options.name;
     this.serverVersion = options.version;
     this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.onInitialize = options.onInitialize;
     this.rootsTimeoutMs =
       typeof options.rootsTimeoutMs === "number" &&
       Number.isFinite(options.rootsTimeoutMs) &&
@@ -202,8 +221,12 @@ export class McpStdioServer {
     }
   }
 
-  registerTool(definition: McpToolDefinition, handler: McpToolHandler): void {
-    this.tools.set(definition.name, { definition, handler });
+  registerTool(
+    definition: McpToolDefinitionProvider,
+    handler: McpToolHandler,
+  ): void {
+    const name = typeof definition === "function" ? definition().name : definition.name;
+    this.tools.set(name, { definition, handler });
   }
 
   async handleMessage(
@@ -282,6 +305,24 @@ export class McpStdioServer {
         capabilities?.roots !== null &&
         typeof capabilities?.roots === "object" &&
         !Array.isArray(capabilities?.roots);
+      const rawClientInfo = msg.params?.clientInfo;
+      let clientInfo: McpClientInfo | undefined;
+      if (
+        rawClientInfo !== null &&
+        typeof rawClientInfo === "object" &&
+        !Array.isArray(rawClientInfo)
+      ) {
+        const ci = rawClientInfo as { name?: unknown; version?: unknown };
+        clientInfo = {
+          name: typeof ci.name === "string" ? ci.name : undefined,
+          version: typeof ci.version === "string" ? ci.version : undefined,
+        };
+      }
+      try {
+        this.onInitialize?.({ clientInfo, protocolVersion });
+      } catch {
+        // Never fail initialize due to optional host-compat inspection
+      }
       return {
         jsonrpc: "2.0",
         id,
@@ -303,7 +344,9 @@ export class McpStdioServer {
     }
 
     if (method === "tools/list") {
-      const definitions = [...this.tools.values()].map((t) => t.definition);
+      const definitions = [...this.tools.values()].map((t) =>
+        typeof t.definition === "function" ? t.definition() : t.definition,
+      );
       return { jsonrpc: "2.0", id, result: { tools: definitions } };
     }
 
