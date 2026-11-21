@@ -5,6 +5,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.8] - 2026-11-22
+
+### Added & Improved
+
+- **Eager MCP tool loading in `mcp_config.json` (#13, thanks `@kf953741`)**
+  - Enabled Antigravity's official per-tool `"eager": true` loading setting in `mcp_config.json` for all 4 tools (`batch_search`, `apply_edits`, `read_slices`, `run_checks`), registering typed native tool declarations (`mcp_agy-fast_fast_*`) upfront (~7.2 KB / ~1.9K cached input tokens total).
+  - Bypasses untyped lazy `call_mcp_tool` completely across both **Antigravity Desktop 2.0** and **Antigravity CLI ≥1.5.8**, eliminating nested-array serialization corruption (`edits: []` / `[null]` / `[-1]` / `[true]`) at the root cause while preserving token-saving native array `edits` (~3× fewer output tokens than double-escaped JSON strings).
+  - Updated `rules/AGENTS.md` Rule 1 & Rule 6 to invoke `mcp_agy-fast_fast_*` directly when eagerly loaded while keeping the direct lazy `call_mcp_tool` + quick-schema fallback intact for older hosts, and verified `"eager": true` persistence in `test/installer.test.ts`.
+- **Host compatibility controller alignment for eager CLI ≥1.5.8 (`src/utils/host-compat.ts`)**
+  - Capped the default `agy-cli-1.5-call-mcp-tool-empty-edits` rule at `maxVersionExclusive: "1.5.8"` so eager-capable Antigravity CLI `≥1.5.8` (including `1.5.12–1.5.14`), Desktop 2.0, IDE, and third-party hosts uniformly receive the typed native `array` `apply_edits` schema and `0` extra `SessionStart` bytes—preventing any split-brain mismatch between eager typed declarations and `SessionStart` hints.
+  - Preserved automatic JSON-string fallback for pre-eager CLI `1.5.0–1.5.7`, explicit `AGY_FAST_EDITS_FORMAT` / `config.json` overrides, dual-format runtime acceptance, and corrupted-argument circuit-breakers.
+
+### 简体中文摘要（v0.2.8）
+
+- **启用官方 `"eager": true` 急加载彻底根治 `call_mcp_tool` 参数损坏（#13，感谢 `@kf953741`）**：在 `mcp_config.json` 为 4 个工具启用官方 `"eager": true` 急加载，直接注册强类型原生声明 `mcp_agy-fast_fast_*`（总 Schema 仅 ~7.2 KB / ~1.9K 可缓存输入 tokens），在 **Antigravity 桌面端 2.0** 与 **CLI ≥1.5.8** 上彻底绕过无类型 `call_mcp_tool`，从根因消除 `edits: []`/`[null]`/`[-1]`/`[true]` 嵌套参数损坏并保留省 3× 输出 token 的原生数组传参；同时更新 `rules/AGENTS.md` 优先急加载直调并保留老宿主懒加载回退。
+- **宿主兼容控制器与急加载边界对齐（`src/utils/host-compat.ts`）**：为 `agy-cli-1.5-call-mcp-tool-empty-edits` 补齐 `maxVersionExclusive: "1.5.8"`，使支持急加载的 CLI ≥1.5.8、桌面端 2.0、IDE 与第三方客户端统一走强类型原生数组且 `SessionStart` 保持 0 额外字节（避免急加载 Schema 与启动提示脑裂），同时保留旧版懒加载 CLI `1.5.0–1.5.7` 的自动保护与 `AGY_FAST_EDITS_FORMAT` / `config.json` 覆盖。
+
+---
+
 ## [0.2.7] - 2026-11-21
 
 ### Added & Improved

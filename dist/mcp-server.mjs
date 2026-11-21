@@ -5800,7 +5800,7 @@ function clampInt2(val, min, max, fallback) {
 }
 
 // src/mcp-server.ts
-var SERVER_VERSION = "0.2.7";
+var SERVER_VERSION = "0.2.8";
 function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
   const editsSchema = preferStringEdits ? {

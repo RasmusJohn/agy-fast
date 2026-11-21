@@ -13,7 +13,7 @@ import { runBatchSearch, type BatchSearchInput } from "./tools/batch-search.js";
 import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
-const SERVER_VERSION = "0.2.7";
+const SERVER_VERSION = "0.2.8";
 
 export interface AgyFastServerOptions {
   env?: NodeJS.ProcessEnv;
