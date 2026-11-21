@@ -24,6 +24,12 @@ export const UPDATER_RUNTIME_FILES = [
 ] as const;
 
 export const UPDATER_OPTIONAL_FILES = [
+  "assets/logo-light.svg",
+  "assets/logo-dark.svg",
+  "assets/architecture-light.svg",
+  "assets/architecture-dark.svg",
+  "assets/architecture-zh-light.svg",
+  "assets/architecture-zh-dark.svg",
   "README.md",
   "README.zh-CN.md",
   "CHANGELOG.md",

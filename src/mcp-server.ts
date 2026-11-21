@@ -4,7 +4,7 @@ import { runBatchSearch, type BatchSearchInput } from "./tools/batch-search.js";
 import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
-const SERVER_VERSION = "0.2.5";
+const SERVER_VERSION = "0.2.6";
 
 export function createAgyFastServer(): McpStdioServer {
   const server = new McpStdioServer({

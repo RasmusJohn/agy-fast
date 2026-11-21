@@ -5,6 +5,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.6] - 2026-11-21
+
+### Security & Runtime Hardening (#7, thanks `@hzhe0083-source`)
+
+- **Untrusted `.git/config` & read-only Git sandbox hardening (`src/tools/batch-search.ts`, `src/utils/snapshot.ts`)**
+  - Neutralizes untrusted repository config execution across both `batch_search` and `SessionStart` snapshots via `-c core.fsmonitor=false -c diff.external= -c gpg.program=false -c gpg.openpgp.program=false -c gpg.ssh.program=false -c gpg.x509.program=false`, prepends `--no-ext-diff --no-textconv` for `diff`/`log`/`show`/`shortlog` and `--no-textconv` for `blame`, and blocks `--ext`/`--ext-*`/`--textc*` abbreviations.
+  - Restores read-only `git branch`/`tag` commit-filter flags (`--merged`, `--no-merged`, `--contains`, `--no-contains`, `--points-at`, and `tag -n`) while rejecting dash-prefixed tokens (including `--`) immediately after commit-filter flags to prevent option-parser desync bypasses, and keeps `tag -v`/`--verify` disabled.
+  - Injects `-n` on `git remote show` (avoiding network calls while leaving a remote named `show` unaffected in `remote get-url show`), rejects URL/path targets, and defaults `git shortlog` to `HEAD` under ignored stdin.
+- **MCP framing, `SessionStart` lifecycle & UTF-8 / UTF-16 surrogate safety (`src/protocol/mcp.ts`, `src/session-start.ts`, `src/utils/snapshot.ts`, `src/utils/output-filter.ts`)**
+  - Selects the earlier of `\r\n\r\n` and `\n\n` in `Content-Length` framing, strictly validates anchored `Content-Length` headers with `latin1` decoding and a 64 MiB frame cap, rejects empty `{}` requests with `-32600`, and normalizes stringified JSON object `params.arguments` while rejecting non-object values with `-32602`.
+  - Bounds `SessionStart` stdin reading to 256 KB, detaches listeners with `pause()` + `unref()` (retaining a no-op `error` handler for fail-open exit when hosts omit EOF), enforces a strict 1,500 UTF-8 byte ceiling across `snapshot + updateNotice`, and adds surrogate-safe slicing (`sliceSafeChars`) plus `Number.isFinite` guards on byte-budget helpers.
+- **`apply_edits`, EOL detection & auto-updater reliability (`src/tools/apply-edits.ts`, `src/utils/fs-utils.ts`, `src/utils/updater-core.ts`, `scripts/install.mjs`)**
+  - Protects dangling symlinks on `create` (`overwrite: false` rejects; `overwrite: true` restores on Phase-2 rollback and unlinks before rename-fallback writes), canonicalizes parent directory `realpath` for new-file dedup, validates `verify` before Phase-2 disk writes, and uses majority EOL detection in `readTextFile`.
+  - Fixes `main`-channel downgrade/redundant-overwrite guards, writes `plugin.json` last in atomic swaps with `finally` temp cleanup, fetches `git-clone` updates from the verified local staging directory (eliminating remote TOCTOU), keeps `dev-source` notify-only even with `--force`, and immediately reclaims stale locks held by dead PIDs (`ESRCH`).
+
+### Added & Improved
+
+- **Auto-sync global installs to T3 Code ACP & isolated `GEMINI_HOME` profiles (#7, thanks `@hzhe0083-source`)**
+  - `scripts/install.mjs` (`install` / `update` / `doctor` / `uninstall`) automatically discovers and symlinks (with copy fallback) isolated `~/.t3/userdata/providers/antigravity/*/` and `GEMINI_HOME` profiles while preserving profile `config.json` and enforcing target ownership checks (opt out via `--no-acp`).
+- **Search, multi-language outliners & multi-surface benchmark accuracy (`src/tools/batch-search.ts`, `src/tools/read-slices.ts`, `src/benchmark.ts`, `src/benchmark-core.ts`)**
+  - Fixes single-file `maxResults` truncation reporting, multi-file `contextLines` preservation, Node fallback multi-batch continuation when an earlier file hits `perFileCap`, and phantom EOF `^$` matches.
+  - Improves TSX/TS (JSX `</Tag>` & scoped self-closing `/>` without breaking `>`-prefixed regex literals like `/>/g`, multiline template literals), Python (multiline signatures & `.pyi`), Rust (lifetimes, `impl<T>`, trait bounds, block comments), Go (raw backtick strings ending in `\`, wrapped `interface{}` params, generic structs), and Shell (`${#var}`) outlining.
+  - Expands `benchmark analyze --local` to discover Antigravity Desktop 2.0, CLI, IDE, T3 Code ACP, `GEMINI_HOME`, and `ANTIGRAVITY_APP_DATA_DIR` brains; fixes middle-truncated JSON commands, direct MCP corrupted-arg detection, distinct `call_mcp_tool` chains, and `--since` coordinator/worker/snapshot identity preservation.
+- **Redesigned geometric logo & dual-theme SVG architecture diagrams (#6, thanks `@GoodCoder666`)**
+  - Replaced the icon with a flat two-tone geometric "A" mark (`assets/logo.svg`, `assets/logo-light.svg`, `assets/logo-dark.svg`) with automatic GitHub light/dark theme switching, and replaced README Mermaid diagrams with crisp custom light/dark English & Chinese SVG architecture diagrams (`assets/architecture-*.svg`).
+
+### 简体中文摘要（v0.2.6）
+
+- **不可信 `.git/config` 与只读 Git 沙箱全面加固（#7，感谢 `@hzhe0083-source`）**：为 `batch_search` 与 `SessionStart` 快照统一注入 `-c core.fsmonitor=false -c diff.external= -c gpg*.program=false`，为 `diff`/`log`/`show`/`shortlog` 补齐 `--no-ext-diff --no-textconv`；恢复 `branch`/`tag` 的 `--merged`/`--contains`/`--points-at` 等过滤参数并封堵紧跟 `--` 的选项解析脱同步绕过；保持禁用 `tag -v`/`--verify`；`remote show` 自动注入 `-n` 并拒绝 URL/路径，`shortlog` 无修订时默认 `HEAD`。
+- **全局安装自动同步 T3 Code ACP 与隔离 `GEMINI_HOME` 配置（#7）**：`install`/`update`/`doctor`/`uninstall` 自动发现并同步 `~/.t3/userdata/providers/antigravity/*/` 与 `GEMINI_HOME` 隔离配置（支持 `--no-acp` 关闭，保持原有归属校验且不触碰 `config.json`）。
+- **MCP 协议、SessionStart 与 UTF-8/代理对安全（#7）**：修复 `Content-Length` 混合换行分帧、严格行锚定与 64 MiB 帧上限、空请求 `-32600` 及字符串化对象参数解析；`SessionStart` 限制 256 KB stdin、无 EOF 时优雅释放且保留静默错误监听、严格保证 `snapshot + updateNotice <= 1500` UTF-8 字节且零孤立 UTF-16 代理对。
+- **`apply_edits`、自动更新器、搜索/大纲与基准分析全面修复（#7）**：悬空符号链接保护与回滚、多数行尾判定、防 `main` 通道降级、`plugin.json` 末位原子替换、本地 staging 防 TOCTOU、死 PID 锁回收；修复 Node 回退多批次早停、TSX/TS/Python/Rust/Go/Shell 大纲（并避免影响 `/>/g` 等正则字面量）及 `--local` 多端会话发现与 `--since` 身份保持。
+- **全新几何 Logo 与双主题 SVG 架构图（#6，感谢 `@GoodCoder666`）**：更新扁平双色几何 "A" Logo（支持 GitHub 明暗主题自动切换），并将中英文 README 的 Mermaid 架构图升级为定制明暗双主题 SVG 图。
+
+---
+
 ## [0.2.5] - 2026-11-21
 
 ### Security & Fixed

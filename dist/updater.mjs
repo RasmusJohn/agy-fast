@@ -174,6 +174,12 @@ var UPDATER_RUNTIME_FILES = [
   "LICENSE"
 ];
 var UPDATER_OPTIONAL_FILES = [
+  "assets/logo-light.svg",
+  "assets/logo-dark.svg",
+  "assets/architecture-light.svg",
+  "assets/architecture-dark.svg",
+  "assets/architecture-zh-light.svg",
+  "assets/architecture-zh-dark.svg",
   "README.md",
   "README.zh-CN.md",
   "CHANGELOG.md",
