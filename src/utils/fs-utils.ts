@@ -218,7 +218,7 @@ export async function walkFiles(
       return;
     }
 
-    entries.sort((a, b) => a.name.localeCompare(b.name));
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     const subdirs: Array<{ abs: string; rel: string }> = [];
 

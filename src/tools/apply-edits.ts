@@ -1,5 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import {
+  formatCorruptedArrayError,
+  isPlainObject,
+  parseMaybeJsonArray,
+  type CorruptedItem,
+} from "../utils/arg-validation.js";
 import { runShellCommandAsync } from "../utils/exec-utils.js";
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
@@ -279,7 +285,11 @@ function planHunksForContent(
   const errors: string[] = [];
 
   for (let idx = 0; idx < hunks.length; idx++) {
-    const hunk = hunks[idx]!;
+    const hunk = hunks[idx];
+    if (!isPlainObject(hunk)) {
+      errors.push(`${displayPath} hunk #${idx + 1}: must be an object with 'target' and 'replacement'`);
+      continue;
+    }
     if (typeof hunk.target !== "string" || hunk.target.length === 0) {
       errors.push(`${displayPath} hunk #${idx + 1}: 'target' must be a non-empty string`);
       continue;
@@ -491,15 +501,90 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
 export async function runApplyEdits(
   input: ApplyEditsInput,
 ): Promise<{ text: string; isError: boolean }> {
-  if (!Array.isArray(input.edits) || input.edits.length === 0) {
+  const parsedEdits = parseMaybeJsonArray(input?.edits);
+  if (!parsedEdits.ok) {
+    if (parsedEdits.kind === "wrong_type" && (typeof input?.edits === "boolean" || input?.edits === null)) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed (0 files modified)",
+          toolName: "apply_edits",
+          items: [{ label: "edits", value: input.edits, expected: "an array of edit objects" }],
+          fallbackAdvice:
+            "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
+        }),
+        isError: true,
+      };
+    }
     return {
       text: "Error: 'edits' must be a non-empty array of file edit objects.",
       isError: true,
     };
   }
-  if (input.edits.length > 50) {
+  const rawEdits = parsedEdits.value;
+  if (rawEdits.length === 0) {
+    return {
+      text: "Error: 'edits' must be a non-empty array of file edit objects.",
+      isError: true,
+    };
+  }
+  if (rawEdits.length > 50) {
     return {
       text: "Error: 'edits' supports at most 50 file entries per call.",
+      isError: true,
+    };
+  }
+
+  // Detect nested-JSON serialization corruption (e.g. edits: [true], [false, true], [null], or hunks: [true])
+  // before regular validation so the caller immediately falls back instead of retrying in a loop.
+  const corruptedItems: CorruptedItem[] = [];
+  const normalizedEdits: FileEdit[] = [];
+  for (let i = 0; i < rawEdits.length; i++) {
+    const rawEntry = rawEdits[i];
+    if (!isPlainObject(rawEntry)) {
+      corruptedItems.push({ label: `edits[${i}]`, value: rawEntry, expected: "an edit object" });
+      continue;
+    }
+    let normalizedHunks: EditHunk[] | undefined;
+    if (rawEntry.hunks !== undefined) {
+      const parsedHunks = parseMaybeJsonArray(rawEntry.hunks);
+      if (!parsedHunks.ok) {
+        corruptedItems.push({
+          label: `edits[${i}].hunks`,
+          value: rawEntry.hunks,
+          expected: "an array of hunk objects",
+        });
+        continue;
+      }
+      let hunkCorrupted = false;
+      for (let j = 0; j < parsedHunks.value.length; j++) {
+        if (!isPlainObject(parsedHunks.value[j])) {
+          corruptedItems.push({
+            label: `edits[${i}].hunks[${j}]`,
+            value: parsedHunks.value[j],
+            expected: "a hunk object",
+          });
+          hunkCorrupted = true;
+        }
+      }
+      if (hunkCorrupted) continue;
+      normalizedHunks = parsedHunks.value as unknown as EditHunk[];
+    }
+    normalizedEdits.push({
+      path: rawEntry.path as string,
+      hunks: normalizedHunks,
+      create: rawEntry.create as string | undefined,
+      overwrite: rawEntry.overwrite as boolean | undefined,
+    });
+  }
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed (0 files modified)",
+        toolName: "apply_edits",
+        items: corruptedItems,
+        fallbackAdvice:
+          "immediately fall back to parallel built-in edit_file / write_file calls for these file(s).",
+      }),
       isError: true,
     };
   }
@@ -520,9 +605,9 @@ export async function runApplyEdits(
   >();
   const errors: string[] = [];
 
-  for (let i = 0; i < input.edits.length; i++) {
-    const entry = input.edits[i]!;
-    if (!entry || typeof entry.path !== "string" || !entry.path.trim()) {
+  for (let i = 0; i < normalizedEdits.length; i++) {
+    const entry = normalizedEdits[i]!;
+    if (typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
       continue;
     }

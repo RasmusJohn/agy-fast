@@ -1,4 +1,10 @@
 import path from "node:path";
+import {
+  formatCorruptedArrayError,
+  isPlainObject,
+  parseMaybeJsonArray,
+  type CorruptedItem,
+} from "../utils/arg-validation.js";
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
@@ -1533,8 +1539,90 @@ function selectOutlineSymbols(symbols: SymbolEntry[], limit: number): SymbolEntr
 export async function runReadSlices(
   input: ReadSlicesInput,
 ): Promise<{ text: string; isError: boolean }> {
-  const outlines = Array.isArray(input.outlines) ? input.outlines : [];
-  const slices = Array.isArray(input.slices) ? input.slices : [];
+  const corruptedItems: CorruptedItem[] = [];
+  let outlines: string[] = [];
+  if (input?.outlines !== undefined) {
+    const parsedOutlines = parseMaybeJsonArray(input.outlines);
+    if (!parsedOutlines.ok) {
+      corruptedItems.push({
+        label: "outlines",
+        value: input.outlines,
+        expected: "an array of file path strings",
+      });
+    } else {
+      for (let i = 0; i < parsedOutlines.value.length; i++) {
+        const item = parsedOutlines.value[i];
+        if (typeof item !== "string" || !item.trim()) {
+          corruptedItems.push({
+            label: `outlines[${i}]`,
+            value: item,
+            expected: "a non-empty file path string",
+          });
+        }
+      }
+      if (corruptedItems.length === 0) {
+        outlines = parsedOutlines.value as string[];
+      }
+    }
+  }
+
+  let slices: SliceRequest[] = [];
+  if (input?.slices !== undefined) {
+    const parsedSlices = parseMaybeJsonArray(input.slices);
+    if (!parsedSlices.ok) {
+      corruptedItems.push({
+        label: "slices",
+        value: input.slices,
+        expected: "an array of slice objects ({ path, ranges })",
+      });
+    } else {
+      for (let i = 0; i < parsedSlices.value.length; i++) {
+        const item = parsedSlices.value[i];
+        if (!isPlainObject(item)) {
+          corruptedItems.push({
+            label: `slices[${i}]`,
+            value: item,
+            expected: "a slice object ({ path, ranges })",
+          });
+          continue;
+        }
+        if (item.ranges !== undefined && !Array.isArray(item.ranges)) {
+          corruptedItems.push({
+            label: `slices[${i}].ranges`,
+            value: item.ranges,
+            expected: "an array of [startLine, endLine] pairs",
+          });
+        } else if (Array.isArray(item.ranges)) {
+          for (let j = 0; j < item.ranges.length; j++) {
+            const r = item.ranges[j];
+            if (typeof r === "boolean" || r === null) {
+              corruptedItems.push({
+                label: `slices[${i}].ranges[${j}]`,
+                value: r,
+                expected: "a [startLine, endLine] pair",
+              });
+            }
+          }
+        }
+      }
+      if (corruptedItems.length === 0) {
+        slices = parsedSlices.value as unknown as SliceRequest[];
+      }
+    }
+  }
+
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "read_slices",
+        items: corruptedItems,
+        fallbackAdvice:
+          "immediately fall back to parallel built-in read_file(StartLine, EndLine) calls.",
+      }),
+      isError: true,
+    };
+  }
 
   if (outlines.length === 0 && slices.length === 0) {
     return {

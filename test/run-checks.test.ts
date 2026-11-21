@@ -111,4 +111,20 @@ describe("run_checks", () => {
     assert.match(res.text, /npm ERR! code ELIFECYCLE/);
     assert.match(res.text, /FAIL_TWO_MARKER/);
   });
+
+  it("circuit-breaks corrupted commands (boolean/null) and accepts stringified JSON arrays", async () => {
+    const bad = await runChecks({
+      commands: [true, null] as unknown as never[],
+    });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /nested argument serialization corruption/i);
+    assert.match(bad.text, /commands\[0\]: received boolean \(true\)/);
+    assert.match(bad.text, /commands\[1\]: received null/);
+
+    const ok = await runChecks({
+      commands: JSON.stringify([{ name: "json-ok", command: `${nodeBin} -e "console.log('ok')"` }]) as unknown as never[],
+    });
+    assert.equal(ok.isError, false);
+    assert.match(ok.text, /\[PASS/);
+  });
 });

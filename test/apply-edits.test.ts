@@ -478,4 +478,67 @@ describe("apply_edits", () => {
     assert.doesNotMatch(verifyBody, /incoming request/);
     assert.doesNotMatch(verifyBody, /\[Help 1\]/);
   });
+
+  it("circuit-breaks corrupted call_mcp_tool nested edits (booleans/null) and accepts stringified JSON arrays", async () => {
+    const file = path.join(tmpDir, "corrupt-test.ts");
+    await fs.writeFile(file, "export const x = 1;\n", "utf8");
+
+    // Client serialization bug: edits collapsed to [false, true] or [null]
+    const boolRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [false, true] as unknown as never[],
+    });
+    assert.equal(boolRes.isError, true);
+    assert.match(boolRes.text, /nested argument serialization corruption/i);
+    assert.match(boolRes.text, /edits\[0\]: received boolean \(false\)/);
+    assert.match(boolRes.text, /edits\[1\]: received boolean \(true\)/);
+    assert.match(boolRes.text, /Do NOT retry the same apply_edits payload/);
+    assert.match(boolRes.text, /edit_file/);
+
+    const nullRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [null, null] as unknown as never[],
+    });
+    assert.equal(nullRes.isError, true);
+    assert.match(nullRes.text, /edits\[0\]: received null/);
+
+    // Nested hunks collapsed to boolean/null
+    const hunkRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [{ path: "corrupt-test.ts", hunks: [true] }] as unknown as never[],
+    });
+    assert.equal(hunkRes.isError, true);
+    assert.match(hunkRes.text, /edits\[0\]\.hunks\[0\]: received boolean \(true\)/);
+
+    const hunksBoolRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [{ path: "corrupt-test.ts", hunks: true }] as unknown as never[],
+    });
+    assert.equal(hunksBoolRes.isError, true);
+    assert.match(hunksBoolRes.text, /edits\[0\]\.hunks: received boolean \(true\)/);
+
+    // Top-level edits collapsed to boolean
+    const topBool = await runApplyEdits({
+      cwd: tmpDir,
+      edits: true as unknown as never[],
+    });
+    assert.equal(topBool.isError, true);
+    assert.match(topBool.text, /edits: received boolean \(true\)/);
+
+    // Verify file remained untouched
+    assert.equal(await fs.readFile(file, "utf8"), "export const x = 1;\n");
+
+    // Stringified JSON array tolerance works cleanly
+    const stringifiedRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: JSON.stringify([
+        {
+          path: "corrupt-test.ts",
+          hunks: [{ target: "export const x = 1;", replacement: "export const x = 42;" }],
+        },
+      ]) as unknown as never[],
+    });
+    assert.equal(stringifiedRes.isError, false);
+    assert.equal(await fs.readFile(file, "utf8"), "export const x = 42;\n");
+  });
 });

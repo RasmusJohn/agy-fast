@@ -258,6 +258,64 @@ ${serialized}`);
 import { promises as fs2 } from "node:fs";
 import path2 from "node:path";
 
+// src/utils/arg-validation.ts
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function describeValueType(value) {
+  if (value === null) return "null";
+  if (value === void 0) return "undefined";
+  if (Array.isArray(value)) return `array (len=${value.length})`;
+  if (typeof value === "boolean") return `boolean (${String(value)})`;
+  if (typeof value === "number") return `number (${String(value)})`;
+  if (typeof value === "string") return `string (len=${value.length})`;
+  return typeof value;
+}
+function parseMaybeJsonArray(value) {
+  if (value === void 0) {
+    return { ok: false, kind: "missing", detail: "undefined" };
+  }
+  if (Array.isArray(value)) {
+    return { ok: true, value };
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return { ok: true, value: parsed };
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          kind: "invalid_json",
+          detail: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+  }
+  return {
+    ok: false,
+    kind: "wrong_type",
+    detail: describeValueType(value)
+  };
+}
+function formatCorruptedArrayError(options) {
+  const details = options.items.slice(0, 8).map(
+    (item) => `- ${item.label}: received ${describeValueType(item.value)} instead of ${item.expected ?? "an object"}`
+  );
+  if (options.items.length > 8) {
+    details.push(`- ... (+${options.items.length - 8} more corrupted entries)`);
+  }
+  return [
+    `${options.header}: nested argument serialization corruption detected in call_mcp_tool.`,
+    ...details,
+    "",
+    `Hint: untyped call_mcp_tool Arguments can occasionally collapse nested objects/arrays into booleans or null. Do NOT retry the same ${options.toolName} payload \u2014 ${options.fallbackAdvice}`
+  ].join("\n");
+}
+
 // src/utils/exec-utils.ts
 import { spawn } from "node:child_process";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -590,7 +648,7 @@ async function walkFiles(rootDir, options = {}) {
     } catch {
       return;
     }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
     const subdirs = [];
     for (const entry of entries) {
       if (truncated) return;
@@ -1014,6 +1072,10 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
   const errors = [];
   for (let idx = 0; idx < hunks.length; idx++) {
     const hunk = hunks[idx];
+    if (!isPlainObject(hunk)) {
+      errors.push(`${displayPath} hunk #${idx + 1}: must be an object with 'target' and 'replacement'`);
+      continue;
+    }
     if (typeof hunk.target !== "string" || hunk.target.length === 0) {
       errors.push(`${displayPath} hunk #${idx + 1}: 'target' must be a non-empty string`);
       continue;
@@ -1189,24 +1251,94 @@ async function commitPlannedWrites(plans) {
   }
 }
 async function runApplyEdits(input) {
-  if (!Array.isArray(input.edits) || input.edits.length === 0) {
+  const parsedEdits = parseMaybeJsonArray(input?.edits);
+  if (!parsedEdits.ok) {
+    if (parsedEdits.kind === "wrong_type" && (typeof input?.edits === "boolean" || input?.edits === null)) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed (0 files modified)",
+          toolName: "apply_edits",
+          items: [{ label: "edits", value: input.edits, expected: "an array of edit objects" }],
+          fallbackAdvice: "immediately fall back to parallel built-in edit_file / write_file calls for these file(s)."
+        }),
+        isError: true
+      };
+    }
     return {
       text: "Error: 'edits' must be a non-empty array of file edit objects.",
       isError: true
     };
   }
-  if (input.edits.length > 50) {
+  const rawEdits = parsedEdits.value;
+  if (rawEdits.length === 0) {
+    return {
+      text: "Error: 'edits' must be a non-empty array of file edit objects.",
+      isError: true
+    };
+  }
+  if (rawEdits.length > 50) {
     return {
       text: "Error: 'edits' supports at most 50 file entries per call.",
+      isError: true
+    };
+  }
+  const corruptedItems = [];
+  const normalizedEdits = [];
+  for (let i = 0; i < rawEdits.length; i++) {
+    const rawEntry = rawEdits[i];
+    if (!isPlainObject(rawEntry)) {
+      corruptedItems.push({ label: `edits[${i}]`, value: rawEntry, expected: "an edit object" });
+      continue;
+    }
+    let normalizedHunks;
+    if (rawEntry.hunks !== void 0) {
+      const parsedHunks = parseMaybeJsonArray(rawEntry.hunks);
+      if (!parsedHunks.ok) {
+        corruptedItems.push({
+          label: `edits[${i}].hunks`,
+          value: rawEntry.hunks,
+          expected: "an array of hunk objects"
+        });
+        continue;
+      }
+      let hunkCorrupted = false;
+      for (let j = 0; j < parsedHunks.value.length; j++) {
+        if (!isPlainObject(parsedHunks.value[j])) {
+          corruptedItems.push({
+            label: `edits[${i}].hunks[${j}]`,
+            value: parsedHunks.value[j],
+            expected: "a hunk object"
+          });
+          hunkCorrupted = true;
+        }
+      }
+      if (hunkCorrupted) continue;
+      normalizedHunks = parsedHunks.value;
+    }
+    normalizedEdits.push({
+      path: rawEntry.path,
+      hunks: normalizedHunks,
+      create: rawEntry.create,
+      overwrite: rawEntry.overwrite
+    });
+  }
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed (0 files modified)",
+        toolName: "apply_edits",
+        items: corruptedItems,
+        fallbackAdvice: "immediately fall back to parallel built-in edit_file / write_file calls for these file(s)."
+      }),
       isError: true
     };
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
-  for (let i = 0; i < input.edits.length; i++) {
-    const entry = input.edits[i];
-    if (!entry || typeof entry.path !== "string" || !entry.path.trim()) {
+  for (let i = 0; i < normalizedEdits.length; i++) {
+    const entry = normalizedEdits[i];
+    if (typeof entry.path !== "string" || !entry.path.trim()) {
       errors.push(`edits[${i}]: 'path' must be a non-empty string`);
       continue;
     }
@@ -1435,9 +1567,35 @@ function findContiguousIndex(haystack, needle) {
   }
   return -1;
 }
+function isAscii(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) return false;
+  }
+  return true;
+}
 function subsequenceCost(needle, haystack) {
   if (!needle) return 2147483647;
-  const lowered = [...haystack].flatMap((ch) => [...ch.toLowerCase()]);
+  if (isAscii(needle) && isAscii(haystack)) {
+    const query2 = needle.toLowerCase();
+    const lowered2 = haystack.toLowerCase();
+    const contiguousAt2 = lowered2.indexOf(query2);
+    if (contiguousAt2 >= 0) {
+      return contiguousAt2 === 0 ? -100 : -60 + Math.min(25, contiguousAt2);
+    }
+    let cursor2 = 0;
+    let first2 = -1;
+    let last2 = -1;
+    const hLen = lowered2.length;
+    for (let i = 0; i < query2.length; i++) {
+      const targetCode = query2.charCodeAt(i);
+      while (cursor2 < hLen && lowered2.charCodeAt(cursor2) !== targetCode) cursor2++;
+      if (cursor2 === hLen) return void 0;
+      if (first2 < 0) first2 = cursor2;
+      last2 = cursor2++;
+    }
+    return Math.max(0, last2 - first2 + 1 - query2.length) - (first2 === 0 ? 20 : 0);
+  }
+  const lowered = [...haystack.toLowerCase()];
   const query = [...needle.toLowerCase()];
   const contiguousAt = findContiguousIndex(lowered, query);
   if (contiguousAt >= 0) {
@@ -1480,7 +1638,7 @@ function rankFuzzyPaths(query, candidates, maxResults) {
     const score = fuzzyScorePath(query, candidate);
     if (score >= 0) scored.push({ path: candidate, score });
   }
-  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path));
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return {
     matches: scored.slice(0, maxResults),
     totalMatched: scored.length
@@ -1630,6 +1788,11 @@ function validateReadonlyGitArgs(pattern) {
   }
   const rest = tokens.slice(1);
   for (const arg of rest) {
+    if (arg === "&&" || arg === "||" || arg === ";" || arg === "|") {
+      throw new Error(
+        `Shell operator '${arg}' is not supported in git queries; split chained commands into separate batch_search queries`
+      );
+    }
     const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
     if (FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) || arg.startsWith("--output=") || arg.startsWith("-c") && arg.length > 2) {
       throw new Error(`Flag '${arg}' is not allowed in read-only git query`);
@@ -1871,12 +2034,26 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   }
   if (summary) {
     const files2 = [];
-    const records = query.outputMode === "count" ? res.stdout.matchAll(/([^\0]+)\0(\d+)\r?\n/g) : res.stdout.matchAll(/([^\0]+)\0/g);
-    for (const [, rawFile, count] of records) {
+    const out = res.stdout;
+    let pos = 0;
+    while (pos < out.length) {
+      const nul = out.indexOf("\0", pos);
+      if (nul === -1) break;
+      const rawFile = out.slice(pos, nul);
+      let count = 0;
+      if (query.outputMode === "count") {
+        let nl = out.indexOf("\n", nul + 1);
+        if (nl === -1) nl = out.length;
+        const rawCount = out.slice(nul + 1, nl).trim();
+        count = Number(rawCount);
+        pos = nl + 1;
+      } else {
+        pos = nul + 1;
+      }
       if (!rawFile || !matchesType(rawFile)) continue;
-      files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number(count ?? 0) });
+      files2.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
-    files2.sort((a, b) => a.file.localeCompare(b.file));
+    files2.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
     return {
       files: files2.slice(0, maxResults),
       totalMatches: 0,
@@ -1963,7 +2140,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       totalMatches++;
     }
   }
-  const files = [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([file, lineMap]) => ({
+  const files = [...byFile.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([file, lineMap]) => ({
     file,
     lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
   }));
@@ -2059,7 +2236,13 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     });
     discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path3.join(searchRoot, rel));
-    if (summary) targetFiles.sort((a, b) => relativeFile(baseCwd, a).localeCompare(relativeFile(baseCwd, b)));
+    if (summary) {
+      targetFiles.sort((a, b) => {
+        const ra = relativeFile(baseCwd, a);
+        const rb = relativeFile(baseCwd, b);
+        return ra < rb ? -1 : ra > rb ? 1 : 0;
+      });
+    }
   }
   const files = [];
   let totalMatches = 0;
@@ -2187,7 +2370,7 @@ function buildGlobFallbackPlan(pattern) {
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
   const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
-  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
@@ -2196,7 +2379,7 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
-    sortedFiles.sort((a, b) => mtimes.get(b) - mtimes.get(a) || a.localeCompare(b));
+    sortedFiles.sort((a, b) => mtimes.get(b) - mtimes.get(a) || (a < b ? -1 : a > b ? 1 : 0));
   }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
@@ -2215,7 +2398,7 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
     const bucket = slash === -1 ? "(root)" : `${f.slice(0, slash)}/`;
     dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
   }
-  const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
+  const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, 6).map(([dir, cnt]) => `${dir} (${cnt})`);
   const totalLabel = walked.truncated ? `${walked.files.length}+` : String(walked.files.length);
   const dirSummary = topDirs.length > 0 ? `; omitted dirs: ${topDirs.join(", ")}` : "";
   const suffix = `
@@ -2404,18 +2587,59 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 async function runBatchSearch(input, options = {}) {
-  if (!Array.isArray(input.queries) || input.queries.length === 0) {
+  const parsedQueries = parseMaybeJsonArray(input?.queries);
+  if (!parsedQueries.ok) {
+    if (parsedQueries.kind === "wrong_type" && (typeof input?.queries === "boolean" || input?.queries === null)) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed",
+          toolName: "batch_search",
+          items: [{ label: "queries", value: input.queries, expected: "an array of query objects" }],
+          fallbackAdvice: "split into smaller queries or use a single compound read-only run_command."
+        }),
+        isError: true
+      };
+    }
     return {
       text: "Error: 'queries' must be a non-empty array of search queries.",
       isError: true
     };
   }
-  if (input.queries.length > 20) {
+  const rawQueries = parsedQueries.value;
+  if (rawQueries.length === 0) {
+    return {
+      text: "Error: 'queries' must be a non-empty array of search queries.",
+      isError: true
+    };
+  }
+  if (rawQueries.length > 20) {
     return {
       text: "Error: 'queries' supports at most 20 queries per call.",
       isError: true
     };
   }
+  const corruptedQueries = [];
+  for (let i = 0; i < rawQueries.length; i++) {
+    if (!isPlainObject(rawQueries[i])) {
+      corruptedQueries.push({
+        label: `queries[${i}]`,
+        value: rawQueries[i],
+        expected: "a query object ({ type, pattern, ... })"
+      });
+    }
+  }
+  if (corruptedQueries.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "batch_search",
+        items: corruptedQueries,
+        fallbackAdvice: "split into smaller queries or use a single compound read-only run_command."
+      }),
+      isError: true
+    };
+  }
+  const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
     const st = await fs3.stat(baseCwd);
@@ -2427,12 +2651,12 @@ async function runBatchSearch(input, options = {}) {
   }
   const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const needsTextSearch = input.queries.some(
+  const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex"
   );
   const useRg = needsTextSearch && !options.forceNodeFallback && await isRipgrepAvailable();
   const sections = await Promise.all(
-    input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
   );
   return {
     text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
@@ -3729,8 +3953,87 @@ function selectOutlineSymbols(symbols, limit) {
   return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
 }
 async function runReadSlices(input) {
-  const outlines = Array.isArray(input.outlines) ? input.outlines : [];
-  const slices = Array.isArray(input.slices) ? input.slices : [];
+  const corruptedItems = [];
+  let outlines = [];
+  if (input?.outlines !== void 0) {
+    const parsedOutlines = parseMaybeJsonArray(input.outlines);
+    if (!parsedOutlines.ok) {
+      corruptedItems.push({
+        label: "outlines",
+        value: input.outlines,
+        expected: "an array of file path strings"
+      });
+    } else {
+      for (let i = 0; i < parsedOutlines.value.length; i++) {
+        const item = parsedOutlines.value[i];
+        if (typeof item !== "string" || !item.trim()) {
+          corruptedItems.push({
+            label: `outlines[${i}]`,
+            value: item,
+            expected: "a non-empty file path string"
+          });
+        }
+      }
+      if (corruptedItems.length === 0) {
+        outlines = parsedOutlines.value;
+      }
+    }
+  }
+  let slices = [];
+  if (input?.slices !== void 0) {
+    const parsedSlices = parseMaybeJsonArray(input.slices);
+    if (!parsedSlices.ok) {
+      corruptedItems.push({
+        label: "slices",
+        value: input.slices,
+        expected: "an array of slice objects ({ path, ranges })"
+      });
+    } else {
+      for (let i = 0; i < parsedSlices.value.length; i++) {
+        const item = parsedSlices.value[i];
+        if (!isPlainObject(item)) {
+          corruptedItems.push({
+            label: `slices[${i}]`,
+            value: item,
+            expected: "a slice object ({ path, ranges })"
+          });
+          continue;
+        }
+        if (item.ranges !== void 0 && !Array.isArray(item.ranges)) {
+          corruptedItems.push({
+            label: `slices[${i}].ranges`,
+            value: item.ranges,
+            expected: "an array of [startLine, endLine] pairs"
+          });
+        } else if (Array.isArray(item.ranges)) {
+          for (let j = 0; j < item.ranges.length; j++) {
+            const r = item.ranges[j];
+            if (typeof r === "boolean" || r === null) {
+              corruptedItems.push({
+                label: `slices[${i}].ranges[${j}]`,
+                value: r,
+                expected: "a [startLine, endLine] pair"
+              });
+            }
+          }
+        }
+      }
+      if (corruptedItems.length === 0) {
+        slices = parsedSlices.value;
+      }
+    }
+  }
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "read_slices",
+        items: corruptedItems,
+        fallbackAdvice: "immediately fall back to parallel built-in read_file(StartLine, EndLine) calls."
+      }),
+      isError: true
+    };
+  }
   if (outlines.length === 0 && slices.length === 0) {
     return {
       text: "Error: provide at least one entry in 'outlines' or 'slices'.",
@@ -3891,15 +4194,56 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 async function runChecks(input) {
-  if (!Array.isArray(input.commands) || input.commands.length === 0) {
+  const parsedCommands = parseMaybeJsonArray(input?.commands);
+  if (!parsedCommands.ok) {
+    if (parsedCommands.kind === "wrong_type" && (typeof input?.commands === "boolean" || input?.commands === null)) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed",
+          toolName: "run_checks",
+          items: [{ label: "commands", value: input.commands, expected: "an array of command specs" }],
+          fallbackAdvice: "immediately fall back to a single compound run_command call."
+        }),
+        isError: true
+      };
+    }
     return {
       text: "Error: 'commands' must be a non-empty array of check commands.",
       isError: true
     };
   }
-  if (input.commands.length > 12) {
+  const rawCommands = parsedCommands.value;
+  if (rawCommands.length === 0) {
+    return {
+      text: "Error: 'commands' must be a non-empty array of check commands.",
+      isError: true
+    };
+  }
+  if (rawCommands.length > 12) {
     return {
       text: "Error: 'commands' supports at most 12 commands per call.",
+      isError: true
+    };
+  }
+  const corruptedCommands = [];
+  for (let i = 0; i < rawCommands.length; i++) {
+    const raw = rawCommands[i];
+    if (typeof raw !== "string" && !isPlainObject(raw)) {
+      corruptedCommands.push({
+        label: `commands[${i}]`,
+        value: raw,
+        expected: "a command string or object ({ name?, command, cwd?, timeoutSec? })"
+      });
+    }
+  }
+  if (corruptedCommands.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "run_checks",
+        items: corruptedCommands,
+        fallbackAdvice: "immediately fall back to a single compound run_command call."
+      }),
       isError: true
     };
   }
@@ -3918,8 +4262,8 @@ async function runChecks(input) {
   const maxChars = clampInt2(input.maxChars ?? 8e3, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const normalized = [];
-  for (let i = 0; i < input.commands.length; i++) {
-    const raw = input.commands[i];
+  for (let i = 0; i < rawCommands.length; i++) {
+    const raw = rawCommands[i];
     const spec = typeof raw === "string" ? { command: raw } : raw;
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {

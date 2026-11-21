@@ -39,7 +39,8 @@
     "update:plugin": "node scripts/install.mjs update",
     "uninstall:plugin": "node scripts/install.mjs uninstall",
     "doctor": "node scripts/install.mjs doctor",
-    "benchmark": "node dist/benchmark.mjs"
+    "benchmark": "node dist/benchmark.mjs",
+    "bench:stress": "npm run build && node scripts/stress-benchmark.mjs"
   },
   "keywords": [
     "antigravity",

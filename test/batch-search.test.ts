@@ -543,4 +543,37 @@ describe("batch_search", () => {
     assert.match(exactRes.text, /proxy\/exactfile/);
     assert.doesNotMatch(exactRes.text, /auto-expanded|showing case-insensitive/);
   });
+
+  it("circuit-breaks corrupted queries (boolean/null) without crashing and accepts stringified JSON arrays", async () => {
+    const corrupt = await runBatchSearch({
+      cwd: tmpDir,
+      queries: [null, true] as unknown as never[],
+    });
+    assert.equal(corrupt.isError, true);
+    assert.match(corrupt.text, /nested argument serialization corruption/i);
+    assert.match(corrupt.text, /queries\[0\]: received null/);
+    assert.match(corrupt.text, /queries\[1\]: received boolean \(true\)/);
+
+    const topCorrupt = await runBatchSearch({
+      cwd: tmpDir,
+      queries: false as unknown as never[],
+    });
+    assert.equal(topCorrupt.isError, true);
+    assert.match(topCorrupt.text, /queries: received boolean \(false\)/);
+
+    const stringified = await runBatchSearch({
+      cwd: tmpDir,
+      queries: JSON.stringify([{ type: "text", pattern: "getUsers", path: "src/api/routes.ts" }]) as unknown as never[],
+    });
+    assert.equal(stringified.isError, false);
+    assert.match(stringified.text, /getUsers/);
+
+    // Shell chaining operators in git queries are rejected with clear guidance
+    const chainedGit = await runBatchSearch({
+      cwd: tmpDir,
+      queries: [{ type: "git", pattern: "status && diff --stat" }],
+    });
+    assert.equal(chainedGit.isError, false);
+    assert.match(chainedGit.text, /Shell operator '&&' is not supported/);
+  });
 });

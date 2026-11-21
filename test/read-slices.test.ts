@@ -561,4 +561,29 @@ describe("read_slices", () => {
     assert.match(sliceRes.text, /  L3-L4 \[method\] empty/);
     assert.match(sliceRes.text, /L6-L7 \[function\] sync_slots/);
   });
+
+  it("circuit-breaks corrupted outlines/slices arguments cleanly without throwing", async () => {
+    const badOutlines = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [true, null] as unknown as string[],
+    });
+    assert.equal(badOutlines.isError, true);
+    assert.match(badOutlines.text, /nested argument serialization corruption/i);
+    assert.match(badOutlines.text, /outlines\[0\]: received boolean \(true\)/);
+
+    const badSlices = await runReadSlices({
+      cwd: tmpDir,
+      slices: [false] as unknown as never[],
+    });
+    assert.equal(badSlices.isError, true);
+    assert.match(badSlices.text, /slices\[0\]: received boolean \(false\)/);
+    assert.match(badSlices.text, /read_file/);
+
+    const stringified = await runReadSlices({
+      cwd: tmpDir,
+      outlines: JSON.stringify(["inventory.gd"]) as unknown as string[],
+    });
+    assert.equal(stringified.isError, false);
+    assert.match(stringified.text, /L1 \[class_name\] Inventory/);
+  });
 });

@@ -19,10 +19,40 @@ function findContiguousIndex(haystack: string[], needle: string[]): number {
   return -1;
 }
 
+function isAscii(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 0x7f) return false;
+  }
+  return true;
+}
+
 /** Compute subsequence span cost (smaller is better); operates on Unicode code points. */
 export function subsequenceCost(needle: string, haystack: string): number | undefined {
   if (!needle) return 2147483647;
-  const lowered = [...haystack].flatMap(ch => [...ch.toLowerCase()]);
+
+  // Zero-allocation ASCII fast path (covers ~99.9% of source file paths)
+  if (isAscii(needle) && isAscii(haystack)) {
+    const query = needle.toLowerCase();
+    const lowered = haystack.toLowerCase();
+    const contiguousAt = lowered.indexOf(query);
+    if (contiguousAt >= 0) {
+      return contiguousAt === 0 ? -100 : -60 + Math.min(25, contiguousAt);
+    }
+    let cursor = 0;
+    let first = -1;
+    let last = -1;
+    const hLen = lowered.length;
+    for (let i = 0; i < query.length; i++) {
+      const targetCode = query.charCodeAt(i);
+      while (cursor < hLen && lowered.charCodeAt(cursor) !== targetCode) cursor++;
+      if (cursor === hLen) return undefined;
+      if (first < 0) first = cursor;
+      last = cursor++;
+    }
+    return Math.max(0, last - first + 1 - query.length) - (first === 0 ? 20 : 0);
+  }
+
+  const lowered = [...haystack.toLowerCase()];
   const query = [...needle.toLowerCase()];
   const contiguousAt = findContiguousIndex(lowered, query);
   if (contiguousAt >= 0) {
@@ -78,7 +108,7 @@ export function rankFuzzyPaths(
     const score = fuzzyScorePath(query, candidate);
     if (score >= 0) scored.push({ path: candidate, score });
   }
-  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || a.path.localeCompare(b.path));
+  scored.sort((a, b) => b.score - a.score || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return {
     matches: scored.slice(0, maxResults),
     totalMatched: scored.length,

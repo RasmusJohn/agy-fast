@@ -854,5 +854,68 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(hm.multiRunCommandTurns, 1);
     assert.equal(hm.mediaLoadedCount, 1);
     assert.equal(hm.multimodalHighCtxTurns, 2);
+
+    // Corrupted MCP argument tracking + swarm worker coverage tracking
+    const corruptedSession = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-20T21:54:59Z",
+          content: "<USER_REQUEST>fix bug</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T21:55:00Z",
+          output_tokens: 9000,
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: "agy-fast_fast",
+                ToolName: "apply_edits",
+                Arguments: { cwd: "/repo", edits: [false, true] },
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-20T21:56:10Z",
+          status: "ERROR",
+          content: "Encountered error in step execution: Validation failed (0 files modified)",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T21:56:12Z",
+          output_tokens: 200,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+    const swarmWorkerSession = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-21T01:03:00Z",
+          content: "[Message] @builder do work",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-21T01:03:05Z",
+          output_tokens: 300,
+          tool_calls: [{ name: "read_board", args: {} }],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-21T01:03:06Z",
+        }),
+      ].join("\n"),
+    );
+    const cm = analyzeTranscriptSessions([corruptedSession, swarmWorkerSession]);
+    assert.equal(cm.agyCorruptedArgCalls, 1);
+    assert.equal(cm.agyCorruptedArgWastedSec, 72);
+    assert.equal(cm.agyCorruptedArgWastedOutTokens, 9000);
+    assert.equal(cm.swarmWorkerSessions, 1);
+    assert.equal(cm.swarmWorkerSessionsWithAgyFast, 0);
   });
 });

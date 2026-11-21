@@ -1,4 +1,10 @@
 import { promises as fs } from "node:fs";
+import {
+  formatCorruptedArrayError,
+  isPlainObject,
+  parseMaybeJsonArray,
+  type CorruptedItem,
+} from "../utils/arg-validation.js";
 import { runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
 import { resolvePath } from "../utils/fs-utils.js";
 import {
@@ -64,15 +70,60 @@ async function mapWithConcurrency<T, R>(
 export async function runChecks(
   input: RunChecksInput,
 ): Promise<{ text: string; isError: boolean }> {
-  if (!Array.isArray(input.commands) || input.commands.length === 0) {
+  const parsedCommands = parseMaybeJsonArray(input?.commands);
+  if (!parsedCommands.ok) {
+    if (
+      parsedCommands.kind === "wrong_type" &&
+      (typeof input?.commands === "boolean" || input?.commands === null)
+    ) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed",
+          toolName: "run_checks",
+          items: [{ label: "commands", value: input.commands, expected: "an array of command specs" }],
+          fallbackAdvice: "immediately fall back to a single compound run_command call.",
+        }),
+        isError: true,
+      };
+    }
     return {
       text: "Error: 'commands' must be a non-empty array of check commands.",
       isError: true,
     };
   }
-  if (input.commands.length > 12) {
+  const rawCommands = parsedCommands.value;
+  if (rawCommands.length === 0) {
+    return {
+      text: "Error: 'commands' must be a non-empty array of check commands.",
+      isError: true,
+    };
+  }
+  if (rawCommands.length > 12) {
     return {
       text: "Error: 'commands' supports at most 12 commands per call.",
+      isError: true,
+    };
+  }
+
+  const corruptedCommands: CorruptedItem[] = [];
+  for (let i = 0; i < rawCommands.length; i++) {
+    const raw = rawCommands[i];
+    if (typeof raw !== "string" && !isPlainObject(raw)) {
+      corruptedCommands.push({
+        label: `commands[${i}]`,
+        value: raw,
+        expected: "a command string or object ({ name?, command, cwd?, timeoutSec? })",
+      });
+    }
+  }
+  if (corruptedCommands.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "run_checks",
+        items: corruptedCommands,
+        fallbackAdvice: "immediately fall back to a single compound run_command call.",
+      }),
       isError: true,
     };
   }
@@ -94,10 +145,10 @@ export async function runChecks(
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
 
   const normalized: NormalizedCommand[] = [];
-  for (let i = 0; i < input.commands.length; i++) {
-    const raw = input.commands[i];
+  for (let i = 0; i < rawCommands.length; i++) {
+    const raw = rawCommands[i];
     const spec: CheckCommandSpec =
-      typeof raw === "string" ? { command: raw } : (raw as CheckCommandSpec);
+      typeof raw === "string" ? { command: raw } : (raw as unknown as CheckCommandSpec);
     if (!spec || typeof spec.command !== "string" || !spec.command.trim()) {
       return {
         text: `Error: commands[${i}] must contain a non-empty 'command' string.`,

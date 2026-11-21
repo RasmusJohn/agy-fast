@@ -635,6 +635,86 @@ function sessionHasStartupSnapshot(steps) {
   }
   return false;
 }
+function isPlainRecord(val) {
+  return val !== null && typeof val === "object" && !Array.isArray(val);
+}
+function extractAgyFastInnerArgs(call) {
+  const outer = getCallArgs(call);
+  if (!outer) return null;
+  if ((call.name ?? "") !== "call_mcp_tool") return outer;
+  let inner = outer.Arguments ?? outer.arguments;
+  for (let i = 0; i < 2 && typeof inner === "string"; i++) {
+    try {
+      inner = JSON.parse(inner);
+    } catch {
+      break;
+    }
+  }
+  return isPlainRecord(inner) ? inner : null;
+}
+function hasCorruptedAgyFastArgs(call, fastTool) {
+  const inner = extractAgyFastInnerArgs(call);
+  if (!inner) return false;
+  if (fastTool === "apply_edits") {
+    const eds = inner.edits;
+    if (typeof eds === "boolean" || eds === null) return true;
+    if (Array.isArray(eds)) {
+      return eds.some((e) => {
+        if (!isPlainRecord(e)) return true;
+        if (e.hunks !== void 0) {
+          if (typeof e.hunks === "boolean" || e.hunks === null) return true;
+          if (Array.isArray(e.hunks) && e.hunks.some((h) => !isPlainRecord(h))) {
+            return true;
+          }
+        }
+        return false;
+      });
+    }
+    return false;
+  }
+  if (fastTool === "batch_search") {
+    const qs = inner.queries;
+    if (typeof qs === "boolean" || qs === null) return true;
+    return Array.isArray(qs) && qs.some((q) => !isPlainRecord(q));
+  }
+  if (fastTool === "read_slices") {
+    const outlines = inner.outlines;
+    if (typeof outlines === "boolean" || outlines === null) return true;
+    if (Array.isArray(outlines) && outlines.some((p) => typeof p !== "string")) {
+      return true;
+    }
+    const slices = inner.slices;
+    if (typeof slices === "boolean" || slices === null) return true;
+    return Array.isArray(slices) && slices.some((s) => !isPlainRecord(s));
+  }
+  if (fastTool === "run_checks") {
+    const cmds = inner.commands;
+    if (typeof cmds === "boolean" || cmds === null) return true;
+    return Array.isArray(cmds) && cmds.some((c) => typeof c !== "string" && !isPlainRecord(c));
+  }
+  return false;
+}
+function isSwarmWorkerSession(steps) {
+  let hasUserRequest = false;
+  let hasSwarmWorkerTool = false;
+  for (const step of steps) {
+    if (step.type === "USER_INPUT") {
+      const text = typeof step.content === "string" ? step.content : "";
+      if (text.includes("<USER_REQUEST>") || text.trim().length > 0) {
+        hasUserRequest = true;
+      }
+    }
+    if (step.type === "PLANNER_RESPONSE" && Array.isArray(step.tool_calls)) {
+      for (const tc of step.tool_calls) {
+        const n = tc.name ?? "";
+        if (n === "read_board" || n === "post_message" || n === "swarm_wait") {
+          hasSwarmWorkerTool = true;
+        }
+      }
+    }
+  }
+  return hasSwarmWorkerTool && !hasUserRequest;
+}
 function sessionUsesAgyFast(steps) {
   for (const step of steps) {
     if (step.type !== "PLANNER_RESPONSE" || !Array.isArray(step.tool_calls)) {
@@ -685,6 +765,11 @@ function analyzeTranscriptSessions(sessions) {
   let mcpSpillCalls = 0;
   let agyTruncatedCalls = 0;
   let agyErrorCalls = 0;
+  let agyCorruptedArgCalls = 0;
+  let agyCorruptedArgWastedSec = 0;
+  let agyCorruptedArgWastedOutTokens = 0;
+  let swarmWorkerSessions = 0;
+  let swarmWorkerSessionsWithAgyFast = 0;
   let multiMcpTurns = 0;
   let multiRunCommandTurns = 0;
   let mediaLoadedCount = 0;
@@ -761,6 +846,7 @@ function analyzeTranscriptSessions(sessions) {
         (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
       );
       const agyCallIndices = [];
+      let turnCorruptedAgyCalls = 0;
       if (calls.length > 0) {
         toolTurns += 1;
         totalToolCalls += calls.length;
@@ -803,6 +889,10 @@ function analyzeTranscriptSessions(sessions) {
               sessionFastCalls += 1;
               mcpCallsThisTurn += 1;
               agyCallIndices.push(callIdx);
+              if (hasCorruptedAgyFastArgs(call, fastTool)) {
+                agyCorruptedArgCalls += 1;
+                turnCorruptedAgyCalls += 1;
+              }
             }
           }
         }
@@ -843,6 +933,7 @@ function analyzeTranscriptSessions(sessions) {
           agyErrorCalls += 1;
         }
       }
+      let turnActiveSec = 0;
       if (tPlanner !== null && !hasBlockingTool) {
         if (genericTimes.length > 0) {
           const firstGeneric = genericTimes[0];
@@ -853,21 +944,31 @@ function analyzeTranscriptSessions(sessions) {
           if (llmSec <= 600) {
             llmTimeSec += llmSec;
             activeTimeSec += llmSec;
+            turnActiveSec += llmSec;
           }
           if (spreadSec <= 600) {
             streamWaitSec += spreadSec;
             activeTimeSec += spreadSec;
+            turnActiveSec += spreadSec;
           }
           if (execSec <= 600) {
             toolExecTimeSec += execSec;
             activeTimeSec += execSec;
+            turnActiveSec += execSec;
           }
         } else if (nextPlannerMs !== null) {
           const spanSec = Math.max(0, (nextPlannerMs - tPlanner) / 1e3);
           if (spanSec <= 600) {
             llmTimeSec += spanSec;
             activeTimeSec += spanSec;
+            turnActiveSec += spanSec;
           }
+        }
+      }
+      if (turnCorruptedAgyCalls > 0) {
+        agyCorruptedArgWastedSec += turnActiveSec;
+        if (Number.isFinite(outTok) && outTok > 0) {
+          agyCorruptedArgWastedOutTokens += outTok;
         }
       }
     }
@@ -875,6 +976,10 @@ function analyzeTranscriptSessions(sessions) {
       validSessions += 1;
       if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
       if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
+      if (isSwarmWorkerSession(steps)) {
+        swarmWorkerSessions += 1;
+        if (sessionFastCalls > 0) swarmWorkerSessionsWithAgyFast += 1;
+      }
     }
   }
   return {
@@ -900,6 +1005,11 @@ function analyzeTranscriptSessions(sessions) {
     mcpSpillCalls,
     agyTruncatedCalls,
     agyErrorCalls,
+    agyCorruptedArgCalls,
+    agyCorruptedArgWastedSec: round2(agyCorruptedArgWastedSec),
+    agyCorruptedArgWastedOutTokens,
+    swarmWorkerSessions,
+    swarmWorkerSessionsWithAgyFast,
     multiMcpTurns,
     multiRunCommandTurns,
     mediaLoadedCount,
@@ -1143,6 +1253,12 @@ function formatMetricsMarkdown(m) {
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
     `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`,
     `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
+    ...m.agyCorruptedArgCalls > 0 ? [
+      `| agy-fast corrupted-arg calls | ${m.agyCorruptedArgCalls} (wasted ${m.agyCorruptedArgWastedSec.toFixed(1)}s, ${m.agyCorruptedArgWastedOutTokens.toLocaleString("en-US")} out tok) |`
+    ] : [],
+    ...m.swarmWorkerSessions > 0 ? [
+      `| Swarm worker coverage | ${m.swarmWorkerSessionsWithAgyFast}/${m.swarmWorkerSessions} using agy-fast |`
+    ] : [],
     `| Parallel batching leaks (multi-MCP / multi-run_command turns) | ${m.multiMcpTurns} / ${m.multiRunCommandTurns} |`,
     `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`
   ].join("\n");
@@ -1198,6 +1314,12 @@ function formatUsageSplitMarkdown(split) {
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
     `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
     `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
+    ...overall.agyCorruptedArgCalls > 0 ? [
+      `| agy-fast corrupted-arg calls | ${overall.agyCorruptedArgCalls} (${overall.agyCorruptedArgWastedSec.toFixed(1)}s) | 0 | ${wf.agyCorruptedArgCalls} (${wf.agyCorruptedArgWastedSec.toFixed(1)}s) | - |`
+    ] : [],
+    ...overall.swarmWorkerSessions > 0 ? [
+      `| Swarm worker sessions | ${overall.swarmWorkerSessions} | ${wo.swarmWorkerSessions} | ${wf.swarmWorkerSessions} | - |`
+    ] : [],
     `| Parallel leaks (multi-MCP / multi-run_command) | ${overall.multiMcpTurns} / ${overall.multiRunCommandTurns} | ${wo.multiMcpTurns} / ${wo.multiRunCommandTurns} | ${wf.multiMcpTurns} / ${wf.multiRunCommandTurns} | - |`,
     `| Multimodal >=180k turns (media) | ${overall.multimodalHighCtxTurns} (${overall.mediaLoadedCount}) | ${wo.multimodalHighCtxTurns} (${wo.mediaLoadedCount}) | ${wf.multimodalHighCtxTurns} (${wf.mediaLoadedCount}) | - |`
   ].join("\n");

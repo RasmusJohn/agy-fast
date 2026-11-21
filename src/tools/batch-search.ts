@@ -1,5 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import {
+  formatCorruptedArrayError,
+  isPlainObject,
+  parseMaybeJsonArray,
+  type CorruptedItem,
+} from "../utils/arg-validation.js";
 import { execBinaryAsync, isRipgrepAvailable } from "../utils/exec-utils.js";
 import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
@@ -196,6 +202,11 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
 
   const rest = tokens.slice(1);
   for (const arg of rest) {
+    if (arg === "&&" || arg === "||" || arg === ";" || arg === "|") {
+      throw new Error(
+        `Shell operator '${arg}' is not supported in git queries; split chained commands into separate batch_search queries`,
+      );
+    }
     const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
     if (
       FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) ||
@@ -473,14 +484,26 @@ async function runTextOrRegexWithRg(
 
   if (summary) {
     const files: FileMatches[] = [];
-    const records = query.outputMode === "count"
-      ? res.stdout.matchAll(/([^\0]+)\0(\d+)\r?\n/g)
-      : res.stdout.matchAll(/([^\0]+)\0/g);
-    for (const [, rawFile, count] of records) {
+    const out = res.stdout;
+    let pos = 0;
+    while (pos < out.length) {
+      const nul = out.indexOf("\0", pos);
+      if (nul === -1) break;
+      const rawFile = out.slice(pos, nul);
+      let count = 0;
+      if (query.outputMode === "count") {
+        let nl = out.indexOf("\n", nul + 1);
+        if (nl === -1) nl = out.length;
+        const rawCount = out.slice(nul + 1, nl).trim();
+        count = Number(rawCount);
+        pos = nl + 1;
+      } else {
+        pos = nul + 1;
+      }
       if (!rawFile || !matchesType(rawFile)) continue;
-      files.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number(count ?? 0) });
+      files.push({ file: relativeFile(baseCwd, rawFile), lines: [], count: Number.isFinite(count) ? count : 0 });
     }
-    files.sort((a, b) => a.file.localeCompare(b.file));
+    files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
     return {
       files: files.slice(0, maxResults),
       totalMatches: 0,
@@ -593,7 +616,7 @@ async function runTextOrRegexWithRg(
   }
 
   const files: FileMatches[] = [...byFile.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([file, lineMap]) => ({
       file,
       lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber),
@@ -708,7 +731,13 @@ async function runTextOrRegexWithNode(
     });
     discoveryTruncated = walked.truncated;
     targetFiles = walked.files.map((rel) => path.join(searchRoot, rel));
-    if (summary) targetFiles.sort((a, b) => relativeFile(baseCwd, a).localeCompare(relativeFile(baseCwd, b)));
+    if (summary) {
+      targetFiles.sort((a, b) => {
+        const ra = relativeFile(baseCwd, a);
+        const rb = relativeFile(baseCwd, b);
+        return ra < rb ? -1 : ra > rb ? 1 : 0;
+      });
+    }
   }
 
   const files: FileMatches[] = [];
@@ -869,7 +898,7 @@ async function formatGlobWalkResult(
   notePrefix?: string,
 ): Promise<string> {
   const relPrefix = toPosixPath(path.relative(baseCwd, searchRoot));
-  const sortedFiles = [...walked.files].sort((a, b) => a.localeCompare(b));
+  const sortedFiles = [...walked.files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (sortBy === "mtime") {
     const mtimes = new Map<string, number>();
     for (let i = 0; i < sortedFiles.length; i += 32) {
@@ -878,7 +907,7 @@ async function formatGlobWalkResult(
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
-    sortedFiles.sort((a, b) => mtimes.get(b)! - mtimes.get(a)! || a.localeCompare(b));
+    sortedFiles.sort((a, b) => mtimes.get(b)! - mtimes.get(a)! || (a < b ? -1 : a > b ? 1 : 0));
   }
   const items = sortedFiles.slice(0, maxResults).map((f) => {
     if (!relPrefix || relPrefix === ".") return f;
@@ -900,7 +929,7 @@ async function formatGlobWalkResult(
     dirCounts.set(bucket, (dirCounts.get(bucket) ?? 0) + 1);
   }
   const topDirs = [...dirCounts.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .slice(0, 6)
     .map(([dir, cnt]) => `${dir} (${cnt})`);
   const totalLabel = walked.truncated
@@ -1134,18 +1163,65 @@ export async function runBatchSearch(
   input: BatchSearchInput,
   options: BatchSearchRuntimeOptions = {},
 ): Promise<{ text: string; isError: boolean }> {
-  if (!Array.isArray(input.queries) || input.queries.length === 0) {
+  const parsedQueries = parseMaybeJsonArray(input?.queries);
+  if (!parsedQueries.ok) {
+    if (
+      parsedQueries.kind === "wrong_type" &&
+      (typeof input?.queries === "boolean" || input?.queries === null)
+    ) {
+      return {
+        text: formatCorruptedArrayError({
+          header: "Validation failed",
+          toolName: "batch_search",
+          items: [{ label: "queries", value: input.queries, expected: "an array of query objects" }],
+          fallbackAdvice:
+            "split into smaller queries or use a single compound read-only run_command.",
+        }),
+        isError: true,
+      };
+    }
     return {
       text: "Error: 'queries' must be a non-empty array of search queries.",
       isError: true,
     };
   }
-  if (input.queries.length > 20) {
+  const rawQueries = parsedQueries.value;
+  if (rawQueries.length === 0) {
+    return {
+      text: "Error: 'queries' must be a non-empty array of search queries.",
+      isError: true,
+    };
+  }
+  if (rawQueries.length > 20) {
     return {
       text: "Error: 'queries' supports at most 20 queries per call.",
       isError: true,
     };
   }
+
+  const corruptedQueries: CorruptedItem[] = [];
+  for (let i = 0; i < rawQueries.length; i++) {
+    if (!isPlainObject(rawQueries[i])) {
+      corruptedQueries.push({
+        label: `queries[${i}]`,
+        value: rawQueries[i],
+        expected: "a query object ({ type, pattern, ... })",
+      });
+    }
+  }
+  if (corruptedQueries.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "batch_search",
+        items: corruptedQueries,
+        fallbackAdvice:
+          "split into smaller queries or use a single compound read-only run_command.",
+      }),
+      isError: true,
+    };
+  }
+  const queries = rawQueries as unknown as SearchQuery[];
 
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
@@ -1159,14 +1235,14 @@ export async function runBatchSearch(
 
   const maxChars = clampInt(input.maxChars ?? 8_500, 500, DEFAULT_INLINE_MAX_BYTES);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const needsTextSearch = input.queries.some(
+  const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex",
   );
   const useRg =
     needsTextSearch && !options.forceNodeFallback && (await isRipgrepAvailable());
 
   const sections = await Promise.all(
-    input.queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
+    queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
   );
 
   // Allocate budget fairly across queries via water-filling within maxChars & inline UTF-8 byte ceiling
