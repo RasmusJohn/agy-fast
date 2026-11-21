@@ -323,7 +323,7 @@ ${serialized}`);
 
 // src/tools/apply-edits.ts
 import { promises as fs2 } from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 
 // src/utils/arg-validation.ts
 function isPlainObject(value) {
@@ -384,8 +384,111 @@ function formatCorruptedArrayError(options) {
 }
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsSystem32Binary(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -425,7 +528,181 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-function runShellCommandAsync(command, options) {
+var WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE = /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
+var WINDOWS_PS_UNQUOTED_SYNTAX_RE = /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
+var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
+var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
+function stripQuotedSpans(command, stripDoubleQuotes) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+          out += " ";
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && next === '"') {
+        i++;
+        if (!stripDoubleQuotes) out += ch + next;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+          if (!stripDoubleQuotes) out += '""';
+        } else {
+          quote = null;
+          out += stripDoubleQuotes ? " " : '"';
+        }
+        continue;
+      }
+      if (!stripDoubleQuotes) out += ch;
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      out += stripDoubleQuotes ? " " : '"';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+function needsPowerShellOnWindows(command) {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  const withoutSingle = stripQuotedSpans(command, false);
+  if (WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE.test(withoutSingle)) {
+    return true;
+  }
+  const unquoted = stripQuotedSpans(command, true);
+  return WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) || WINDOWS_PS_CMDLET_RE.test(unquoted);
+}
+function formatPowerShellCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed[0] !== '"' && trimmed[0] !== "'") {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (quote === '"' && trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      if (trimmed[idx + 1] === quote) {
+        idx += 2;
+        continue;
+      }
+      const afterQuote = trimmed.slice(idx + 1);
+      if (!/^\s+/.test(afterQuote)) {
+        return command;
+      }
+      const rest = afterQuote.trimStart();
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+function buildPowerShellUtf8Command(command) {
+  return `${PS_UTF8_PREFIX} ${formatPowerShellCommand(command)}`;
+}
+var cachedWindowsPowerShell;
+var cachedWindowsPowerShellExecPath = null;
+var pendingWindowsPowerShellProbe = null;
+async function defaultProbeWindowsShell(bin) {
+  const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
+  const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
+  const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
+    cwd,
+    timeoutMs: 2e3,
+    maxOutputBytes: 4096
+  });
+  if (!whereRes.error && !whereRes.timedOut) {
+    if (whereRes.exitCode !== 0) return false;
+    const resolved = whereRes.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line));
+    if (!resolved) return false;
+    cachedWindowsPowerShellExecPath = resolved;
+    return true;
+  }
+  const res = await execBinaryAsync(
+    exeQuery,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd,
+      timeoutMs: 3e3,
+      maxOutputBytes: 4096
+    }
+  );
+  if (!res.error && !res.timedOut && res.exitCode === 0) {
+    cachedWindowsPowerShellExecPath = exeQuery;
+    return true;
+  }
+  return false;
+}
+async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
+  if (cachedWindowsPowerShell !== void 0) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+  return pendingWindowsPowerShellProbe;
+}
+async function runShellCommandAsync(command, options) {
+  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
+    const psBin = await resolveWindowsPowerShell();
+    if (psBin) {
+      const utf8Command = buildPowerShellUtf8Command(command);
+      return spawnAndCollect(
+        cachedWindowsPowerShellExecPath ?? psBin,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+        false,
+        options
+      );
+    }
+  }
   return spawnAndCollect(command, [], true, options);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
@@ -435,7 +712,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -485,22 +763,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -508,14 +786,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
@@ -544,7 +822,7 @@ async function isRipgrepAvailable() {
 // src/utils/fs-utils.ts
 import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
+import path2 from "node:path";
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   ".git",
   ".hg",
@@ -574,17 +852,17 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
 function expandHome(inputPath) {
   if (inputPath === "~") return os.homedir();
   if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path.join(os.homedir(), inputPath.slice(2));
+    return path2.join(os.homedir(), inputPath.slice(2));
   }
   return inputPath;
 }
 function resolvePath(inputPath, baseDir) {
   const expanded = expandHome(inputPath.trim());
-  const root = baseDir ? path.resolve(expandHome(baseDir)) : process.cwd();
-  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(root, expanded);
+  const root = baseDir ? path2.resolve(expandHome(baseDir)) : process.cwd();
+  return path2.isAbsolute(expanded) ? path2.normalize(expanded) : path2.resolve(root, expanded);
 }
 function toPosixPath(p) {
-  return p.split(path.sep).join("/");
+  return p.split(path2.sep).join("/");
 }
 function isLikelyBinary(buf) {
   const limit = Math.min(buf.length, 8192);
@@ -733,7 +1011,7 @@ async function walkFiles(rootDir, options = {}) {
           continue;
         }
       }
-      const absPath = path.join(dir, name);
+      const absPath = path2.join(dir, name);
       const relPosix = relDir ? `${relDir}/${name}` : name;
       if (entry.isDirectory()) {
         if (ignoreDirs.has(name)) continue;
@@ -1303,7 +1581,7 @@ async function commitPlannedWrites(plans) {
   try {
     for (const plan of plans) {
       const target = plan.writeTargetPath;
-      const dir = path2.dirname(target);
+      const dir = path3.dirname(target);
       await fs2.mkdir(dir, { recursive: true });
       const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       try {
@@ -1496,12 +1774,12 @@ async function runApplyEdits(input) {
       writeTargetPath = await fs2.realpath(absPath);
     } catch {
       try {
-        const realParent = await fs2.realpath(path2.dirname(absPath));
-        writeTargetPath = path2.join(realParent, path2.basename(absPath));
+        const realParent = await fs2.realpath(path3.dirname(absPath));
+        writeTargetPath = path3.join(realParent, path3.basename(absPath));
       } catch {
       }
     }
-    const relPath = toPosixPath(path2.relative(baseCwd, absPath)) || path2.basename(absPath);
+    const relPath = toPosixPath(path3.relative(baseCwd, absPath)) || path3.basename(absPath);
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
     if (!hasCreate && !hasHunks) {
@@ -1741,7 +2019,7 @@ ${formatted}`
 
 // src/tools/batch-search.ts
 import { promises as fs3 } from "node:fs";
-import path3 from "node:path";
+import path4 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -2204,7 +2482,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path3.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path4.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
@@ -2342,8 +2620,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     const rawText = ev.data?.lines?.text ?? (ev.data?.lines?.bytes ? Buffer.from(ev.data.lines.bytes, "base64").toString("utf8") : "");
     const lineText = rawText.replace(/\r?\n$/, "");
     if (!rawFile || !matchesType(rawFile) || typeof lineNumber !== "number") continue;
-    const absFile = path3.isAbsolute(rawFile) ? rawFile : path3.resolve(baseCwd, rawFile);
-    const relFile = toPosixPath(path3.relative(baseCwd, absFile)) || path3.basename(absFile);
+    const absFile = path4.isAbsolute(rawFile) ? rawFile : path4.resolve(baseCwd, rawFile);
+    const relFile = toPosixPath(path4.relative(baseCwd, absFile)) || path4.basename(absFile);
     if (ev.type === "context") {
       if (lastKeptMatchFile === relFile && lastKeptMatchLine !== -1 && lineNumber > lastKeptMatchLine && lineNumber <= lastKeptMatchLine + contextLines) {
         upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
@@ -2473,7 +2751,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
+    const relPosix = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
   } else {
     const includeHidden = Boolean(
@@ -2485,7 +2763,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       fileFilter: globMatchesFile
     });
     discoveryTruncated = walked.truncated;
-    targetFiles = walked.files.map((rel) => path3.join(searchRoot, rel));
+    targetFiles = walked.files.map((rel) => path4.join(searchRoot, rel));
     if (summary) {
       targetFiles.sort((a, b) => {
         const ra = relativeFile(baseCwd, a);
@@ -2632,13 +2910,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path3.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path4.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs3.lstat(path3.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs3.lstat(path4.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -2675,8 +2953,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
   if (isFileTarget) {
-    const rel = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
-    const base = path3.basename(searchRoot);
+    const rel = toPosixPath(path4.relative(baseCwd, searchRoot)) || path4.basename(searchRoot);
+    const base = path4.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -2727,7 +3005,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path3.relative(baseCwd, path3.resolve(baseCwd, file))) || path3.basename(file);
+  return toPosixPath(path4.relative(baseCwd, path4.resolve(baseCwd, file))) || path4.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
@@ -2735,7 +3013,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchesType = fileTypeMatcher(query.fileType);
   const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
   const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path3.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path4.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
   const footer = walked.truncated || totalMatched > maxResults ? `
@@ -2886,7 +3164,7 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path3.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path4.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd);
       return `${header}
 ${out}`;
@@ -3015,7 +3293,7 @@ function clampInt(val, min, max) {
 }
 
 // src/tools/read-slices.ts
-import path4 from "node:path";
+import path5 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -4282,7 +4560,7 @@ function extractSfcSymbols(lines) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path4.extname(filePath).toLowerCase();
+  const ext = path5.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -4466,7 +4744,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -4500,7 +4778,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
           return "## Slice: (invalid)\nERROR: 'path' must be a non-empty string";
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+        const relPath = toPosixPath(path5.relative(baseCwd, absPath)) || path5.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return `## Slice: ${relPath}
 ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;

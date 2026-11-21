@@ -3,18 +3,121 @@
 
 
 // src/updater.ts
-import path2 from "node:path";
+import path3 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/utils/updater-core.ts
 import { spawn as spawn2 } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
-import path from "node:path";
+import path2 from "node:path";
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsSystem32Binary(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -61,7 +164,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -111,22 +215,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -134,14 +238,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
@@ -191,12 +295,12 @@ function getHomeDir(env = process.env) {
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const cacheDir = custom ? path.resolve(custom) : path.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  const cacheDir = custom ? path2.resolve(custom) : path2.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
   return {
     cacheDir,
-    stateFile: path.join(cacheDir, "update-state.json"),
-    configFile: path.join(cacheDir, "config.json"),
-    lockFile: path.join(cacheDir, "update.lock")
+    stateFile: path2.join(cacheDir, "update-state.json"),
+    configFile: path2.join(cacheDir, "config.json"),
+    lockFile: path2.join(cacheDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -270,7 +374,7 @@ async function readJsonFile(filePath) {
   return null;
 }
 async function writeJsonAtomically(filePath, data) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.mkdir(path2.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
@@ -322,7 +426,7 @@ async function resolveUpdaterSettings(env = process.env) {
 }
 async function readInstalledVersion(pluginDir) {
   const manifest = await readJsonFile(
-    path.join(pluginDir, "plugin.json")
+    path2.join(pluginDir, "plugin.json")
   );
   if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
     return manifest.version.trim();
@@ -338,14 +442,14 @@ async function pathExists(p) {
   }
 }
 async function detectInstallKind(pluginDir) {
-  const resolved = path.resolve(pluginDir);
+  const resolved = path2.resolve(pluginDir);
   try {
     const lst = await fs.lstat(resolved);
     if (lst.isSymbolicLink()) return "symlink";
   } catch {
     return "copied";
   }
-  const hasGit = await pathExists(path.join(resolved, ".git"));
+  const hasGit = await pathExists(path2.join(resolved, ".git"));
   if (hasGit) {
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
       cwd: resolved,
@@ -354,14 +458,14 @@ async function detectInstallKind(pluginDir) {
     if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
       return "git-dirty";
     }
-    const norm = resolved.split(path.sep).join("/").toLowerCase();
+    const norm = resolved.split(path2.sep).join("/").toLowerCase();
     const isPluginInstallDir = norm.endsWith("/plugins/agy-fast") || norm.includes("/plugins/agy-fast/");
     if (!isPluginInstallDir) {
       return "dev-source";
     }
     return "git-clone";
   }
-  if (await pathExists(path.join(resolved, "src"))) {
+  if (await pathExists(path2.join(resolved, "src"))) {
     return "dev-source";
   }
   return "copied";
@@ -443,17 +547,17 @@ async function fetchLatestRemoteVersion(opts) {
 }
 async function verifyStagedPlugin(stagingDir) {
   for (const rel of UPDATER_RUNTIME_FILES) {
-    if (!await pathExists(path.join(stagingDir, rel))) {
+    if (!await pathExists(path2.join(stagingDir, rel))) {
       return { ok: false, version: "0.0.0", reason: `Missing required file: ${rel}` };
     }
   }
   const manifest = await readJsonFile(
-    path.join(stagingDir, "plugin.json")
+    path2.join(stagingDir, "plugin.json")
   );
   if (!manifest || manifest.name !== "agy-fast" || typeof manifest.version !== "string" || !parseSemver(manifest.version)) {
     return { ok: false, version: "0.0.0", reason: "Invalid staged plugin.json manifest" };
   }
-  const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
+  const mcpPath = path2.join(stagingDir, "dist", "mcp-server.mjs");
   const smokeOk = await new Promise((resolve) => {
     const child = spawn2(process.execPath, [mcpPath], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -518,16 +622,16 @@ async function syncRuntimeFilesAtomically(srcRoot, dstRoot) {
   const runtimeWithoutManifest = UPDATER_RUNTIME_FILES.filter((rel) => rel !== "plugin.json");
   const toCopy = [...runtimeWithoutManifest];
   for (const opt of UPDATER_OPTIONAL_FILES) {
-    if (await pathExists(path.join(srcRoot, opt))) {
+    if (await pathExists(path2.join(srcRoot, opt))) {
       toCopy.push(opt);
     }
   }
   toCopy.push("plugin.json");
   let seq = 0;
   for (const rel of toCopy) {
-    const src = path.join(srcRoot, rel);
-    const dst = path.join(dstRoot, rel);
-    await fs.mkdir(path.dirname(dst), { recursive: true });
+    const src = path2.join(srcRoot, rel);
+    const dst = path2.join(dstRoot, rel);
+    await fs.mkdir(path2.dirname(dst), { recursive: true });
     const tmp = `${dst}.agy-tmp.${process.pid}.${seq++}`;
     try {
       await fs.copyFile(src, tmp);
@@ -558,7 +662,7 @@ function isProcessDead(pid) {
   }
 }
 async function acquireUpdateLock(lockPath) {
-  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  await fs.mkdir(path2.dirname(lockPath), { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const handle = await fs.open(lockPath, "wx");
@@ -597,7 +701,7 @@ async function acquireUpdateLock(lockPath) {
 }
 async function runPluginUpdate(opts) {
   const env = opts.env ?? process.env;
-  const pluginDir = path.resolve(opts.pluginDir);
+  const pluginDir = path2.resolve(opts.pluginDir);
   const paths = getUpdaterPaths(env);
   const settings = await resolveUpdaterSettings(env);
   const repoUrl = opts.repoUrl?.trim() || settings.repoUrl;
@@ -673,7 +777,7 @@ async function runPluginUpdate(opts) {
         message: remote.version ? `Update available: v${currentVersion} -> v${remote.version}${reason ? ` (${reason})` : ""}.` : `Update available on branch '${remote.ref}'${reason ? ` (${reason})` : ""}.`
       };
     }
-    stagingDir = path.join(
+    stagingDir = path2.join(
       paths.cacheDir,
       `staging-${process.pid}-${Date.now()}`
     );
@@ -791,8 +895,8 @@ async function runPluginUpdate(opts) {
 // src/updater.ts
 function parseCliArgs(argv) {
   const args = argv.slice(2);
-  const defaultPluginDir = path2.resolve(
-    path2.dirname(fileURLToPath(import.meta.url)),
+  const defaultPluginDir = path3.resolve(
+    path3.dirname(fileURLToPath(import.meta.url)),
     ".."
   );
   let pluginDir = defaultPluginDir;
@@ -813,7 +917,7 @@ function parseCliArgs(argv) {
     } else if (a === "--json") {
       json = true;
     } else if (a === "--plugin-dir" && args[i + 1]) {
-      pluginDir = path2.resolve(args[++i]);
+      pluginDir = path3.resolve(args[++i]);
     } else if (a === "--channel" && args[i + 1]) {
       const parsed = parseUpdateChannel(args[++i]);
       if (!parsed) throw new Error(`Invalid --channel value (expected 'release' or 'main')`);

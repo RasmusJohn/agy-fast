@@ -3,7 +3,7 @@
 
 // src/session-start.ts
 import { promises as fs3 } from "node:fs";
-import path3 from "node:path";
+import path4 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/utils/output-filter.ts
@@ -66,11 +66,114 @@ function sliceSafeChars(text, maxChars) {
 
 // src/utils/snapshot.ts
 import { promises as fs } from "node:fs";
-import path from "node:path";
+import path2 from "node:path";
 
 // src/utils/exec-utils.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+var WINDOWS_CODEPAGE_LABELS = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8"
+};
+var strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+var cachedWindowsFallbackEncoding;
+var fallbackDecoderCache = /* @__PURE__ */ new Map();
+function parseWindowsCodePage(output) {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1], 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+function stripTrailingIncompleteUtf8(buf) {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i] & 192) === 128) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i];
+  if ((lead & 128) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 224) === 192) expectedLen = 2;
+  else if ((lead & 240) === 224) expectedLen = 3;
+  else if ((lead & 248) === 240) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+function getWindowsSystem32Binary(name) {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+function getWindowsFallbackEncoding() {
+  if (cachedWindowsFallbackEncoding !== void 0) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label = fallbackEncoding ?? (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
@@ -117,7 +220,8 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   return new Promise((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     const stdoutChunks = [];
@@ -167,22 +271,22 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error
       });
     };
     child.stdout?.on("data", (chunk) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -190,14 +294,14 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
@@ -414,7 +518,7 @@ async function getTwoLevelTree(workspaceDir) {
         };
       }
       try {
-        const sub = await fs.readdir(path.join(workspaceDir, entry.name), {
+        const sub = await fs.readdir(path2.join(workspaceDir, entry.name), {
           withFileTypes: true
         });
         const valid = sub.filter(
@@ -484,7 +588,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // package.json
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(dirPath, "package.json"), "utf8");
+        const raw = await fs.readFile(path2.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw);
         const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
         const label = pkg.name ? `${prefix}package.json (${pkg.name})` : `${prefix}package.json`;
@@ -499,7 +603,7 @@ async function detectManifestsInDir(dirPath, prefix) {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
         try {
-          const raw = await fs.readFile(path.join(dirPath, name), "utf8");
+          const raw = await fs.readFile(path2.join(dirPath, name), "utf8");
           const targets = [];
           for (const line of raw.split(/\r?\n/)) {
             const m = /^([A-Za-z0-9_.-]+)\s*:(?!=)/.exec(line);
@@ -519,7 +623,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pom.xml (Maven)
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(dirPath, "pom.xml"), "utf8");
+        const raw = await fs.readFile(path2.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
         const m = /<artifactId>\s*([^<\s]+)\s*<\/artifactId>/i.exec(stripped);
         hints.push(
@@ -532,7 +636,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
         try {
-          await fs.access(path.join(dirPath, name));
+          await fs.access(path2.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
           break;
         } catch {
@@ -542,7 +646,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // pyproject.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(dirPath, "pyproject.toml"), "utf8");
+        const raw = await fs.readFile(path2.join(dirPath, "pyproject.toml"), "utf8");
         const tools = [];
         if (/\[tool\.pytest/.test(raw)) tools.push("pytest");
         if (/\[tool\.ruff/.test(raw)) tools.push("ruff");
@@ -558,7 +662,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // Cargo.toml
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(dirPath, "Cargo.toml"), "utf8");
+        const raw = await fs.readFile(path2.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
         hints.push(
           isWorkspace ? `${prefix}Cargo.toml (workspace)` : `${prefix}Cargo.toml`
@@ -569,7 +673,7 @@ async function detectManifestsInDir(dirPath, prefix) {
     // go.mod
     (async () => {
       try {
-        const raw = await fs.readFile(path.join(dirPath, "go.mod"), "utf8");
+        const raw = await fs.readFile(path2.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
         hints.push(m?.[1] ? `${prefix}go.mod (${m[1]})` : `${prefix}go.mod`);
       } catch {
@@ -588,7 +692,7 @@ async function getProjectManifestSummary(workspaceDir) {
     ).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 8);
     const nested = await Promise.all(
       subdirs.map(
-        (d) => detectManifestsInDir(path.join(workspaceDir, d.name), `${d.name}/`)
+        (d) => detectManifestsInDir(path2.join(workspaceDir, d.name), `${d.name}/`)
       )
     );
     for (const list of nested) {
@@ -714,7 +818,7 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
 import { spawn as spawn2 } from "node:child_process";
 import { promises as fs2 } from "node:fs";
 import os from "node:os";
-import path2 from "node:path";
+import path3 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 12;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
@@ -723,12 +827,12 @@ function getHomeDir(env = process.env) {
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const cacheDir = custom ? path2.resolve(custom) : path2.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  const cacheDir = custom ? path3.resolve(custom) : path3.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
   return {
     cacheDir,
-    stateFile: path2.join(cacheDir, "update-state.json"),
-    configFile: path2.join(cacheDir, "config.json"),
-    lockFile: path2.join(cacheDir, "update.lock")
+    stateFile: path3.join(cacheDir, "update-state.json"),
+    configFile: path3.join(cacheDir, "config.json"),
+    lockFile: path3.join(cacheDir, "update.lock")
   };
 }
 function parseSemver(raw) {
@@ -782,7 +886,7 @@ async function readJsonFile(filePath) {
   return null;
 }
 async function writeJsonAtomically(filePath, data) {
-  await fs2.mkdir(path2.dirname(filePath), { recursive: true });
+  await fs2.mkdir(path3.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   await fs2.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
@@ -834,7 +938,7 @@ async function resolveUpdaterSettings(env = process.env) {
 }
 async function readInstalledVersion(pluginDir) {
   const manifest = await readJsonFile(
-    path2.join(pluginDir, "plugin.json")
+    path3.join(pluginDir, "plugin.json")
   );
   if (manifest && typeof manifest.version === "string" && manifest.version.trim()) {
     return manifest.version.trim();
@@ -868,13 +972,13 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     ).catch(() => {
     });
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path2.join(pluginDir, "scripts", "install.mjs");
+    const installerPath = path3.join(pluginDir, "scripts", "install.mjs");
     return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
   }
   return null;
 }
 function spawnBackgroundUpdateCheck(pluginDir, env = process.env) {
-  const updaterPath = path2.join(pluginDir, "dist", "updater.mjs");
+  const updaterPath = path3.join(pluginDir, "dist", "updater.mjs");
   try {
     const child = spawn2(
       process.execPath,
@@ -982,8 +1086,8 @@ async function main() {
     }
     let updateNotice = null;
     try {
-      const pluginDir = path3.resolve(
-        path3.dirname(fileURLToPath(import.meta.url)),
+      const pluginDir = path4.resolve(
+        path4.dirname(fileURLToPath(import.meta.url)),
         ".."
       );
       const settings = await resolveUpdaterSettings();
@@ -997,7 +1101,7 @@ async function main() {
           currentVersion
         );
         if (shouldTriggerBackgroundCheck(state, Date.now(), settings.checkIntervalMs)) {
-          const updaterPath = path3.join(pluginDir, "dist", "updater.mjs");
+          const updaterPath = path4.join(pluginDir, "dist", "updater.mjs");
           const hasUpdater = await fs3.access(updaterPath).then(() => true).catch(() => false);
           if (hasUpdater) {
             await writeUpdateState({

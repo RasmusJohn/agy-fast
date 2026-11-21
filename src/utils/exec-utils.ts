@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
 
 export interface ExecResult {
   exitCode: number | null;
@@ -19,6 +20,127 @@ export interface ExecOptions {
 }
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MiB
+
+const WINDOWS_CODEPAGE_LABELS: Record<number, string> = {
+  866: "ibm866",
+  874: "windows-874",
+  936: "gb18030",
+  54936: "gb18030",
+  950: "big5",
+  932: "shift_jis",
+  949: "euc-kr",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+  65001: "utf-8",
+};
+
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+let cachedWindowsFallbackEncoding: string | null | undefined;
+const fallbackDecoderCache = new Map<string, TextDecoder>();
+
+export function parseWindowsCodePage(output: string): string | null {
+  const match = /\b(\d{3,5})\b/.exec(output);
+  if (!match) return null;
+  const cp = Number.parseInt(match[1]!, 10);
+  const mapped = WINDOWS_CODEPAGE_LABELS[cp];
+  return mapped && mapped !== "utf-8" ? mapped : null;
+}
+
+function stripTrailingIncompleteUtf8(buf: Buffer): Buffer {
+  if (buf.length === 0) return buf;
+  let i = buf.length - 1;
+  const minIdx = Math.max(0, buf.length - 4);
+  while (i >= minIdx && (buf[i]! & 0xc0) === 0x80) {
+    i--;
+  }
+  if (i < minIdx) return buf;
+  const lead = buf[i]!;
+  if ((lead & 0x80) === 0) return buf;
+  let expectedLen = 0;
+  if ((lead & 0xe0) === 0xc0) expectedLen = 2;
+  else if ((lead & 0xf0) === 0xe0) expectedLen = 3;
+  else if ((lead & 0xf8) === 0xf0) expectedLen = 4;
+  else return buf;
+  return buf.length - i < expectedLen ? buf.subarray(0, i) : buf;
+}
+
+function getWindowsSystem32Binary(name: string): { bin: string; cwd: string } {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+  if (systemRoot) {
+    return {
+      bin: path.join(systemRoot, "System32", name),
+      cwd: systemRoot,
+    };
+  }
+  return { bin: name, cwd: process.cwd() };
+}
+
+function getWindowsFallbackEncoding(): string | null {
+  if (cachedWindowsFallbackEncoding !== undefined) {
+    return cachedWindowsFallbackEncoding;
+  }
+  try {
+    const { bin: chcpBin, cwd } = getWindowsSystem32Binary("chcp.com");
+    const res = spawnSync(chcpBin, [], {
+      cwd,
+      encoding: "latin1",
+      timeout: 1500,
+      windowsHide: true,
+    });
+    if (!res.error && res.status === 0) {
+      const mapped = parseWindowsCodePage(res.stdout || "");
+      if (mapped) {
+        cachedWindowsFallbackEncoding = mapped;
+        return cachedWindowsFallbackEncoding;
+      }
+    }
+  } catch {
+    // Ignore probe errors and fall back to UTF-8
+  }
+  cachedWindowsFallbackEncoding = null;
+  return null;
+}
+
+/**
+ * Decodes child-process stdout/stderr buffers as UTF-8 first, falling back to
+ * the Windows active console codepage (e.g. `gb18030` for CP936) only when
+ * non-UTF-8 bytes are present.
+ */
+export function decodeProcessOutput(
+  buf: Buffer,
+  truncated = false,
+  fallbackEncoding?: string,
+): string {
+  if (buf.length === 0) return "";
+  const candidate = truncated ? stripTrailingIncompleteUtf8(buf) : buf;
+  try {
+    return strictUtf8Decoder.decode(candidate);
+  } catch {
+    const label =
+      fallbackEncoding ??
+      (process.platform === "win32" ? getWindowsFallbackEncoding() : null);
+    if (!label || label === "utf-8") {
+      return buf.toString("utf8");
+    }
+    try {
+      let decoder = fallbackDecoderCache.get(label);
+      if (!decoder) {
+        decoder = new TextDecoder(label);
+        fallbackDecoderCache.set(label, decoder);
+      }
+      return decoder.decode(buf);
+    } catch {
+      return buf.toString("utf8");
+    }
+  }
+}
 
 function killChildTree(pid: number | undefined, detached: boolean): void {
   if (!pid) return;
@@ -69,10 +191,234 @@ export function execBinaryAsync(
   return spawnAndCollect(bin, args, false, options);
 }
 
-export function runShellCommandAsync(
+export type WindowsPowerShellBin = "pwsh" | "powershell.exe";
+export type WindowsShellProbe = (bin: WindowsPowerShellBin) => Promise<boolean>;
+
+const WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE =
+  /(?<![\\`])(?:\$env:[A-Za-z_][A-Za-z0-9_]*|\$(?:LASTEXITCODE|PSVersionTable|PSScriptRoot|PROFILE)\b)/i;
+const WINDOWS_PS_UNQUOTED_SYNTAX_RE =
+  /(?<![\\`])\$(?:HOME|PWD|null|true|false|_)\b|\$\([^)]|@\(|(?:^|[;\r\n])\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=/im;
+const WINDOWS_PS_CMDLET_RE =
+  /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Select|Where|ForEach|Sort|Group|Measure|Compare|ConvertTo|ConvertFrom|Export|Import|Invoke|Start|Stop|Restart|Wait|Read|Write|Out|Format|Resolve|Join|Split|Copy|Move|Rename|Clear|Add|Push|Pop|Enable|Disable)-[A-Z][A-Za-z0-9]*\b(?!-)/;
+const EXPLICIT_POWERSHELL_INVOCATION_RE =
+  /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
+const PS_NON_INVOCATION_TAIL_RE =
+  /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
+const PS_UTF8_PREFIX =
+  "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
+
+function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
+  let out = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (next === "'") {
+          i++;
+        } else {
+          quote = null;
+          out += " ";
+        }
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if ((ch === "\\" || ch === "`") && next === '"') {
+        i++;
+        if (!stripDoubleQuotes) out += ch + next;
+        continue;
+      }
+      if (ch === '"') {
+        if (next === '"') {
+          i++;
+          if (!stripDoubleQuotes) out += '""';
+        } else {
+          quote = null;
+          out += stripDoubleQuotes ? " " : '"';
+        }
+        continue;
+      }
+      if (!stripDoubleQuotes) out += ch;
+      continue;
+    }
+    if (ch === "'") {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (ch === '"') {
+      quote = '"';
+      out += stripDoubleQuotes ? " " : '"';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Detects whether a Windows command uses PowerShell syntax (`$env:VAR`, automatic
+ * variables, subexpressions, or PascalCase `Verb-Noun` cmdlets outside quotes)
+ * so cross-platform/cmd commands keep fast `cmd.exe` execution without altering
+ * quoting behavior.
+ */
+export function needsPowerShellOnWindows(command: string): boolean {
+  if (!command || EXPLICIT_POWERSHELL_INVOCATION_RE.test(command)) {
+    return false;
+  }
+  const withoutSingle = stripQuotedSpans(command, false);
+  if (WINDOWS_PS_DOUBLE_QUOTABLE_VAR_RE.test(withoutSingle)) {
+    return true;
+  }
+  const unquoted = stripQuotedSpans(command, true);
+  return (
+    WINDOWS_PS_UNQUOTED_SYNTAX_RE.test(unquoted) ||
+    WINDOWS_PS_CMDLET_RE.test(unquoted)
+  );
+}
+
+/**
+ * Prepends `&` when a PowerShell command starts with a quoted executable path
+ * followed by whitespace + arguments (e.g. `"C:\Program Files\nodejs\node.exe" -v`),
+ * while leaving PowerShell string expressions (`"$Env:PATH".Split(';')`,
+ * `"$Env:FOO" > out.txt`, `'it''s' + $Env:FOO`, etc.) untouched.
+ */
+export function formatPowerShellCommand(command: string): string {
+  const trimmed = command.trim();
+  if (!trimmed || (trimmed[0] !== '"' && trimmed[0] !== "'")) {
+    return command;
+  }
+  const quote = trimmed[0];
+  let idx = 1;
+  while (idx < trimmed.length) {
+    if (quote === '"' && trimmed[idx] === "`" && idx + 1 < trimmed.length) {
+      idx += 2;
+      continue;
+    }
+    if (trimmed[idx] === quote) {
+      // Both PowerShell '...' (`''`) and "..." (`""`) escape doubled quotes
+      if (trimmed[idx + 1] === quote) {
+        idx += 2;
+        continue;
+      }
+      const afterQuote = trimmed.slice(idx + 1);
+      if (!/^\s+/.test(afterQuote)) {
+        return command;
+      }
+      const rest = afterQuote.trimStart();
+      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+        return `& ${trimmed}`;
+      }
+      return command;
+    }
+    idx++;
+  }
+  return command;
+}
+
+export function buildPowerShellUtf8Command(command: string): string {
+  return `${PS_UTF8_PREFIX} ${formatPowerShellCommand(command)}`;
+}
+
+let cachedWindowsPowerShell: WindowsPowerShellBin | null | undefined;
+let cachedWindowsPowerShellExecPath: string | null = null;
+let pendingWindowsPowerShellProbe: Promise<WindowsPowerShellBin | null> | null = null;
+
+async function defaultProbeWindowsShell(bin: WindowsPowerShellBin): Promise<boolean> {
+  const { bin: whereBin, cwd } = getWindowsSystem32Binary("where.exe");
+  const exeQuery = bin.toLowerCase().endsWith(".exe") ? bin : `${bin}.exe`;
+  const whereRes = await execBinaryAsync(whereBin, [exeQuery], {
+    cwd,
+    timeoutMs: 2000,
+    maxOutputBytes: 4096,
+  });
+  if (!whereRes.error && !whereRes.timedOut) {
+    if (whereRes.exitCode !== 0) return false;
+    const resolved = whereRes.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /\.exe$/i.test(line));
+    if (!resolved) return false;
+    cachedWindowsPowerShellExecPath = resolved;
+    return true;
+  }
+  const res = await execBinaryAsync(
+    exeQuery,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+    {
+      cwd,
+      timeoutMs: 3000,
+      maxOutputBytes: 4096,
+    },
+  );
+  if (!res.error && !res.timedOut && res.exitCode === 0) {
+    cachedWindowsPowerShellExecPath = exeQuery;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Resolves the preferred PowerShell executable on Windows (`pwsh` -> `powershell.exe`
+ * -> `null`), caching the probe result across calls.
+ */
+export async function resolveWindowsPowerShell(
+  probe: WindowsShellProbe = defaultProbeWindowsShell,
+): Promise<WindowsPowerShellBin | null> {
+  if (cachedWindowsPowerShell !== undefined) {
+    return cachedWindowsPowerShell;
+  }
+  if (pendingWindowsPowerShellProbe) {
+    return pendingWindowsPowerShellProbe;
+  }
+
+  pendingWindowsPowerShellProbe = (async () => {
+    try {
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("pwsh")) {
+        cachedWindowsPowerShell = "pwsh";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      if (await probe("powershell.exe")) {
+        cachedWindowsPowerShell = "powershell.exe";
+        return cachedWindowsPowerShell;
+      }
+      cachedWindowsPowerShellExecPath = null;
+      cachedWindowsPowerShell = null;
+      return null;
+    } finally {
+      pendingWindowsPowerShellProbe = null;
+    }
+  })();
+
+  return pendingWindowsPowerShellProbe;
+}
+
+export function resetWindowsShellCache(): void {
+  cachedWindowsPowerShell = undefined;
+  cachedWindowsPowerShellExecPath = null;
+  pendingWindowsPowerShellProbe = null;
+}
+
+export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
+  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
+    const psBin = await resolveWindowsPowerShell();
+    if (psBin) {
+      const utf8Command = buildPowerShellUtf8Command(command);
+      return spawnAndCollect(
+        cachedWindowsPowerShellExecPath ?? psBin,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+        false,
+        options,
+      );
+    }
+  }
   return spawnAndCollect(command, [], true, options);
 }
 
@@ -89,7 +435,8 @@ function spawnAndCollect(
   return new Promise<ExecResult>((resolve) => {
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
 
@@ -147,23 +494,23 @@ function spawnAndCollect(
         signal,
         timedOut,
         durationMs: Date.now() - startMs,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        truncated,
+        stdout: decodeProcessOutput(Buffer.concat(stdoutChunks), stdoutTruncated),
+        stderr: decodeProcessOutput(Buffer.concat(stderrChunks), stderrTruncated),
+        truncated: stdoutTruncated || stderrTruncated,
         error,
       });
     };
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (stdoutBytes >= maxOutputBytes) {
-        truncated = true;
+        stdoutTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stdoutBytes;
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining));
         stdoutBytes += remaining;
-        truncated = true;
+        stdoutTruncated = true;
       } else {
         stdoutChunks.push(chunk);
         stdoutBytes += chunk.length;
@@ -172,14 +519,14 @@ function spawnAndCollect(
 
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderrBytes >= maxOutputBytes) {
-        truncated = true;
+        stderrTruncated = true;
         return;
       }
       const remaining = maxOutputBytes - stderrBytes;
       if (chunk.length > remaining) {
         stderrChunks.push(chunk.subarray(0, remaining));
         stderrBytes += remaining;
-        truncated = true;
+        stderrTruncated = true;
       } else {
         stderrChunks.push(chunk);
         stderrBytes += chunk.length;
