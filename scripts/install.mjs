@@ -277,6 +277,66 @@ async function pathExists(p) {
   }
 }
 
+async function lstatSafe(p) {
+  try {
+    return await fs.lstat(p);
+  } catch (err) {
+    if (err?.code === "ENOENT" || err?.code === "ENOTDIR") {
+      return null;
+    }
+    throw err;
+  }
+}
+
+function toComparePath(p) {
+  const normalized = path.resolve(p);
+  return process.platform === "win32" || process.platform === "darwin"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function isStrictAncestorPath(ancestorPath, descendantPath) {
+  const rel = path.relative(ancestorPath, descendantPath);
+  return (
+    rel !== "" &&
+    rel !== ".." &&
+    !rel.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(rel)
+  );
+}
+
+async function assertRemovableTarget(targetPath, stat) {
+  if (!stat || stat.isSymbolicLink()) {
+    return;
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `Refusing to delete ${targetPath}: target exists and is not an ${PLUGIN_NAME} directory or symlink.`,
+    );
+  }
+  const entries = await fs.readdir(targetPath);
+  if (entries.length === 0) {
+    return;
+  }
+  const manifest = await readJsonSafe(path.join(targetPath, "plugin.json"));
+  if (manifest?.name !== PLUGIN_NAME) {
+    throw new Error(
+      `Refusing to delete non-empty directory ${targetPath}: missing plugin.json with name "${PLUGIN_NAME}".`,
+    );
+  }
+}
+
+async function removeTargetPath(targetPath, stat) {
+  if (!stat) {
+    return;
+  }
+  if (stat.isSymbolicLink()) {
+    await fs.unlink(targetPath);
+    return;
+  }
+  await fs.rm(targetPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+}
+
 async function verifyMcpServerLive(mcpScriptPath) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mcpScriptPath], {
@@ -533,9 +593,21 @@ async function runDoctor(targetDir, quiet = false) {
 async function runInstall(opts) {
   checkNodeVersion();
 
-  const resolvedSrc = path.resolve(REPO_ROOT);
+  const resolvedSrc = await fs.realpath(REPO_ROOT);
   const resolvedDst = path.resolve(opts.targetDir);
-  const sameDirectory = resolvedSrc === resolvedDst;
+  const dstStat = await lstatSafe(resolvedDst);
+
+  let sameDirectory = false;
+  if (dstStat && !dstStat.isSymbolicLink()) {
+    const srcCompare = toComparePath(resolvedSrc);
+    const dstCompare = toComparePath(await fs.realpath(resolvedDst));
+    sameDirectory = srcCompare === dstCompare;
+    if (isStrictAncestorPath(dstCompare, srcCompare)) {
+      throw new Error(
+        `Refusing to install into ${resolvedDst}: target is an ancestor directory of ${resolvedSrc}.`,
+      );
+    }
+  }
 
   await assertSourceFilesPresent(resolvedSrc);
 
@@ -544,10 +616,9 @@ async function runInstall(opts) {
       console.log(`Repository is already at target plugin directory: ${resolvedDst}`);
     }
   } else if (opts.useLink) {
+    await assertRemovableTarget(resolvedDst, dstStat);
     await fs.mkdir(path.dirname(resolvedDst), { recursive: true });
-    if (await pathExists(resolvedDst)) {
-      await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    }
+    await removeTargetPath(resolvedDst, dstStat);
     const linkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(resolvedSrc, resolvedDst, linkType);
     if (!opts.quiet) {
@@ -555,9 +626,8 @@ async function runInstall(opts) {
     }
   } else {
     // Preserve clean target directory when re-installing / upgrading
-    if (await pathExists(resolvedDst)) {
-      await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    }
+    await assertRemovableTarget(resolvedDst, dstStat);
+    await removeTargetPath(resolvedDst, dstStat);
     await copyRuntimeFiles(resolvedSrc, resolvedDst);
     if (!opts.quiet) {
       console.log(`Installed agy-fast to ${resolvedDst}`);
@@ -701,21 +771,34 @@ async function runUpdate(opts) {
 
 async function runUninstall(opts) {
   const resolvedDst = path.resolve(opts.targetDir);
-  if (!(await pathExists(resolvedDst))) {
+  const dstStat = await lstatSafe(resolvedDst);
+  if (!dstStat) {
     if (!opts.quiet) {
       console.log(`Nothing to remove (${resolvedDst} does not exist).`);
     }
     return;
   }
 
-  const isSourceRepo =
-    path.resolve(REPO_ROOT) === resolvedDst &&
-    (await pathExists(path.join(REPO_ROOT, "src")));
-  if (isSourceRepo) {
-    throw new Error(
-      `Refusing to delete the active source repository at ${resolvedDst}. Remove it manually if desired.`,
-    );
+  if (!dstStat.isSymbolicLink()) {
+    const resolvedSrc = await fs.realpath(REPO_ROOT);
+    const srcCompare = toComparePath(resolvedSrc);
+    const dstCompare = toComparePath(await fs.realpath(resolvedDst));
+    if (
+      srcCompare === dstCompare &&
+      (await pathExists(path.join(resolvedSrc, "src")))
+    ) {
+      throw new Error(
+        `Refusing to delete the active source repository at ${resolvedDst}. Remove it manually if desired.`,
+      );
+    }
+    if (isStrictAncestorPath(dstCompare, srcCompare)) {
+      throw new Error(
+        `Refusing to delete ${resolvedDst}: target is an ancestor directory of ${resolvedSrc}.`,
+      );
+    }
   }
+
+  await assertRemovableTarget(resolvedDst, dstStat);
 
   const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
   if (hasCommand("agy", ["--version"]) && !opts.skipEnable && isGlobalTarget) {
@@ -725,7 +808,7 @@ async function runUninstall(opts) {
     });
   }
 
-  await fs.rm(resolvedDst, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  await removeTargetPath(resolvedDst, dstStat);
   if (!opts.quiet) {
     console.log(`Removed agy-fast from ${resolvedDst}`);
   }

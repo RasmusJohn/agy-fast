@@ -413,6 +413,12 @@ describe("benchmark analyzer & CLI", () => {
       { args: { CommandLine: JSON.stringify("cd /repo; rg foo src/ || true") } },
       { args: { CommandLine: JSON.stringify('find . -name "*.ts" 2>/dev/null | sort | head -n 20') } },
       { args: { CommandLine: JSON.stringify("git branch --show-current && git remote -v && git tag --list") } },
+      { args: { CommandLine: JSON.stringify("git branch --color=always") } },
+      { args: { CommandLine: JSON.stringify("git branch --color --list") } },
+      { args: { CommandLine: JSON.stringify("git branch --abbrev=8 --list") } },
+      { args: { CommandLine: JSON.stringify("git branch --column=never") } },
+      { args: { CommandLine: JSON.stringify("git tag --color --list") } },
+      { args: { CommandLine: JSON.stringify("git tag --column=never") } },
       { args: { CommandLine: JSON.stringify("wc -l < src/index.ts") } },
       // call.arguments object and JSON-string fallbacks
       { arguments: { CommandLine: JSON.stringify("wc -l src/index.ts") } },
@@ -436,11 +442,18 @@ describe("benchmark analyzer & CLI", () => {
       { args: { CommandLine: JSON.stringify("git -C /repo branch -D old") } },
       { args: { CommandLine: JSON.stringify("git branch -f main HEAD") } },
       { args: { CommandLine: JSON.stringify("git branch new-feature") } },
+      { args: { CommandLine: JSON.stringify("git branch --color new-branch") } },
+      { args: { CommandLine: JSON.stringify("git branch --column new-branch") } },
+      { args: { CommandLine: JSON.stringify("git branch --abbrev new-branch") } },
+      { args: { CommandLine: JSON.stringify("git branch --color -D --column target") } },
       { args: { CommandLine: JSON.stringify("git branch --merged -D old") } },
       { args: { CommandLine: JSON.stringify("git remote add origin https://example.com") } },
       { args: { CommandLine: JSON.stringify("git remote set-head origin main") } },
       { args: { CommandLine: JSON.stringify("git diff --output=patch.diff") } },
       { args: { CommandLine: JSON.stringify("git tag v1.0.0") } },
+      { args: { CommandLine: JSON.stringify("git tag --color evil-tag") } },
+      { args: { CommandLine: JSON.stringify("git tag --column evil-tag") } },
+      { args: { CommandLine: JSON.stringify("git tag --color -d --column v0.2.2") } },
       { args: { CommandLine: JSON.stringify("find . -name '.DS_Store' -delete") } },
       { args: { CommandLine: JSON.stringify("find . -name '*.tmp' -exec rm {} +") } },
       // Chained, piped, and multi-line mutating commands
@@ -484,6 +497,15 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(metrics.readonlySearchRunCommandCalls, readonlyCmds.length);
     assert.equal(metrics.editFileCalls, 5);
     assert.equal(metrics.redundantSameTurnEditFileCalls, 2);
+
+    const readonlyOnly = analyzeTranscriptSessions([
+      [{ type: "PLANNER_RESPONSE", tool_calls: readonlyCmds.map((c) => ({ name: "run_command", ...c })) }],
+    ]);
+    assert.equal(readonlyOnly.readonlySearchRunCommandCalls, readonlyCmds.length);
+    const nonReadonlyOnly = analyzeTranscriptSessions([
+      [{ type: "PLANNER_RESPONSE", tool_calls: nonReadonlyCmds.map((c) => ({ name: "run_command", ...c })) }],
+    ]);
+    assert.equal(nonReadonlyOnly.readonlySearchRunCommandCalls, 0);
   });
 
   it("supports --recent <N> to select the N most recently modified transcripts and rejects invalid CLI flags", async () => {

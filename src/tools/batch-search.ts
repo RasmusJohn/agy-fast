@@ -87,21 +87,22 @@ const ALLOWED_BRANCH_BOOL_FLAGS = new Set([
   "--omit-empty",
   "--no-column",
   "--quiet",
+]);
+
+const ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS = new Set([
   "--merged",
   "--no-merged",
+  "--abbrev",
+  "--color",
+  "--column",
 ]);
 
 const ALLOWED_BRANCH_VALUE_FLAGS = new Set([
-  "--merged",
-  "--no-merged",
   "--contains",
   "--no-contains",
   "--points-at",
   "--sort",
   "--format",
-  "--abbrev",
-  "--color",
-  "--column",
 ]);
 
 const ALLOWED_BRANCH_SHORT_CHARS = new Set(["a", "r", "v", "l", "q", "i"]);
@@ -113,20 +114,21 @@ const ALLOWED_TAG_BOOL_FLAGS = new Set([
   "--ignore-case",
   "--omit-empty",
   "--no-column",
+]);
+
+const ALLOWED_TAG_OPTIONAL_VALUE_FLAGS = new Set([
   "--merged",
   "--no-merged",
+  "--color",
+  "--column",
 ]);
 
 const ALLOWED_TAG_VALUE_FLAGS = new Set([
   "--contains",
   "--no-contains",
-  "--merged",
-  "--no-merged",
   "--points-at",
   "--sort",
   "--format",
-  "--color",
-  "--column",
 ]);
 
 const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "v", "i"]);
@@ -237,14 +239,18 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
+          if (
+            !ALLOWED_BRANCH_VALUE_FLAGS.has(flagName) &&
+            !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)
+          ) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
           }
         } else if (ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
-          if (flagName !== "--merged" && flagName !== "--no-merged") {
-            expectValue = true;
-          }
-        } else if (!ALLOWED_BRANCH_BOOL_FLAGS.has(flagName)) {
+          expectValue = true;
+        } else if (
+          !ALLOWED_BRANCH_BOOL_FLAGS.has(flagName) &&
+          !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)
+        ) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
         }
         if (flagName === "--list") hasListFlag = true;
@@ -281,14 +287,18 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
+          if (
+            !ALLOWED_TAG_VALUE_FLAGS.has(flagName) &&
+            !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)
+          ) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
           }
         } else if (ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
-          if (flagName !== "--merged" && flagName !== "--no-merged") {
-            expectValue = true;
-          }
-        } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName)) {
+          expectValue = true;
+        } else if (
+          !ALLOWED_TAG_BOOL_FLAGS.has(flagName) &&
+          !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)
+        ) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
         }
         if (flagName === "--list" || flagName === "--verify") {

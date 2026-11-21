@@ -183,9 +183,6 @@ const GIT_BRANCH_VALUE_FLAGS = new Set([
   "--points-at",
   "--sort",
   "--format",
-  "--abbrev",
-  "--color",
-  "--column",
 ]);
 
 const KNOWN_SYSTEM_BIN_PREFIXES = [

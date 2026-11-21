@@ -456,7 +456,18 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
         if (plan.originalMode !== null && process.platform !== "win32") {
           await fs.chmod(tmpPath, plan.originalMode);
         }
+      } catch (tmpErr) {
+        try {
+          await fs.unlink(tmpPath);
+        } catch {
+          // ignore cleanup failure
+        }
+        throw tmpErr;
+      }
+
+      try {
         await fs.rename(tmpPath, target);
+        written.push(plan);
       } catch (renameErr) {
         // Fallback if rename across filesystems or directory permissions fails
         try {
@@ -464,6 +475,7 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
         } catch {
           // ignore cleanup failure
         }
+        written.push(plan);
         await fs.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
@@ -474,7 +486,6 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
         }
         void renameErr;
       }
-      written.push(plan);
     }
   } catch (err) {
     // Rollback all previously written files
@@ -681,8 +692,17 @@ export async function runApplyEdits(
         }
         originalMode = st.mode & 0o7777;
         originalBuffer = await fs.readFile(item.writeTargetPath);
-      } catch {
-        exists = false;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          exists = false;
+          originalBuffer = null;
+          originalMode = null;
+        } else {
+          errors.push(
+            `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          continue;
+        }
       }
 
       const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;

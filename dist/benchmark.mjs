@@ -113,10 +113,7 @@ var GIT_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--no-merged",
   "--points-at",
   "--sort",
-  "--format",
-  "--abbrev",
-  "--color",
-  "--column"
+  "--format"
 ]);
 var KNOWN_SYSTEM_BIN_PREFIXES = [
   "/bin/",

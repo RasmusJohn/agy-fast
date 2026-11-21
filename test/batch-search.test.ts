@@ -322,11 +322,76 @@ describe("batch_search", () => {
       "branch",
       "--show-current",
     ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --color=always"), [
+      "--no-pager",
+      "branch",
+      "--color=always",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --color --list"), [
+      "--no-pager",
+      "branch",
+      "--color",
+      "--list",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --color --list main*"), [
+      "--no-pager",
+      "branch",
+      "--color",
+      "--list",
+      "main*",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --abbrev=8 --list"), [
+      "--no-pager",
+      "branch",
+      "--abbrev=8",
+      "--list",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --abbrev --list"), [
+      "--no-pager",
+      "branch",
+      "--abbrev",
+      "--list",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --column=never"), [
+      "--no-pager",
+      "branch",
+      "--column=never",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --column --all"), [
+      "--no-pager",
+      "branch",
+      "--column",
+      "--all",
+    ]);
     assert.deepEqual(validateReadonlyGitArgs("tag -l v*"), [
       "--no-pager",
       "tag",
       "-l",
       "v*",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --color --list"), [
+      "--no-pager",
+      "tag",
+      "--color",
+      "--list",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --color --list v*"), [
+      "--no-pager",
+      "tag",
+      "--color",
+      "--list",
+      "v*",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --column=never"), [
+      "--no-pager",
+      "tag",
+      "--column=never",
+    ]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --column --list"), [
+      "--no-pager",
+      "tag",
+      "--column",
+      "--list",
     ]);
     assert.deepEqual(validateReadonlyGitArgs("remote -v"), [
       "--no-pager",
@@ -356,11 +421,27 @@ describe("batch_search", () => {
       "branch -l --no-list -qm renamed",
       "branch --create-reflog",
       "branch new-branch",
+      "branch --color new-branch",
+      "branch --column new-branch",
+      "branch --abbrev new-branch",
+      "branch --color -D --column target",
+      "branch --column -D target",
+      "branch --abbrev -D target",
+      "branch --list --color -D target",
+      "branch --color=always new-branch",
+      "branch --color -- new-branch",
       "tag v1.0.0",
       "tag -d v1.0.0",
       "tag -dv1.0.0",
       "tag -l -fd v1.0.0",
       "tag -l -am msg v1.0.0",
+      "tag --color evil-tag",
+      "tag --column evil-tag",
+      "tag --color -d --column v0.2.2",
+      "tag --column -d v0.2.2",
+      "tag -l --color -d v0.2.2",
+      "tag --color=always evil-tag",
+      "tag --color -- evil-tag",
       "remote add origin https://example.com/repo.git",
       "remote show --prune origin",
       "diff --output=/tmp/leak",

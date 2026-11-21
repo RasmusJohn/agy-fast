@@ -172,4 +172,129 @@ describe("installer", () => {
     assert.match(ps1, /if \(\$__agyFastWasFile\)\s*\{[\s\S]*exit \$__agyFastFinalExit/);
     assert.match(ps1, /System\.Collections\.Generic\.List\[string\]/);
   });
+
+  it("protects source repo across symlink/case variants, rejects ancestors and non-plugin dirs, and handles empty/symlink targets safely", async () => {
+    const env = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome };
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    const run = (args: string[]) =>
+      execFileSync(process.execPath, args, { env, encoding: "utf8", stdio: "pipe" });
+    const expectFail = (args: string[], pattern: RegExp) => {
+      assert.throws(() => run(args), (err: unknown) => {
+        assert.match(String((err as { stderr?: string })?.stderr ?? ""), pattern);
+        return true;
+      });
+    };
+
+    const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-safety-"));
+    const parentAlias = path.join(sandbox, "repo-parent-link");
+    try {
+      // 1. Symlinked-parent & case-variant same-directory protection
+      await fs.symlink(path.dirname(process.cwd()), parentAlias, linkType);
+      const aliasedRepo = path.join(parentAlias, path.basename(process.cwd()));
+      assert.match(
+        run([INSTALL_SCRIPT, "install", "--target", aliasedRepo, "--no-enable"]),
+        /Repository is already at target plugin directory/,
+      );
+      expectFail(
+        [INSTALL_SCRIPT, "uninstall", "--target", aliasedRepo, "--no-enable"],
+        /Refusing to delete the active source repository/,
+      );
+      assert.ok((await fs.stat(path.join(process.cwd(), "src"))).isDirectory());
+
+      if (process.platform === "win32" || process.platform === "darwin") {
+        const cwd = process.cwd();
+        const caseVariant = cwd.toLowerCase() === cwd ? cwd.toUpperCase() : cwd.toLowerCase();
+        assert.notEqual(caseVariant, cwd);
+        assert.match(
+          run([INSTALL_SCRIPT, "install", "--target", caseVariant, "--no-enable"]),
+          /Repository is already at target plugin directory/,
+        );
+        expectFail(
+          [INSTALL_SCRIPT, "uninstall", "--target", caseVariant, "--no-enable"],
+          /Refusing to delete the active source repository/,
+        );
+        assert.ok((await fs.stat(path.join(cwd, "src"))).isDirectory());
+      }
+
+      // 2. Reject ancestor directory of REPO_ROOT even with a matching plugin.json
+      const ancestorDir = path.join(sandbox, "ancestor-root");
+      const nestedRepo = path.join(ancestorDir, "nested-repo");
+      run([INSTALL_SCRIPT, "install", "--target", nestedRepo, "--no-enable"]);
+      await fs.mkdir(path.join(nestedRepo, "src"), { recursive: true });
+      await fs.writeFile(path.join(ancestorDir, "plugin.json"), JSON.stringify({ name: "agy-fast" }), "utf8");
+      const nestedInstaller = path.join(nestedRepo, "scripts", "install.mjs");
+      expectFail([nestedInstaller, "install", "--target", ancestorDir, "--no-enable"], /ancestor directory/);
+      expectFail([nestedInstaller, "install", "--target", ancestorDir, "--link", "--no-enable"], /ancestor directory/);
+      expectFail([nestedInstaller, "uninstall", "--target", ancestorDir, "--no-enable"], /ancestor directory/);
+      assert.ok((await fs.stat(path.join(nestedRepo, "src"))).isDirectory());
+
+      // 3. Reject non-empty non-agy-fast target dirs, other plugins, and regular files
+      const nonPluginDir = path.join(sandbox, "user-projects");
+      await fs.mkdir(nonPluginDir, { recursive: true });
+      const keepUserFile = path.join(nonPluginDir, "important.txt");
+      await fs.writeFile(keepUserFile, "do-not-delete", "utf8");
+      expectFail([INSTALL_SCRIPT, "install", "--target", nonPluginDir, "--no-enable"], /Refusing to delete non-empty directory/);
+      expectFail([INSTALL_SCRIPT, "install", "--target", nonPluginDir, "--link", "--no-enable"], /Refusing to delete non-empty directory/);
+      expectFail([INSTALL_SCRIPT, "uninstall", "--target", nonPluginDir, "--no-enable"], /Refusing to delete non-empty directory/);
+      assert.equal(await fs.readFile(keepUserFile, "utf8"), "do-not-delete");
+
+      const otherPluginDir = path.join(sandbox, "other-plugin");
+      await fs.mkdir(otherPluginDir, { recursive: true });
+      await fs.writeFile(path.join(otherPluginDir, "plugin.json"), JSON.stringify({ name: "other-plugin" }), "utf8");
+      expectFail([INSTALL_SCRIPT, "install", "--target", otherPluginDir, "--no-enable"], /Refusing to delete non-empty directory/);
+      expectFail([INSTALL_SCRIPT, "uninstall", "--target", otherPluginDir, "--no-enable"], /Refusing to delete non-empty directory/);
+
+      const regularFileTarget = path.join(sandbox, "regular-file.txt");
+      await fs.writeFile(regularFileTarget, "keep-file", "utf8");
+      expectFail([INSTALL_SCRIPT, "install", "--target", regularFileTarget, "--no-enable"], /Refusing to delete/);
+      expectFail([INSTALL_SCRIPT, "uninstall", "--target", regularFileTarget, "--no-enable"], /Refusing to delete/);
+      assert.equal(await fs.readFile(regularFileTarget, "utf8"), "keep-file");
+
+      // 4. Empty dir, overwrite upgrade, self-uninstall (no src/), and symlink/broken-link safety
+      const emptyForInstall = path.join(sandbox, "empty-install");
+      await fs.mkdir(emptyForInstall, { recursive: true });
+      run([INSTALL_SCRIPT, "install", "--target", emptyForInstall, "--no-enable"]);
+      const staleMarker = path.join(emptyForInstall, "stale.tmp");
+      await fs.writeFile(staleMarker, "old", "utf8");
+      run([INSTALL_SCRIPT, "install", "--target", emptyForInstall, "--no-enable"]);
+      await assert.rejects(fs.stat(staleMarker));
+      run([path.join(emptyForInstall, "scripts", "install.mjs"), "uninstall", "--target", emptyForInstall, "--no-enable"]);
+      await assert.rejects(fs.lstat(emptyForInstall));
+
+      const emptyForUninstall = path.join(sandbox, "empty-uninstall");
+      await fs.mkdir(emptyForUninstall, { recursive: true });
+      run([INSTALL_SCRIPT, "uninstall", "--target", emptyForUninstall, "--no-enable"]);
+      await assert.rejects(fs.lstat(emptyForUninstall));
+
+      const repoLinkTarget = path.join(sandbox, "dev-link");
+      run([INSTALL_SCRIPT, "install", "--target", repoLinkTarget, "--link", "--no-enable"]);
+      const symlinkInstaller = path.join(repoLinkTarget, "scripts", "install.mjs");
+      run(["--preserve-symlinks-main", symlinkInstaller, "install", "--target", repoLinkTarget, "--link", "--no-enable"]);
+      assert.equal(await fs.realpath(repoLinkTarget), await fs.realpath(process.cwd()));
+      run(["--preserve-symlinks-main", symlinkInstaller, "install", "--target", repoLinkTarget, "--no-enable"]);
+      assert.ok(!(await fs.lstat(repoLinkTarget)).isSymbolicLink());
+      assert.ok((await fs.stat(path.join(repoLinkTarget, "plugin.json"))).isFile());
+      run([INSTALL_SCRIPT, "install", "--target", repoLinkTarget, "--link", "--no-enable"]);
+      run([INSTALL_SCRIPT, "uninstall", "--target", repoLinkTarget, "--no-enable"]);
+      await assert.rejects(fs.lstat(repoLinkTarget));
+      assert.ok((await fs.stat(path.join(process.cwd(), "src"))).isDirectory());
+
+      const extLink = path.join(sandbox, "ext-link-rm");
+      await fs.symlink(nonPluginDir, extLink, linkType);
+      run([INSTALL_SCRIPT, "uninstall", "--target", extLink, "--no-enable"]);
+      await assert.rejects(fs.lstat(extLink));
+      assert.equal(await fs.readFile(keepUserFile, "utf8"), "do-not-delete");
+
+      const deadTarget = path.join(sandbox, "dead-target");
+      const brokenLink = path.join(sandbox, "broken-link");
+      await fs.mkdir(deadTarget, { recursive: true });
+      await fs.symlink(deadTarget, brokenLink, linkType);
+      await fs.rmdir(deadTarget);
+      run([INSTALL_SCRIPT, "uninstall", "--target", brokenLink, "--no-enable"]);
+      await assert.rejects(fs.lstat(brokenLink));
+    } finally {
+      await fs.unlink(parentAlias).catch(() => {});
+      await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  });
 });

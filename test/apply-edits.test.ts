@@ -541,4 +541,192 @@ describe("apply_edits", () => {
     assert.equal(stringifiedRes.isError, false);
     assert.equal(await fs.readFile(file, "utf8"), "export const x = 42;\n");
   });
+
+  function makeErrnoError(code: string, message: string): NodeJS.ErrnoException {
+    const err = new Error(message) as NodeJS.ErrnoException;
+    err.code = code;
+    return err;
+  }
+
+  it("does not fall back to direct write or leave tmp files when temp write fails in Phase 2", async () => {
+    const subDir = path.join(tmpDir, "phase2-tmp-fail");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+    const firstFile = path.join(realSubDir, "first.txt");
+    const targetFile = path.join(realSubDir, "target.txt");
+    await fs.writeFile(firstFile, "first orig\n", "utf8");
+    await fs.writeFile(targetFile, "target orig\n", "utf8");
+
+    const origWriteFile = fs.writeFile;
+    let directWriteAttempted = false;
+    fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
+      const p = String(args[0]);
+      if (p.startsWith(`${targetFile}.agy-fast-tmp-`)) {
+        await origWriteFile(p, "partial");
+        throw makeErrnoError("ENOSPC", "ENOSPC: no space left on device");
+      }
+      if (p === targetFile) {
+        directWriteAttempted = true;
+        await origWriteFile(p, "");
+        throw makeErrnoError("ENOSPC", "ENOSPC: no space left on device");
+      }
+      return origWriteFile(...args);
+    }) as typeof fs.writeFile;
+
+    try {
+      const res = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [
+          { path: "first.txt", hunks: [{ target: "first orig", replacement: "first mod" }] },
+          { path: "target.txt", hunks: [{ target: "target orig", replacement: "target mod" }] },
+        ],
+      });
+      assert.equal(res.isError, true);
+      assert.match(res.text, /Write failed \(changes rolled back\)/);
+      assert.match(res.text, /ENOSPC/);
+      assert.equal(directWriteAttempted, false);
+    } finally {
+      fs.writeFile = origWriteFile;
+    }
+
+    assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
+    assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+  });
+
+  it("rolls back target file and removes partial created file when rename and fallback direct write both fail", async () => {
+    const subDir = path.join(tmpDir, "phase2-fallback-fail");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+    const firstFile = path.join(realSubDir, "first.txt");
+    const targetFile = path.join(realSubDir, "target.txt");
+    const newFile = path.join(realSubDir, "created-fail.txt");
+    await fs.writeFile(firstFile, "first orig\n", "utf8");
+    await fs.writeFile(targetFile, "target orig\n", "utf8");
+
+    const origRename = fs.rename;
+    const origWriteFile = fs.writeFile;
+    let targetWriteCalls = 0;
+
+    fs.rename = (async (...args: Parameters<typeof origRename>) => {
+      if (String(args[1]) === targetFile || String(args[1]) === newFile) {
+        throw makeErrnoError("EXDEV", "EXDEV: cross-device link not permitted");
+      }
+      return origRename(...args);
+    }) as typeof fs.rename;
+
+    fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
+      const p = String(args[0]);
+      if (p === targetFile && ++targetWriteCalls === 1) {
+        await origWriteFile(p, "");
+        throw makeErrnoError("EIO", "EIO: i/o error");
+      }
+      if (p === newFile) {
+        await origWriteFile(p, "");
+        throw makeErrnoError("EIO", "EIO: i/o error");
+      }
+      return origWriteFile(...args);
+    }) as typeof fs.writeFile;
+
+    try {
+      const existingRes = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [
+          { path: "first.txt", hunks: [{ target: "first orig", replacement: "first mod" }] },
+          { path: "target.txt", hunks: [{ target: "target orig", replacement: "target mod" }] },
+        ],
+      });
+      assert.equal(existingRes.isError, true);
+      assert.match(existingRes.text, /Write failed \(changes rolled back\)/);
+      assert.match(existingRes.text, /EIO/);
+      assert.equal(targetWriteCalls, 2);
+
+      const createdRes = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [{ path: "created-fail.txt", create: "new content\n" }],
+      });
+      assert.equal(createdRes.isError, true);
+      assert.match(createdRes.text, /Write failed \(changes rolled back\)/);
+      assert.match(createdRes.text, /EIO/);
+    } finally {
+      fs.rename = origRename;
+      fs.writeFile = origWriteFile;
+    }
+
+    assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
+    assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
+    await assert.rejects(() => fs.stat(newFile), { code: "ENOENT" });
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+  });
+
+  it("fails fast on non-ENOENT errors in create without overwriting or deleting existing files", async () => {
+    const subDir = path.join(tmpDir, "create-non-enoent");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+    const statErrFile = path.join(realSubDir, "stat-err.txt");
+    const busyFile = path.join(realSubDir, "busy.txt");
+    const otherFile = path.join(realSubDir, "other.txt");
+    await fs.writeFile(statErrFile, "keep stat-err\n", "utf8");
+    await fs.writeFile(busyFile, "precious original\n", "utf8");
+    await fs.writeFile(otherFile, "other orig\n", "utf8");
+
+    const origStat = fs.stat;
+    fs.stat = (async (...args: Parameters<typeof origStat>) => {
+      if (String(args[0]) === statErrFile) {
+        throw makeErrnoError("EACCES", `EACCES: permission denied, stat '${statErrFile}'`);
+      }
+      return origStat(...args);
+    }) as typeof fs.stat;
+
+    try {
+      const statRes = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [{ path: "stat-err.txt", create: "clobbered\n" }],
+      });
+      assert.equal(statRes.isError, true);
+      assert.match(statRes.text, /0 files modified/);
+      assert.match(statRes.text, /EACCES/);
+    } finally {
+      fs.stat = origStat;
+    }
+    assert.equal(await fs.readFile(statErrFile, "utf8"), "keep stat-err\n");
+
+    const origReadFile = fs.readFile;
+    fs.readFile = (async (...args: Parameters<typeof origReadFile>) => {
+      if (String(args[0]) === busyFile) {
+        throw makeErrnoError("EBUSY", `EBUSY: resource busy or locked, open '${busyFile}'`);
+      }
+      return origReadFile(...args);
+    }) as typeof fs.readFile;
+
+    try {
+      const atomicRes = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [
+          { path: "busy.txt", create: "replaced\n", overwrite: true },
+          { path: "other.txt", hunks: [{ target: "other orig", replacement: "other mod" }] },
+        ],
+      });
+      assert.equal(atomicRes.isError, true);
+      assert.match(atomicRes.text, /0 files modified/);
+      assert.match(atomicRes.text, /EBUSY/);
+
+      const partialRes = await runApplyEdits({
+        cwd: realSubDir,
+        bestEffort: true,
+        edits: [
+          { path: "busy.txt", create: "replaced\n", overwrite: true },
+          { path: "other.txt", hunks: [{ target: "other orig", replacement: "other mod" }] },
+        ],
+      });
+      assert.equal(partialRes.isError, true);
+      assert.match(partialRes.text, /Partial edit applied \(1\/2 file\(s\) written; 1 file\(s\) failed/);
+      assert.match(partialRes.text, /EBUSY/);
+    } finally {
+      fs.readFile = origReadFile;
+    }
+
+    assert.equal(await fs.readFile(busyFile, "utf8"), "precious original\n");
+    assert.equal(await fs.readFile(otherFile, "utf8"), "other mod\n");
+  });
 });

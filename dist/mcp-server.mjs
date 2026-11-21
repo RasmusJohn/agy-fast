@@ -1214,12 +1214,22 @@ async function commitPlannedWrites(plans) {
         if (plan.originalMode !== null && process.platform !== "win32") {
           await fs2.chmod(tmpPath, plan.originalMode);
         }
+      } catch (tmpErr) {
+        try {
+          await fs2.unlink(tmpPath);
+        } catch {
+        }
+        throw tmpErr;
+      }
+      try {
         await fs2.rename(tmpPath, target);
+        written.push(plan);
       } catch (renameErr) {
         try {
           await fs2.unlink(tmpPath);
         } catch {
         }
+        written.push(plan);
         await fs2.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
@@ -1229,7 +1239,6 @@ async function commitPlannedWrites(plans) {
         }
         void renameErr;
       }
-      written.push(plan);
     }
   } catch (err) {
     for (let i = written.length - 1; i >= 0; i--) {
@@ -1405,8 +1414,17 @@ async function runApplyEdits(input) {
         }
         originalMode = st.mode & 4095;
         originalBuffer = await fs2.readFile(item.writeTargetPath);
-      } catch {
-        exists = false;
+      } catch (err) {
+        if (err?.code === "ENOENT") {
+          exists = false;
+          originalBuffer = null;
+          originalMode = null;
+        } else {
+          errors.push(
+            `${item.relPath}: ${err instanceof Error ? err.message : String(err)}`
+          );
+          continue;
+        }
       }
       const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
       const newLines = countLines(item.create);
@@ -1684,21 +1702,21 @@ var ALLOWED_BRANCH_BOOL_FLAGS = /* @__PURE__ */ new Set([
   "--ignore-case",
   "--omit-empty",
   "--no-column",
-  "--quiet",
-  "--merged",
-  "--no-merged"
+  "--quiet"
 ]);
-var ALLOWED_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
+var ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--merged",
   "--no-merged",
+  "--abbrev",
+  "--color",
+  "--column"
+]);
+var ALLOWED_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--contains",
   "--no-contains",
   "--points-at",
   "--sort",
-  "--format",
-  "--abbrev",
-  "--color",
-  "--column"
+  "--format"
 ]);
 var ALLOWED_BRANCH_SHORT_CHARS = /* @__PURE__ */ new Set(["a", "r", "v", "l", "q", "i"]);
 var ALLOWED_TAG_BOOL_FLAGS = /* @__PURE__ */ new Set([
@@ -1707,20 +1725,20 @@ var ALLOWED_TAG_BOOL_FLAGS = /* @__PURE__ */ new Set([
   "--no-color",
   "--ignore-case",
   "--omit-empty",
-  "--no-column",
+  "--no-column"
+]);
+var ALLOWED_TAG_OPTIONAL_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--merged",
-  "--no-merged"
+  "--no-merged",
+  "--color",
+  "--column"
 ]);
 var ALLOWED_TAG_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--contains",
   "--no-contains",
-  "--merged",
-  "--no-merged",
   "--points-at",
   "--sort",
-  "--format",
-  "--color",
-  "--column"
+  "--format"
 ]);
 var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "v", "i"]);
 var ALLOWED_REMOTE_SUBCOMMANDS = /* @__PURE__ */ new Set(["show", "get-url"]);
@@ -1818,14 +1836,12 @@ function validateReadonlyGitArgs(pattern) {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
+          if (!ALLOWED_BRANCH_VALUE_FLAGS.has(flagName) && !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
           }
         } else if (ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
-          if (flagName !== "--merged" && flagName !== "--no-merged") {
-            expectValue = true;
-          }
-        } else if (!ALLOWED_BRANCH_BOOL_FLAGS.has(flagName)) {
+          expectValue = true;
+        } else if (!ALLOWED_BRANCH_BOOL_FLAGS.has(flagName) && !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
         }
         if (flagName === "--list") hasListFlag = true;
@@ -1862,14 +1878,12 @@ function validateReadonlyGitArgs(pattern) {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
+          if (!ALLOWED_TAG_VALUE_FLAGS.has(flagName) && !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
           }
         } else if (ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
-          if (flagName !== "--merged" && flagName !== "--no-merged") {
-            expectValue = true;
-          }
-        } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName)) {
+          expectValue = true;
+        } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName) && !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
         }
         if (flagName === "--list" || flagName === "--verify") {
