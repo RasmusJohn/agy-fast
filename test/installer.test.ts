@@ -68,6 +68,20 @@ describe("installer", () => {
     }
     await assert.rejects(fs.stat(path.join(expectedDir, "node_modules")));
 
+    // Verify installed mcp_config.json enables eager tool loading for all 4 tools
+    const installedMcpCfg = JSON.parse(
+      await fs.readFile(path.join(expectedDir, "mcp_config.json"), "utf8"),
+    ) as {
+      mcpServers?: { fast?: { tools?: Record<string, { eager?: boolean }> } };
+    };
+    for (const toolName of ["batch_search", "apply_edits", "read_slices", "run_checks"]) {
+      assert.equal(
+        installedMcpCfg.mcpServers?.fast?.tools?.[toolName]?.eager,
+        true,
+        `Expected ${toolName} to have eager: true in mcp_config.json`,
+      );
+    }
+
     // Doctor passes when run both from source and from installed directory
     const docOut = execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
       env,
