@@ -5,6 +5,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.7] - 2026-11-21
+
+### Added & Improved
+
+- **Antigravity host surface & version compatibility controller (#10, building on `@fwyc0573`)**
+  - Added a declarative host compatibility controller (`src/utils/host-compat.ts`) that detects Antigravity **CLI**, **Desktop 2.0**, **IDE**, and third-party MCP hosts via MCP `initialize` `clientInfo`, `SessionStart` `.gemini/antigravity*` paths, and `ANTIGRAVITY_LS_VERSION` (supporting 4-part builds and SemVer 2.0 prerelease precedence with strict cross-surface and third-party client isolation).
+  - Defaults to **token-saving native `array` edits** (~2.6x–3.3x fewer output tokens, 0 extra `SessionStart` bytes) on Desktop 2.0, IDE, third-party MCP hosts, and unaffected CLI versions; automatically activates JSON array string `apply_edits` schemas and a compact 1-line `[agy-fast compat]` SessionStart directive on affected Antigravity CLI 1.5.x builds to prevent lazy `call_mcp_tool` `edits: []` payload drops (server runtime always accepts both formats).
+  - Added explicit overrides via `AGY_FAST_EDITS_FORMAT=auto|array|string`, `AGY_FAST_HOST`, and `scripts/install.mjs config/install --edits-format`, plus live `Host compat` diagnostics in `scripts/install.mjs doctor`.
+- **Workspace root as default `cwd` & MCP `roots/list` hardening (#9, thanks `@fwyc0573`)**
+  - Queries MCP `roots/list` after `notifications/initialized` and `notifications/roots/list_changed`, resolving omitted and relative tool `cwd` values against the first valid workspace root without mutating global `process.cwd()`.
+  - Hardened `src/protocol/mcp.ts` with bounded wait timeouts, stdin EOF/error unblocking, monotonic sequence deduplication, a 64-entry `knownRootsIds` cap, per-dispatch outgoing queues that flush before `waitForRoots()` to avoid batch self-deadlocks, mixed `\n\r\n` `Content-Length` framing, and graceful `stdout` `EPIPE` handling.
+- **170 s shared `run_checks` & `apply_edits` verify call budget (#9, thanks `@fwyc0573`)**
+  - Caps `run_checks` and `apply_edits` `verify` timeouts at `170 s` (under Antigravity's `180 s` MCP call ceiling) and shares a monotonic `performance.now()` call budget across all commands in a `run_checks` batch, reporting skipped commands cleanly as `[NOT RUN]`.
+  - Rejects boolean/non-numeric timeout coercion and validates non-string `commands[i].cwd`.
+- **Windows selective PowerShell routing & console codepage decoding (#1, thanks `@BLACK-BIRTHDAY`)**
+  - Automatically routes Windows commands containing PowerShell syntax (`$env:`, cmdlets, `$x = ...`, `$(...)`, `@(...)`) through `pwsh` -> `powershell.exe` -> `cmd.exe` (caching resolved executable paths) with UTF-8 output encoding, while keeping plain cross-platform commands on `cmd.exe`.
+  - Decodes non-UTF-8 Windows console output (CP936/GBK, CP950/Big5, CP932/Shift_JIS, CP949/EUC-KR, CP1250–1258, CP850/CP437) cleanly without mojibake or mid-sequence UTF-8 corruption.
+
+### Fixed
+
+- **`apply_edits` empty-array & malformed-JSON argument handling (#10, thanks `@fwyc0573`)**
+  - Treats `edits: []` / `"[]"` and stringified `"true"`/`"false"`/`"null"` literals as `call_mcp_tool` serialization corruption (displaying decoded types and triggering immediate fallback to parallel `edit_file`/`write_file`), reports precise `JSON.parse` / non-array diagnostics for malformed `edits` strings, and counts `edits: []` in `benchmark` corrupted-argument metrics.
+- **Deterministic `batch_search` truncation & `rg`/Node parity (#9, thanks `@fwyc0573`)**
+  - Uses a 2-pass `--count` -> `--json` flow for directory `rg` searches so `maxResults` truncation always keeps the first matches in deterministic path order; adds unconditional `--no-config` and `--crlf`, guards bare `-` filenames, enforces 2 MB / binary / `glob` checks on single-file targets, keeps truncated `contextLines` without line-number gaps, tolerates transient Pass-2 ENOENT when stderr is empty, and aligns negated `!glob` in Node fallback.
+- **Python symbol outline accuracy & syntax recovery (#9, thanks `@fwyc0573`)**
+  - Fixes Python decorator/body ranges across triple-quoted strings, multiline calls/signatures, backslash continuations inside quoted strings, Python 3.12+ PEP 701 f-strings (same-quote reuse, multiline expressions, format specs), and mid-edit unclosed bracket recovery.
+
+### 简体中文摘要（v0.2.7）
+
+- **Antigravity 宿主端与版本检查控制器（#10，基于 `@fwyc0573` 贡献扩展）**：新增 `src/utils/host-compat.ts` 识别 CLI / 桌面端 2.0 / IDE / 第三方客户端及版本（支持 4 段版本号、SemVer 2.0 预发布比较与跨端/第三方严格隔离）；默认采用省 token 的原生数组参数（桌面端/IDE/其他客户端 0 额外 `SessionStart` 字节），仅在受影响的 Antigravity CLI 1.5.x 自动切换 `apply_edits.edits` 为 JSON 数组字符串以规避 `call_mcp_tool` `[]` 丢参；支持 `AGY_FAST_EDITS_FORMAT`、`AGY_FAST_HOST`、`install.mjs config/install --edits-format` 覆盖与 `doctor` 实时诊断。
+- **工作区默认 `cwd` 与 MCP `roots/list` 协议加固（#9，感谢 `@fwyc0573`）**：通过 `roots/list` 自动将省略/相对 `cwd` 解析至工作区根目录（不修改全局 `process.cwd()`），补齐超时/EOF/乱序防死锁、`knownRootsIds` 上限、批处理队列防自死锁、混合 `\n\r\n` 分帧与 `EPIPE` 优雅退出。
+- **`run_checks` / `apply_edits` 170s 共享调用预算（#9）**：适配 Antigravity 180s MCP 超时上限，采用单调时钟 `performance.now()` 共享预算并明确标记 `[NOT RUN]`；拦截布尔/非数值超时强转与非字符串 `commands[i].cwd`。
+- **Windows 选择性 PowerShell 路由与多代码页解码（#1，感谢 `@BLACK-BIRTHDAY`）**：仅对含 PowerShell 语法的命令按 `pwsh -> powershell.exe -> cmd.exe` 路由并强制 UTF-8 输出，同时无乱码解码 GBK/CP936、Big5、Shift_JIS、EUC-KR 及 CP1250–1258 等控制台编码。
+- **`apply_edits` 空数组熔断、稳定 `batch_search` 截断与 Python 大纲加固（#9, #10）**：将 `edits: []`/`"[]"` 与 `"true"`/`"false"`/`"null"` 纳入参数丢失熔断并精确报告非法 JSON；`batch_search` 采用路径有序 2-pass 截断并补齐 `--no-config`/`--crlf`/单文件过滤/中途删文件容错与 `!glob` 一致性；Python 大纲支持字符串内 `\` 续行、PEP 701 f-string 与未闭合括号恢复。
+
+---
+
 ## [0.2.6] - 2026-11-21
 
 ### Security & Runtime Hardening (#7, thanks `@hzhe0083-source`)
