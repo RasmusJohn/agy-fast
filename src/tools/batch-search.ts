@@ -240,7 +240,29 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
     }
   }
 
-  if (subcmd === "branch") {
+  if (subcmd === "status") {
+    for (const arg of rest) {
+      if (arg === "--") break;
+      if (arg.startsWith("--")) {
+        const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
+        if (flagName.startsWith("--v")) {
+          throw new Error(
+            `Flag '${arg}' is not allowed in read-only git status query (verbose status executes diff textconv; use 'diff' instead)`,
+          );
+        }
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        for (const ch of arg.slice(1)) {
+          // -u[<mode>] and -M[<n>] consume the remainder of the token as their value
+          if (ch === "u" || ch === "M") break;
+          if (ch === "v") {
+            throw new Error(
+              `Flag '${arg}' is not allowed in read-only git status query (verbose status executes diff textconv; use 'diff' instead)`,
+            );
+          }
+        }
+      }
+    }
+  } else if (subcmd === "branch") {
     let hasListFlag = false;
     let expectValue = false;
     let expectNonFlagCommit = false;

@@ -641,17 +641,23 @@ var MCP_CALL_BUDGET_SEC = 170;
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
-    try {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true
-      });
-      killer.unref();
-    } catch {
+    const fallbackKill = () => {
       try {
         process.kill(pid, "SIGTERM");
       } catch {
       }
+    };
+    try {
+      const { bin: taskkillBin, cwd } = getWindowsSystem32Binary("taskkill.exe");
+      const killer = spawn(taskkillBin, ["/PID", String(pid), "/T", "/F"], {
+        cwd,
+        stdio: "ignore",
+        windowsHide: true
+      });
+      killer.on("error", fallbackKill);
+      killer.unref();
+    } catch {
+      fallbackKill();
     }
     return;
   }
@@ -2802,7 +2808,28 @@ function validateReadonlyGitArgs(pattern) {
       throw new Error(`Flag '${arg}' is not allowed in read-only git query`);
     }
   }
-  if (subcmd === "branch") {
+  if (subcmd === "status") {
+    for (const arg of rest) {
+      if (arg === "--") break;
+      if (arg.startsWith("--")) {
+        const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
+        if (flagName.startsWith("--v")) {
+          throw new Error(
+            `Flag '${arg}' is not allowed in read-only git status query (verbose status executes diff textconv; use 'diff' instead)`
+          );
+        }
+      } else if (arg.startsWith("-") && arg.length > 1) {
+        for (const ch of arg.slice(1)) {
+          if (ch === "u" || ch === "M") break;
+          if (ch === "v") {
+            throw new Error(
+              `Flag '${arg}' is not allowed in read-only git status query (verbose status executes diff textconv; use 'diff' instead)`
+            );
+          }
+        }
+      }
+    }
+  } else if (subcmd === "branch") {
     let hasListFlag = false;
     let expectValue = false;
     let expectNonFlagCommit = false;

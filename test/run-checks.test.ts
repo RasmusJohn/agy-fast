@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
 import {
   buildPowerShellUtf8Command,
   decodeProcessOutput,
+  execBinaryAsync,
   formatPowerShellCommand,
   needsPowerShellOnWindows,
   parseWindowsCodePage,
@@ -353,6 +356,55 @@ describe("run_checks", () => {
         } else {
           process.env.AGY_FAST_PWSH_TEST = prev;
         }
+      }
+    });
+
+    it("falls back cleanly without crashing when taskkill is unavailable on command timeout", async () => {
+      const savedEnv = { ...process.env };
+      const savedPath = process.env.PATH;
+      const savedSystemRoot = process.env.SystemRoot;
+      const savedWindir = process.env.WINDIR;
+      try {
+        // 1. Empty PATH with intact SystemRoot resolves System32\taskkill.exe directly
+        process.env.PATH = "";
+        const resWithSysRoot = await execBinaryAsync(
+          process.execPath,
+          ["-e", "setTimeout(() => {}, 10000)"],
+          { cwd: process.cwd(), timeoutMs: 250, env: savedEnv },
+        );
+        assert.equal(resWithSysRoot.timedOut, true);
+        assert.notEqual(resWithSysRoot.signal, "SIGKILL");
+        assert.ok(resWithSysRoot.durationMs < 1400, `expected prompt termination, got ${resWithSysRoot.durationMs}ms`);
+
+        // 2. Empty PATH + missing SystemRoot/WINDIR emits async spawn ENOENT, handled by error listener + fallbackKill
+        delete process.env.SystemRoot;
+        delete process.env.WINDIR;
+        const resNoTaskkill = await execBinaryAsync(
+          process.execPath,
+          ["-e", "setTimeout(() => {}, 10000)"],
+          { cwd: process.cwd(), timeoutMs: 250, env: savedEnv },
+        );
+        assert.equal(resNoTaskkill.timedOut, true);
+        assert.notEqual(resNoTaskkill.signal, "SIGKILL");
+        assert.ok(resNoTaskkill.durationMs < 1400, `expected fallbackKill before settle timer, got ${resNoTaskkill.durationMs}ms`);
+
+        // 3. Invalid SystemRoot (nonexistent bin + invalid cwd) also emits async ENOENT handled by fallbackKill
+        process.env.SystemRoot = path.join(os.tmpdir(), "agy-fast-nonexistent-sysroot");
+        const resBadSysRoot = await execBinaryAsync(
+          process.execPath,
+          ["-e", "setTimeout(() => {}, 10000)"],
+          { cwd: process.cwd(), timeoutMs: 250, env: savedEnv },
+        );
+        assert.equal(resBadSysRoot.timedOut, true);
+        assert.notEqual(resBadSysRoot.signal, "SIGKILL");
+        assert.ok(resBadSysRoot.durationMs < 1400, `expected fallbackKill before settle timer, got ${resBadSysRoot.durationMs}ms`);
+      } finally {
+        if (savedPath === undefined) delete process.env.PATH;
+        else process.env.PATH = savedPath;
+        if (savedSystemRoot === undefined) delete process.env.SystemRoot;
+        else process.env.SystemRoot = savedSystemRoot;
+        if (savedWindir === undefined) delete process.env.WINDIR;
+        else process.env.WINDIR = savedWindir;
       }
     });
   }

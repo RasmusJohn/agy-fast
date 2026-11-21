@@ -855,9 +855,54 @@ describe("batch_search", () => {
       assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
       assert.equal(await fs.access(markerGpg).then(() => true, () => false), false);
 
-      // Prefix abbreviations of --ext-diff / --textconv are also rejected
+      // Prefix abbreviations of --ext-diff / --textconv and verbose git status flags are also rejected
       assert.throws(() => validateReadonlyGitArgs("diff --textc"), /not allowed/i);
       assert.throws(() => validateReadonlyGitArgs("diff --ext-dif"), /not allowed/i);
+      for (const badStatus of [
+        "status -v",
+        "status -vv",
+        "status --verbose",
+        "status --verb",
+        "status --v",
+        "status --verbose=2",
+        "status -bv",
+        "status -sv",
+        "status -vuall",
+        "status --long -v",
+      ]) {
+        assert.throws(() => validateReadonlyGitArgs(badStatus), `Expected '${badStatus}' to be rejected`);
+      }
+      for (const okStatus of [
+        "status",
+        "status --short",
+        "status -sb",
+        "status -uall",
+        "status -suall",
+        "status -M50",
+        "status --no-verbose",
+        "status -- -v",
+        "status -- --verbose",
+      ]) {
+        assert.doesNotThrow(() => validateReadonlyGitArgs(okStatus), `Expected '${okStatus}' to be allowed`);
+      }
+
+      // Stage doc.txt as well so both staged (-v/--verbose) and unstaged (-vv) textconv paths are covered
+      execFileSync("git", ["add", "doc.txt"], { cwd: untrustedRepo });
+      await fs.writeFile(path.join(untrustedRepo, "doc.txt"), "v3\n", "utf8");
+      const statusRes = await runBatchSearch({
+        cwd: untrustedRepo,
+        queries: [
+          { type: "git", pattern: "status -v" },
+          { type: "git", pattern: "status -vv" },
+          { type: "git", pattern: "status --verbose" },
+          { type: "git", pattern: "status --no-verbose" },
+        ],
+      });
+      assert.equal(statusRes.isError, false);
+      assert.match(statusRes.text, /Flag '-v' is not allowed/);
+      assert.match(statusRes.text, /Flag '-vv' is not allowed/);
+      assert.match(statusRes.text, /Flag '--verbose' is not allowed/);
+      assert.equal(await fs.access(markerTc).then(() => true, () => false), false);
     } finally {
       await fs.rm(untrustedRepo, { recursive: true, force: true });
     }

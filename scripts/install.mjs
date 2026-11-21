@@ -321,6 +321,42 @@ function toComparePath(p) {
     : normalized;
 }
 
+async function canonicalizeExistingPath(p) {
+  const resolved = path.resolve(p);
+  const tail = [];
+  let cur = resolved;
+  while (true) {
+    try {
+      const real = await fs.realpath(cur);
+      return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+    } catch (err) {
+      if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") {
+        return resolved;
+      }
+      const parent = path.dirname(cur);
+      if (parent === cur) {
+        return resolved;
+      }
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+async function canonicalizeEntryComparePath(p) {
+  const resolved = path.resolve(p);
+  const stat = await lstatSafe(resolved);
+  if (stat && !stat.isSymbolicLink()) {
+    return toComparePath(await canonicalizeExistingPath(resolved));
+  }
+  const parent = path.dirname(resolved);
+  if (parent === resolved) {
+    return toComparePath(resolved);
+  }
+  const realParent = await canonicalizeExistingPath(parent);
+  return toComparePath(path.join(realParent, path.basename(resolved)));
+}
+
 function isStrictAncestorPath(ancestorPath, descendantPath) {
   const rel = path.relative(ancestorPath, descendantPath);
   return (
@@ -533,16 +569,19 @@ async function isDirSafe(p) {
 
 async function discoverIsolatedPluginDirs(primaryGlobalDir) {
   const home = getHomeDir();
-  const primaryCompare = toComparePath(primaryGlobalDir);
-  const defaultGeminiCompare = toComparePath(path.join(home, ".gemini"));
+  const primaryCompare = await canonicalizeEntryComparePath(primaryGlobalDir);
+  const defaultGeminiCompare = toComparePath(
+    await canonicalizeExistingPath(path.join(home, ".gemini")),
+  );
   const seen = new Set([primaryCompare]);
   const results = [];
 
-  const addCandidate = (geminiRoot, label) => {
+  const addCandidate = async (geminiRoot, label) => {
     const resolvedRoot = path.resolve(geminiRoot);
-    if (toComparePath(resolvedRoot) === defaultGeminiCompare) return;
+    const rootCompare = toComparePath(await canonicalizeExistingPath(resolvedRoot));
+    if (rootCompare === defaultGeminiCompare) return;
     const pluginDir = path.join(resolvedRoot, "config", "plugins", PLUGIN_NAME);
-    const key = toComparePath(pluginDir);
+    const key = await canonicalizeEntryComparePath(pluginDir);
     if (seen.has(key)) return;
     seen.add(key);
     results.push({ geminiRoot: resolvedRoot, pluginDir, label });
@@ -560,7 +599,7 @@ async function discoverIsolatedPluginDirs(primaryGlobalDir) {
       const hasConfig = await isDirSafe(path.join(profileRoot, "config"));
       const hasAcp = await isDirSafe(path.join(profileRoot, "antigravity-acp"));
       if (hasConfig || hasAcp) {
-        addCandidate(profileRoot, `T3 Code ACP (${entry.name.slice(0, 8)})`);
+        await addCandidate(profileRoot, `T3 Code ACP (${entry.name.slice(0, 8)})`);
       }
     }
   } catch {
@@ -575,7 +614,7 @@ async function discoverIsolatedPluginDirs(primaryGlobalDir) {
       const hasConfig = await isDirSafe(path.join(resolvedEnv, "config"));
       const hasAcp = await isDirSafe(path.join(resolvedEnv, "antigravity-acp"));
       if (hasConfig || hasAcp) {
-        addCandidate(resolvedEnv, "GEMINI_HOME");
+        await addCandidate(resolvedEnv, "GEMINI_HOME");
       }
     }
   }
@@ -628,14 +667,29 @@ async function inspectIsolatedPluginDir(isolated) {
 
 async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, opts) {
   const isoStat = await lstatSafe(isolated.pluginDir);
-  const srcCompare = toComparePath(resolvedSrc);
-  const primaryCompare = toComparePath(primaryGlobalDir);
+  const srcCompare = toComparePath(await canonicalizeExistingPath(resolvedSrc));
+  const primaryStat = await lstatSafe(primaryGlobalDir);
+  const primaryRealPath =
+    primaryStat && !primaryStat.isSymbolicLink()
+      ? await canonicalizeExistingPath(primaryGlobalDir)
+      : primaryGlobalDir;
+  const primaryCompare =
+    primaryStat && !primaryStat.isSymbolicLink()
+      ? toComparePath(primaryRealPath)
+      : await canonicalizeEntryComparePath(primaryGlobalDir);
+  const isoEntryCompare = await canonicalizeEntryComparePath(isolated.pluginDir);
+  if (isoEntryCompare === primaryCompare) {
+    return { synced: true, mode: "same" };
+  }
   if (isoStat && !isoStat.isSymbolicLink()) {
     const isoCompare = toComparePath(await fs.realpath(isolated.pluginDir));
     if (isoCompare === srcCompare || isoCompare === primaryCompare) {
       return { synced: true, mode: "same" };
     }
-    if (isStrictAncestorPath(isoCompare, srcCompare) || isStrictAncestorPath(isoCompare, primaryCompare)) {
+    if (
+      isStrictAncestorPath(isoCompare, srcCompare) ||
+      isStrictAncestorPath(isoCompare, primaryCompare)
+    ) {
       throw new Error(
         `Refusing to sync into ${isolated.pluginDir}: target is an ancestor directory of ${resolvedSrc}.`,
       );
@@ -647,9 +701,9 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   await removeTargetPath(isolated.pluginDir, isoStat);
 
   // Link directly to resolvedSrc in --link dev mode (avoids chained NTFS junctions on Windows),
-  // otherwise link to primaryGlobalDir so auto-updates to ~/.gemini/config/plugins/agy-fast
+  // otherwise link to primaryRealPath so auto-updates to ~/.gemini/config/plugins/agy-fast
   // propagate immediately to every isolated ACP profile.
-  const linkSource = opts.useLink ? resolvedSrc : primaryGlobalDir;
+  const linkSource = opts.useLink ? resolvedSrc : primaryRealPath;
   const linkType = process.platform === "win32" ? "junction" : "dir";
   let mode = "symlink";
   try {
@@ -1018,21 +1072,34 @@ async function runUpdate(opts) {
     (parsed.status === "updated" || parsed.status === "up-to-date" || opts.force)
   ) {
     const isolatedTargets = await discoverIsolatedPluginDirs(resolvedDst);
-    const dstStat = await lstatSafe(resolvedDst);
-    const linkTarget = dstStat?.isSymbolicLink() ? await fs.realpath(resolvedDst) : resolvedDst;
-    for (const isolated of isolatedTargets) {
-      const info = await inspectIsolatedPluginDir(isolated);
-      const alreadyLinkedToGlobal =
-        (info.status === "ok" || info.status === "disabled") &&
-        info.mode === "symlink" &&
-        info.linkTarget &&
-        toComparePath(path.resolve(path.dirname(isolated.pluginDir), info.linkTarget)) ===
-          toComparePath(linkTarget);
-      if (!alreadyLinkedToGlobal) {
-        await syncIsolatedPluginDir(linkTarget, linkTarget, isolated, {
-          ...opts,
-          useLink: false,
-        });
+    if (isolatedTargets.length > 0) {
+      let linkTarget;
+      try {
+        linkTarget = await fs.realpath(resolvedDst);
+      } catch (err) {
+        if (err?.code === "ENOENT") {
+          throw new Error(
+            `Primary plugin path ${resolvedDst} is a broken symlink. Run 'install' to repair it.`,
+          );
+        }
+        throw err;
+      }
+      const linkTargetCompare = toComparePath(linkTarget);
+      for (const isolated of isolatedTargets) {
+        const info = await inspectIsolatedPluginDir(isolated);
+        const resolvedLinkTarget =
+          (info.status === "ok" || info.status === "disabled") && info.mode === "symlink"
+            ? await canonicalizeExistingPath(isolated.pluginDir)
+            : null;
+        const alreadyLinkedToGlobal =
+          resolvedLinkTarget !== null &&
+          toComparePath(resolvedLinkTarget) === linkTargetCompare;
+        if (!alreadyLinkedToGlobal) {
+          await syncIsolatedPluginDir(linkTarget, linkTarget, isolated, {
+            ...opts,
+            useLink: false,
+          });
+        }
       }
     }
   }

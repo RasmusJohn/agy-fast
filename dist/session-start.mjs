@@ -180,17 +180,23 @@ var MCP_CALL_BUDGET_SEC = 170;
 function killChildTree(pid, detached) {
   if (!pid) return;
   if (process.platform === "win32") {
-    try {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true
-      });
-      killer.unref();
-    } catch {
+    const fallbackKill = () => {
       try {
         process.kill(pid, "SIGTERM");
       } catch {
       }
+    };
+    try {
+      const { bin: taskkillBin, cwd } = getWindowsSystem32Binary("taskkill.exe");
+      const killer = spawn(taskkillBin, ["/PID", String(pid), "/T", "/F"], {
+        cwd,
+        stdio: "ignore",
+        windowsHide: true
+      });
+      killer.on("error", fallbackKill);
+      killer.unref();
+    } catch {
+      fallbackKill();
     }
     return;
   }

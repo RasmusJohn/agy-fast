@@ -452,4 +452,64 @@ describe("installer", () => {
       await fs.rm(customGeminiHome, { recursive: true, force: true });
     }
   });
+
+  it("does not destroy primary install or fail uninstall when $HOME is a symlink/junction aliased by GEMINI_HOME", async () => {
+    const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-home-alias-"));
+    const realHome = path.join(sandbox, "real-home");
+    const linkHome = path.join(sandbox, "link-home");
+    const realGemini = path.join(realHome, ".gemini");
+    const separateGemini = path.join(sandbox, "separate-gemini");
+    try {
+      await fs.mkdir(path.join(realGemini, "config"), { recursive: true });
+      await fs.mkdir(path.join(separateGemini, "config"), { recursive: true });
+      await fs.symlink(realHome, linkHome, process.platform === "win32" ? "junction" : "dir");
+
+      const aliasEnv = makeIsolatedEnv(linkHome, { GEMINI_HOME: realGemini });
+      const primaryViaLink = path.join(linkHome, ".gemini", "config", "plugins", "agy-fast");
+      const primaryViaReal = path.join(realGemini, "config", "plugins", "agy-fast");
+
+      // 1. Copied global install: GEMINI_HOME aliases ~/.gemini -> must NOT delete primary or create self-loop
+      const copyOut = execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable"], {
+        env: aliasEnv,
+        encoding: "utf8",
+      });
+      assert.doesNotMatch(copyOut, /Synced GEMINI_HOME/);
+      const realStat = await fs.lstat(primaryViaReal);
+      assert.equal(realStat.isSymbolicLink(), false);
+      assert.equal(realStat.isDirectory(), true);
+      assert.ok((await fs.stat(path.join(primaryViaReal, "dist", "mcp-server.mjs"))).isFile());
+
+      // 2. --link global install + uninstall: must NOT double-unlink with ENOENT
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--link", "--no-enable"], {
+        env: aliasEnv,
+        encoding: "utf8",
+      });
+      assert.equal((await fs.lstat(primaryViaReal)).isSymbolicLink(), true);
+      assert.equal(await fs.realpath(primaryViaLink), await fs.realpath(process.cwd()));
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "uninstall", "--no-enable"], {
+        env: aliasEnv,
+        encoding: "utf8",
+      });
+      await assert.rejects(fs.lstat(primaryViaReal));
+
+      // 3. Separate GEMINI_HOME alongside symlinked $HOME still syncs and uninstalls normally
+      const sepEnv = makeIsolatedEnv(linkHome, { GEMINI_HOME: separateGemini });
+      const sepPluginDir = path.join(separateGemini, "config", "plugins", "agy-fast");
+      const sepOut = execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable"], {
+        env: sepEnv,
+        encoding: "utf8",
+      });
+      assert.match(sepOut, /Synced GEMINI_HOME/);
+      assert.equal(await fs.realpath(sepPluginDir), await fs.realpath(primaryViaReal));
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "uninstall", "--no-enable"], {
+        env: sepEnv,
+        encoding: "utf8",
+      });
+      await assert.rejects(fs.lstat(primaryViaReal));
+      await assert.rejects(fs.lstat(sepPluginDir));
+    } finally {
+      await fs.unlink(linkHome).catch(() => {});
+      await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  });
 });
