@@ -309,6 +309,7 @@ npm install
 npm run typecheck   # Strict TypeScript check
 npm run build       # Bundle src/*.ts -> dist/*.mjs with esbuild
 npm test            # Run unit, MCP protocol, hook, benchmark, and installer tests
+npm run bench:stress # Run 12-scenario end-to-end stress & performance benchmark
 npm run validate    # Run `agy plugin validate --strict .`
 ```
 

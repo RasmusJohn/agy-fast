@@ -5,6 +5,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.4] - 2026-11-21
+
+### Fixed
+
+- **Circuit-breaker for corrupted `call_mcp_tool` nested arguments across all 4 MCP tools (`src/utils/arg-validation.ts`, `apply_edits`, `batch_search`, `read_slices`, `run_checks`)**
+  - Detects when Antigravity's untyped `call_mcp_tool` argument parser collapses nested edit/query/slice/command objects into booleans or `null` (e.g., `edits: [true]`, `[false, true]`, `[null]`, or `hunks: [true]`).
+  - Immediately returns a clear circuit-breaker error identifying the corrupted element type and instructing the caller **not** to retry the same payload and to fall back to parallel built-in tools—preventing multi-minute retry loops observed in live sessions.
+  - Eliminates uncaught `TypeError` crashes when `null`/primitive elements enter `queries`, `outlines`, or `hunks`, and seamlessly accepts stringified JSON array arguments.
+- **Read-only `git` shell chaining guard (`src/tools/batch-search.ts`)**
+  - Rejects standalone shell chaining operators (`&&`, `||`, `;`, `|`) inside `batch_search` `git` queries with a clear hint to split chained commands into separate queries rather than passing them to `git` as pathspecs.
+
+### Improved
+
+- **High-scale search & fuzzy-path performance (`src/utils/fuzzy-match.ts`, `src/utils/fs-utils.ts`, `src/tools/batch-search.ts`)**
+  - Added a zero-allocation ASCII fast path in `subsequenceCost` (replacing per-character `.flatMap` array allocations), switched hot-path filename sorting from ICU `localeCompare` to deterministic code-unit ordering, and replaced regex `matchAll` parsing of `rg --count`/`--files-with-matches` output with a direct `\0` index scan.
+- **Rules & benchmark diagnostics (`rules/AGENTS.md`, `src/benchmark-core.ts`)**
+  - Broadened Rule 3 to cover **all images** (`.png`/`.jpg`/`.webp`, including UI screenshots and business/debug captures) in `>150k`-token sessions to prevent prompt-cache invalidation spikes.
+  - Added corrupted-argument fallback guidance to Rule 5 and refined Rule 6 swarm worker briefing (compound read-only exploration + parallel ranged `read_file` when MCP/snapshots are absent).
+  - Added `agyCorruptedArgCalls`, `agyCorruptedArgWastedSec`, `agyCorruptedArgWastedOutTokens`, and `swarmWorkerSessions` metrics to `dist/benchmark.mjs`.
+- **12-scenario multi-dimensional stress benchmark (`scripts/stress-benchmark.mjs`, `npm run bench:stress`)**
+  - Exercises compiled `dist/mcp-server.mjs` and `dist/session-start.mjs` end-to-end across 3,000–6,000 file monorepos, `rg` + pure-Node fallback, 5×5,000-line / 40-file outlines + ReDoS resilience, 50-file atomic/Phase-2 disk rollback/`bestEffort`/2 MB noisy `verify`, 12-way `run_checks` + 5 MB log flood + grandchild process-tree kill, 400-request soak under a strict 128 MB V8 heap cap, 20-payload read-only git red-team checks, all 14 outline formats + 4-byte emoji truncation safety, and optional live real-repo benchmarking.
+
+### Documentation
+
+- **Reorganized English and Simplified Chinese READMEs (#4, thanks `@GoodCoder666`)**
+  - Added top status badges, KPI summary table, bottleneck breakdown, hybrid execution Mermaid architecture diagram, collapsible install/example/env sections, expanded AI-search-friendly FAQ, and Star History chart across [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md).
+
+### 简体中文摘要（v0.2.4）
+
+- **全 4 工具接入 `call_mcp_tool` 嵌套参数序列化损坏熔断与容错**：精准识别 `edits: [true]` / `[false, true]` / `[null]` 等底层序列化损坏，直接返回明确熔断提示引导立即回退并行原生工具（杜绝实测中反复重试白耗十余分钟的问题），同时修补 `queries`/`outlines`/`hunks` 收到 `null`/原始值可能抛 `TypeError` 的隐患，并兼容 JSON 字符串化数组参数。
+- **大规模搜索性能优化与只读 Git 链式拦截**：为 `fuzzy-match` 新增零分配 ASCII 快速路径、热路径排序移除昂贵的 ICU `localeCompare`、`rg` 汇总输出改为直接 `\0` 索引扫描，并在只读 `git` 校验中拦截独立 `&&`/`||`/`;`/`|` 链式符。
+- **规则与基准测试升级**：Rule 3 扩展至任意图片（避免 >150k 长对话缓存清零）、Rule 5 补入损坏参数熔断、Rule 6 优化 Swarm Worker 协作提示；`benchmark` 新增参数损坏耗时与 Swarm Worker 覆盖率指标；仓库新增 12 场景全链路压测套件（`npm run bench:stress`）。
+- **README 全面改版（#4，感谢 `@GoodCoder666`）**：中英文 README 新增徽章、核心指标速览表、混合架构 Mermaid 图、折叠式示例与更完整的常见问题 FAQ。
+
+---
+
 ## [0.2.3] - 2026-11-20
 
 ### Added

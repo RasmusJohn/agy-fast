@@ -307,6 +307,7 @@ npm install
 npm run typecheck   # TypeScript 严格类型检查
 npm run build       # 使用 esbuild 打包 src/*.ts -> dist/*.mjs
 npm test            # 运行单元测试、MCP 协议测试、Hook 测试、基准测试与安装器测试
+npm run bench:stress # 运行 12 场景端到端压测与性能基准套件
 npm run validate    # 运行 `agy plugin validate --strict .`
 ```
 
