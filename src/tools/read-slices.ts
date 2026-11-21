@@ -592,21 +592,65 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
   return symbols;
 }
 
+function isPythonFStringPrefix(line: string, quoteIdx: number): boolean {
+  let k = quoteIdx - 1;
+  while (k >= 0 && /[A-Za-z]/.test(line[k]!)) k--;
+  if (k >= 0 && /[0-9_]/.test(line[k]!)) return false;
+  const prefix = line.slice(k + 1, quoteIdx).toLowerCase();
+  return prefix === "f" || prefix === "fr" || prefix === "rf";
+}
+
 function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
+  const indentOf = (l: string) => (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
 
-  // Pre-compute triple-quoted multiline string state and paren balance per line
-  const inTripleString = new Array<boolean>(lines.length).fill(false);
-  const openParens = new Array<number>(lines.length).fill(0);
-  const closeParens = new Array<number>(lines.length).fill(0);
+  // Pre-compute whether each line continues the previous logical line: it starts
+  // inside a triple-quoted string, inside open brackets (multi-line signatures,
+  // calls, literals), inside a Python 3.12+ f-string expression, or after a
+  // backslash continuation.
+  const isContinuation = new Array<boolean>(lines.length).fill(false);
+  const inStringContinuation = new Array<boolean>(lines.length).fill(false);
   let activeQuote: '"""' | "'''" | null = null;
+  let activeSingleQuote: '"' | "'" | null = null;
+  let activeSingleIsFString = false;
+  let bracketDepth = 0;
+  let backslashContinued = false;
+  const fExprStack: Array<{ quote: '"' | "'"; braceDepth: number; baseBracketDepth: number }> = [];
+
   for (let i = 0; i < lines.length; i++) {
-    inTripleString[i] = activeQuote !== null;
     const line = lines[i]!;
+    inStringContinuation[i] =
+      activeQuote !== null || activeSingleQuote !== null || backslashContinued;
+    // In Python, `def`/`async def`/`class` are statements and cannot appear
+    // inside open brackets or an f-string expression. Recover from mid-edit
+    // unclosed brackets so subsequent symbols in the file are preserved.
+    if (
+      !inStringContinuation[i] &&
+      (bracketDepth > 0 || fExprStack.length > 0) &&
+      re.test(line)
+    ) {
+      bracketDepth = 0;
+      fExprStack.length = 0;
+      const defIndent = indentOf(line);
+      for (let k = i - 1; k >= 0; k--) {
+        if (inStringContinuation[k]) break;
+        const t = lines[k]!.trim();
+        if (!t || t.startsWith("#")) {
+          isContinuation[k] = false;
+          continue;
+        }
+        if (t.startsWith("@") && indentOf(lines[k]!) === defIndent) {
+          isContinuation[k] = false;
+          continue;
+        }
+        break;
+      }
+    }
+    isContinuation[i] =
+      inStringContinuation[i]! || bracketDepth > 0 || fExprStack.length > 0;
+    backslashContinued = false;
     let j = 0;
-    let op = 0;
-    let cp = 0;
     while (j < line.length) {
       if (activeQuote) {
         if (line[j] === "\\") {
@@ -616,6 +660,43 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
         if (line.startsWith(activeQuote, j)) {
           activeQuote = null;
           j += 3;
+          continue;
+        }
+        j++;
+      } else if (activeSingleQuote) {
+        if (line[j] === "\\") {
+          if (j === line.length - 1) {
+            backslashContinued = true;
+            break;
+          }
+          j += 2;
+          continue;
+        }
+        if (activeSingleIsFString) {
+          if (line[j] === "{") {
+            if (line[j + 1] === "{") {
+              j += 2;
+              continue;
+            }
+            fExprStack.push({
+              quote: activeSingleQuote,
+              braceDepth: 1,
+              baseBracketDepth: bracketDepth,
+            });
+            activeSingleQuote = null;
+            activeSingleIsFString = false;
+            j++;
+            continue;
+          }
+          if (line[j] === "}" && line[j + 1] === "}") {
+            j += 2;
+            continue;
+          }
+        }
+        if (line[j] === activeSingleQuote) {
+          activeSingleQuote = null;
+          activeSingleIsFString = false;
+          j++;
           continue;
         }
         j++;
@@ -632,66 +713,125 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
           continue;
         }
         if (line[j] === '"' || line[j] === "'") {
-          const q = line[j]!;
-          j++;
-          while (j < line.length && line[j] !== q) {
-            if (line[j] === "\\") j += 2;
-            else j++;
-          }
+          activeSingleQuote = line[j] === '"' ? '"' : "'";
+          activeSingleIsFString = isPythonFStringPrefix(line, j);
           j++;
           continue;
         }
-        if (line[j] === "(") op++;
-        else if (line[j] === ")") cp++;
+        if (fExprStack.length > 0) {
+          const top = fExprStack[fExprStack.length - 1]!;
+          if (
+            top.braceDepth === 1 &&
+            bracketDepth === top.baseBracketDepth &&
+            line[j] === ":" &&
+            line[j + 1] !== "="
+          ) {
+            // Format spec (e.g. f"{x:'>10}" or f"{x:{w}}"): scan to matching `}`.
+            let specDepth = 1;
+            j++;
+            while (j < line.length && specDepth > 0) {
+              if (line[j] === "\\") {
+                j += 2;
+                continue;
+              }
+              if (line[j] === "{") specDepth++;
+              else if (line[j] === "}") specDepth--;
+              j++;
+            }
+            if (specDepth === 0) {
+              fExprStack.pop();
+              activeSingleQuote = top.quote;
+              activeSingleIsFString = true;
+            }
+            continue;
+          }
+          if (line[j] === "{") {
+            top.braceDepth++;
+            bracketDepth++;
+            j++;
+            continue;
+          }
+          if (line[j] === "}") {
+            if (top.braceDepth === 1) {
+              fExprStack.pop();
+              activeSingleQuote = top.quote;
+              activeSingleIsFString = true;
+              j++;
+              continue;
+            }
+            top.braceDepth--;
+            bracketDepth = Math.max(0, bracketDepth - 1);
+            j++;
+            continue;
+          }
+        }
+        if (line[j] === "(" || line[j] === "[" || line[j] === "{") bracketDepth++;
+        else if (line[j] === ")" || line[j] === "]" || line[j] === "}") {
+          bracketDepth = Math.max(0, bracketDepth - 1);
+        } else if (line[j] === "\\" && j === line.length - 1) backslashContinued = true;
         j++;
       }
     }
-    openParens[i] = op;
-    closeParens[i] = cp;
+    // Single-line string without trailing backslash does not span lines in Python
+    if (activeSingleQuote && !backslashContinued) {
+      activeSingleQuote = null;
+      activeSingleIsFString = false;
+    }
   }
 
-  const raw: Array<{ indent: number; kind: string; name: string; startIdx: number }> = [];
+  const raw: Array<{ indent: number; kind: string; name: string; defIdx: number }> = [];
   for (let i = 0; i < lines.length; i++) {
-    if (inTripleString[i]) continue;
+    if (isContinuation[i]) continue;
     const m = re.exec(lines[i]!);
     if (!m) continue;
     const indent = m[1]!.replace(/\t/g, "    ").length;
     const kind = m[2] === "class" ? "class" : indent > 0 ? "method" : "function";
-    raw.push({ indent, kind, name: m[3]!, startIdx: i });
+    raw.push({ indent, kind, name: m[3]!, defIdx: i });
   }
 
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx]!;
-    // Advance past multiline signature parens before checking dedent
-    let headerEndIdx = item.startIdx;
-    let parenDepth = openParens[item.startIdx]! - closeParens[item.startIdx]!;
-    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
-    while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
-      headerEndIdx++;
-      parenDepth += openParens[headerEndIdx]! - closeParens[headerEndIdx]!;
+    // Decorators directly above the def belong to the symbol.
+    let startIdx = item.defIdx;
+    for (let j = item.defIdx - 1; j >= 0; j--) {
+      if (isContinuation[j] || !lines[j]!.trim()) continue;
+      const trimmed = lines[j]!.trimStart();
+      if (trimmed.startsWith("#")) continue;
+      if (!trimmed.startsWith("@") || indentOf(lines[j]!) !== item.indent) break;
+      startIdx = j;
     }
-    if (parenDepth > 0) headerEndIdx = item.startIdx;
-
     let endIdx = lines.length - 1;
-    for (let j = headerEndIdx + 1; j < lines.length; j++) {
-      if (inTripleString[j]) continue;
+    for (let j = item.defIdx + 1; j < lines.length; j++) {
+      if (isContinuation[j]) continue;
       const l = lines[j]!;
       const trimmed = l.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
-      const curIndent = (/^[ \t]*/.exec(l)?.[0] ?? "").replace(/\t/g, "    ").length;
-      if (curIndent <= item.indent) {
+      if (indentOf(l) <= item.indent) {
         endIdx = j - 1;
         break;
       }
     }
-    while (endIdx > headerEndIdx && !lines[endIdx]!.trim()) {
+    // Trailing blank lines and comments at or left of the def indent introduce
+    // what follows, not this body.
+    while (endIdx > item.defIdx) {
+      const trimmed = lines[endIdx]!.trim();
+      if (
+        trimmed &&
+        !(
+          !isContinuation[endIdx] &&
+          trimmed.startsWith("#") &&
+          indentOf(lines[endIdx]!) <= item.indent
+        )
+      ) {
+        break;
+      }
       endIdx--;
     }
     symbols.push({
       kind: item.kind,
       name: item.name,
-      startLine: item.startIdx + 1,
-      endLine: Math.max(item.startIdx + 1, endIdx + 1),
+      startLine: startIdx + 1,
+      endLine: endIdx + 1,
       depth: item.indent > 0 ? 1 : 0,
     });
   }

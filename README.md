@@ -198,7 +198,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **Targeted slices:** Optionally piggyback tiny `[startLine, endLine]` slices in the same call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
 
 ### 4. `run_checks` — Concurrent Build, Lint, Test & Diagnostic Runner
-- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..300 s`) and ANSI escape stripping.
+- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..170 s`, sharing a `170 s` call budget under Antigravity's `180 s` MCP limit) and ANSI escape stripping.
 - **Adaptive output modes:** `compact` (default) collapses passing commands to 1-line summaries and extracts focused failure traces; `full` preserves stdout for diagnostic or audit scripts within the `≤8.8 KB` inline cap.
 
 <details>

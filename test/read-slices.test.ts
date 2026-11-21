@@ -285,6 +285,124 @@ describe("read_slices", () => {
     );
   });
 
+  it("ends Python symbols after multi-line signatures and includes decorators", () => {
+    const pySyms = extractSymbols(
+      "model.py",
+      [
+        "class Model:",
+        "    def __init__(",
+        "        self,",
+        "        size: int,",
+        "    ) -> None:",
+        "        self.size = size",
+        "        self.table = {",
+        "    'k': 1,",
+        "        }",
+        "",
+        "    @property",
+        "    @functools.lru_cache(",
+        "        maxsize=8,",
+        "    )",
+        "    def area(self) -> int:",
+        "        return self.size \\",
+        "* 2",
+        "",
+        "# --- helpers ---",
+        "",
+        "def build(",
+        "    size: int,",
+        "):",
+        "    return Model(size)",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      pySyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      [
+        "class:Model:1-17",
+        "method:__init__:2-9",
+        "method:area:11-17",
+        "function:build:21-24",
+      ],
+    );
+
+    // Comment between stacked decorators still preserves the full decorator range
+    const commentBetweenDecos = extractSymbols(
+      "decos.py",
+      [
+        "@outer",
+        "# keep outer decorator attached",
+        "@inner",
+        "def run():",
+        '    """',
+        "# not a trailing comment",
+        '    """',
+        "    return 1",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      commentBetweenDecos.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:run:1-8"],
+    );
+
+    // Backslash continuation inside a quoted string must not split the function or emit fake symbols
+    const quotedBackslash = extractSymbols(
+      "str_cont.py",
+      [
+        "def f():",
+        '    s = "hello \\',
+        'def fake(): pass" + (',
+        "        1",
+        "    )",
+        "    return s",
+        "",
+        "def g():",
+        "    return 2",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      quotedBackslash.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:f:1-6", "function:g:8-9"],
+    );
+
+    // Python 3.12+ PEP 701 f-strings (same-quote reuse, multiline expr, quote fill format spec)
+    const pep701 = extractSymbols(
+      "pep701.py",
+      [
+        "def first(s):",
+        '    a = f"{s.split("(")[0]}"',
+        '    b = f"{s:\'>10}"',
+        '    c = f"a {(',
+        "        1 + 2",
+        '    )} b"',
+        "    return a, b, c",
+        "",
+        "def second():",
+        "    return 2",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      pep701.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:first:1-7", "function:second:9-10"],
+    );
+
+    // Mid-edit unclosed bracket recovers on subsequent def/class (including decorator)
+    const midEdit = extractSymbols(
+      "midedit.py",
+      [
+        "def editing():",
+        "    x = compute(a, b",
+        "",
+        "@decorator",
+        "def intact_after():",
+        "    return 1",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      midEdit.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:editing:1-2", "function:intact_after:4-6"],
+    );
+  });
+
   it("extracts Vue SFC blocks, CSS structure, TS no-semi types, multiline object-param functions, and Fastify routes", () => {
     const vueSyms = extractSymbols(
       "App.vue",

@@ -1,11 +1,12 @@
 import { promises as fs } from "node:fs";
+import { performance } from "node:perf_hooks";
 import {
   formatCorruptedArrayError,
   isPlainObject,
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
+import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../utils/exec-utils.js";
 import { resolvePath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
@@ -42,7 +43,8 @@ interface NormalizedCommand {
 
 interface CheckRunOutcome {
   spec: NormalizedCommand;
-  result: ExecResult;
+  /** null when the call budget ran out before the command could start. */
+  result: ExecResult | null;
   passed: boolean;
 }
 
@@ -69,6 +71,7 @@ async function mapWithConcurrency<T, R>(
 
 export async function runChecks(
   input: RunChecksInput,
+  budgetMs = MCP_CALL_BUDGET_SEC * 1000,
 ): Promise<{ text: string; isError: boolean }> {
   const parsedCommands = parseMaybeJsonArray(input?.commands);
   if (!parsedCommands.ok) {
@@ -138,10 +141,10 @@ export async function runChecks(
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
 
-  const concurrency = clampInt(input.concurrency ?? 4, 1, 8);
-  const defaultTimeoutSec = clampInt(input.timeoutSec ?? 60, 1, 300);
+  const concurrency = clampInt(input.concurrency, 1, 8, 4);
+  const defaultTimeoutSec = clampInt(input.timeoutSec, 1, MCP_CALL_BUDGET_SEC, 60);
   const outputMode = input.outputMode === "full" ? "full" : "compact";
-  const maxChars = clampInt(input.maxChars ?? 8_000, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxChars = clampInt(input.maxChars, 500, DEFAULT_INLINE_MAX_BYTES, 8_000);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
 
   const normalized: NormalizedCommand[] = [];
@@ -155,8 +158,15 @@ export async function runChecks(
         isError: true,
       };
     }
-    const cmdCwd = spec.cwd ? resolvePath(spec.cwd, baseCwd) : baseCwd;
-    if (spec.cwd) {
+    if (spec.cwd !== undefined && spec.cwd !== null && typeof spec.cwd !== "string") {
+      return {
+        text: `Error: commands[${i}].cwd must be a string path.`,
+        isError: true,
+      };
+    }
+    const trimmedSpecCwd = spec.cwd?.trim() || "";
+    const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
+    if (trimmedSpecCwd) {
       try {
         const st = await fs.stat(cmdCwd);
         if (!st.isDirectory()) {
@@ -173,9 +183,10 @@ export async function runChecks(
       }
     }
     const cmdTimeoutSec = clampInt(
-      spec.timeoutSec ?? defaultTimeoutSec,
+      spec.timeoutSec,
       1,
-      300,
+      MCP_CALL_BUDGET_SEC,
+      defaultTimeoutSec,
     );
     normalized.push({
       index: i,
@@ -186,34 +197,50 @@ export async function runChecks(
     });
   }
 
-  const wallStart = Date.now();
+  const safeBudgetMs =
+    Number.isFinite(budgetMs) && budgetMs > 0
+      ? Math.max(100, Math.trunc(budgetMs))
+      : MCP_CALL_BUDGET_SEC * 1000;
+  const wallStart = performance.now();
+  const deadline = wallStart + safeBudgetMs;
   const outcomes = await mapWithConcurrency<NormalizedCommand, CheckRunOutcome>(
     normalized,
     concurrency,
     async (spec) => {
+      const remainingMs = deadline - performance.now();
+      // exec-utils clamps timeouts to >=100ms plus kill grace; avoid starting doomed commands
+      if (remainingMs < 100) return { spec, result: null, passed: false };
       const result = await runShellCommandAsync(spec.command, {
         cwd: spec.cwd,
-        timeoutMs: spec.timeoutMs,
+        timeoutMs: Math.min(spec.timeoutMs, remainingMs),
       });
       const passed = !result.error && !result.timedOut && result.exitCode === 0;
       return { spec, result, passed };
     },
   );
-  const wallMs = Date.now() - wallStart;
+  const wallMs = Math.round(performance.now() - wallStart);
 
   const passedCount = outcomes.filter((o) => o.passed).length;
-  const failedCount = outcomes.length - passedCount;
+  const notRunCount = outcomes.filter((o) => !o.result).length;
+  const failedCount = outcomes.length - passedCount - notRunCount;
 
-  const summaryHeader =
-    failedCount === 0
-      ? `Checks: ${passedCount}/${outcomes.length} passed (wall: ${wallMs}ms)`
-      : `Checks: ${passedCount}/${outcomes.length} passed, ${failedCount} failed (wall: ${wallMs}ms)`;
+  const counts = [`${passedCount}/${outcomes.length} passed`];
+  if (failedCount > 0) counts.push(`${failedCount} failed`);
+  if (notRunCount > 0) {
+    counts.push(
+      `${notRunCount} not run (call time budget of ${Math.round(safeBudgetMs / 1000)}s used up; run them in another call)`,
+    );
+  }
+  const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
 
   // Allocate larger output share to failing checks than passing checks
   const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
   const failedBudget =
     failedCount > 0
-      ? Math.max(160, Math.floor((usableChars - passedCount * 120) / failedCount))
+      ? Math.max(
+          160,
+          Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount),
+        )
       : 320;
   const fullPerCmdBudget = Math.max(
     160,
@@ -221,6 +248,7 @@ export async function runChecks(
   );
 
   const blocks = outcomes.map(({ spec, result, passed }) => {
+    if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
     const badge = result.error
       ? "ERROR"
       : result.timedOut
@@ -278,7 +306,10 @@ export async function runChecks(
   return { text, isError: false };
 }
 
-function clampInt(val: number, min: number, max: number): number {
-  if (!Number.isFinite(val)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(val)));
+function clampInt(val: unknown, min: number, max: number, fallback: number): number {
+  if (typeof val !== "number" && typeof val !== "string") return fallback;
+  if (typeof val === "string" && val.trim() === "") return fallback;
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }

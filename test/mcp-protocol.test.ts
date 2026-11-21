@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
@@ -211,6 +212,337 @@ describe("MCP Stdio Server end-to-end", () => {
       byId.get(7)?.result as { content: Array<{ text: string }> }
     ).content[0]?.text;
     assert.match(checkText ?? "", /Checks: 1\/1 passed/);
+  });
+
+  it("resolves tool paths against the client's workspace root instead of its own cwd", async () => {
+    const msgs = [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: { roots: { listChanged: true } },
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      // Sent before the roots answer: the call must wait for it.
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "read_slices", arguments: { outlines: ["demo.ts"] } },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "agy-fast-roots-1",
+        result: { roots: [{ uri: pathToFileURL(tmpDir).href }] },
+      },
+    ];
+
+    const res = await sendMessagesToServer(msgs.map((m) => `${JSON.stringify(m)}\n`));
+    assert.equal(res.code, 0);
+    assert.equal(res.stderr, "");
+    const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(
+      lines.find((l) => l.method === "roots/list"),
+      { jsonrpc: "2.0", id: "agy-fast-roots-1", method: "roots/list" },
+    );
+    const call = lines.find((l) => l.id === 2);
+    assert.equal(call.result.isError, false);
+    assert.match(call.result.content[0].text, /greet/);
+    // The roots answer is consumed, not treated as an invalid request.
+    assert.equal(lines.filter((l) => l.error).length, 0);
+    // initialize response is emitted before the server-initiated roots/list request.
+    const initIdx = lines.findIndex((l) => l.id === 1);
+    const rootsIdx = lines.findIndex((l) => l.method === "roots/list");
+    assert.ok(initIdx !== -1 && rootsIdx !== -1 && initIdx < rootsIdx);
+
+    // Relative cwd resolves against the workspace root without mutating process.cwd().
+    const subDir = path.join(tmpDir, "sub-root-check");
+    await fs.mkdir(subDir, { recursive: true });
+    await fs.writeFile(path.join(subDir, "nested.ts"), "export function nestedFn() { return 42; }\n", "utf8");
+    const relRes = await sendMessagesToServer(
+      [
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: { roots: { listChanged: true } },
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        {
+          jsonrpc: "2.0",
+          id: "agy-fast-roots-1",
+          result: { roots: [{ uri: "file:///nonexistent-agy-fast-root-xyz" }, { uri: pathToFileURL(tmpDir).href }] },
+        },
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "read_slices", arguments: { cwd: "sub-root-check", outlines: ["nested.ts"] } },
+        },
+      ].map((m) => `${JSON.stringify(m)}\n`),
+    );
+    assert.equal(relRes.code, 0);
+    assert.equal(relRes.stderr, "");
+    const relLines = relRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    const relCall = relLines.find((l) => l.id === 2);
+    assert.equal(relCall.result.isError, false);
+    assert.match(relCall.result.content[0].text, /nestedFn/);
+
+    // Overlapped list_changed + out-of-order replies + malformed roots + unanswered roots must never deadlock or crash
+    const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-root2-"));
+    try {
+      await fs.writeFile(path.join(otherRoot, "root2.ts"), "export function fromRoot2() { return 2; }\n", "utf8");
+      const overlapRes = await sendMessagesToServer(
+        [
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: { roots: { listChanged: true } } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "read_slices", arguments: { outlines: ["root2.ts"] } },
+          },
+          { jsonrpc: "2.0", method: "notifications/roots/list_changed" },
+          // Newer roots-2 arrives first, stale roots-1 arrives later (must not revert root or emit -32600)
+          {
+            jsonrpc: "2.0",
+            id: "agy-fast-roots-2",
+            result: { roots: [{ uri: pathToFileURL(otherRoot).href }] },
+          },
+          {
+            jsonrpc: "2.0",
+            id: "agy-fast-roots-1",
+            result: { roots: [{ uri: pathToFileURL(tmpDir).href }] },
+          },
+        ].map((m) => `${JSON.stringify(m)}\n`),
+      );
+      assert.equal(overlapRes.code, 0);
+      assert.equal(overlapRes.stderr, "");
+      const ovLines = overlapRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      assert.equal(ovLines.filter((l) => l.error).length, 0);
+      const ovCall = ovLines.find((l) => l.id === 2);
+      assert.equal(ovCall?.result?.isError, false);
+      assert.match(ovCall?.result?.content?.[0]?.text ?? "", /fromRoot2/);
+
+      // Malformed/nonexistent/null roots and unanswered roots on EOF must never crash or drop responses
+      const badRootsRes = await sendMessagesToServer(
+        [
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: { roots: { listChanged: true } } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          {
+            jsonrpc: "2.0",
+            id: "agy-fast-roots-1",
+            result: { roots: [null, { uri: "file:not a valid url" }, { uri: "file:///nonexistent-agy-fast-99999" }] },
+          },
+          { jsonrpc: "2.0", method: "notifications/roots/list_changed" },
+          // Deliberately leave agy-fast-roots-2 unanswered before EOF
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "read_slices", arguments: { cwd: tmpDir, outlines: ["demo.ts"] } },
+          },
+        ].map((m) => `${JSON.stringify(m)}\n`),
+      );
+      assert.equal(badRootsRes.code, 0);
+      assert.equal(badRootsRes.stderr, "");
+      const badLines = badRootsRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      assert.equal(badLines.filter((l) => l.error).length, 0);
+      const badCall = badLines.find((l) => l.id === 3);
+      assert.equal(badCall?.result?.isError, false);
+      assert.match(badCall?.result?.content?.[0]?.text ?? "", /greet/);
+
+      // Batched [initialize, notifications/initialized] emits initialize response BEFORE roots/list;
+      // "error": null and uppercase FILE: URI still apply roots; non-string cwd returns clean error.
+      const batchRes = await sendMessagesToServer([
+        JSON.stringify([
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: { roots: {} } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+        ]) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "agy-fast-roots-1",
+          error: null,
+          result: { roots: [{ uri: pathToFileURL(tmpDir).href.replace(/^file:/, "FILE:") }] },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: { name: "read_slices", arguments: { outlines: ["demo.ts"] } },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "tools/call",
+          params: { name: "read_slices", arguments: { cwd: 123, outlines: ["demo.ts"] } },
+        }) + "\n",
+      ]);
+      assert.equal(batchRes.code, 0);
+      assert.equal(batchRes.stderr, "");
+      const bLines = batchRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      assert.ok(Array.isArray(bLines[0]) && bLines[0][0]?.id === 1);
+      assert.equal(bLines[1]?.method, "roots/list");
+      const bCall4 = bLines.find((l) => !Array.isArray(l) && l.id === 4);
+      assert.equal(bCall4?.result?.isError, false);
+      assert.match(bCall4?.result?.content?.[0]?.text ?? "", /greet/);
+      const bCall5 = bLines.find((l) => !Array.isArray(l) && l.id === 5);
+      assert.equal(bCall5?.result?.isError, true);
+      assert.match(bCall5?.result?.content?.[0]?.text ?? "", /'cwd' must be a string/);
+
+      // Mixed LF+CRLF (\n\r\n) Content-Length header separator must not hang or desync next frame
+      const mp1 = JSON.stringify({ jsonrpc: "2.0", id: 10, method: "ping" });
+      const mp2 = JSON.stringify({ jsonrpc: "2.0", id: 11, method: "ping" });
+      const mixedSepRes = await sendMessagesToServer([
+        `Content-Length: ${Buffer.byteLength(mp1, "utf8")}\n\r\n${mp1}` +
+          `Content-Length: ${Buffer.byteLength(mp2, "utf8")}\r\n\r\n${mp2}`,
+      ]);
+      assert.equal(mixedSepRes.code, 0);
+      const mixedBodies = [
+        ...mixedSepRes.stdout.matchAll(/Content-Length: \d+\r\n\r\n(\{[^\n]*\})/g),
+      ].map((m) => JSON.parse(m[1]!));
+      assert.deepEqual(
+        mixedBodies.map((b) => b.id).sort((a, b) => a - b),
+        [10, 11],
+      );
+
+      // Interactive batch [initialize, notifications/initialized, tools/call] and
+      // [notifications/roots/list_changed, tools/call] must flush roots/list immediately
+      // (no 1500ms self-deadlock) and resolve tools/call in the updated workspace root.
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(process.execPath, [MCP_SERVER_SCRIPT], {
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        let buf = "";
+        let stderr = "";
+        const responses: unknown[] = [];
+        const startedAt = Date.now();
+        let stage = 0;
+        const killTimer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("Interactive batch roots test timed out"));
+        }, 5000);
+        killTimer.unref();
+
+        child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+        child.stdout.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          let nl: number;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            const msg = JSON.parse(line);
+            if (!Array.isArray(msg) && msg.method === "roots/list") {
+              const targetRoot = stage === 0 ? tmpDir : otherRoot;
+              child.stdin.write(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: msg.id,
+                  result: { roots: [{ uri: pathToFileURL(targetRoot).href }] },
+                }) + "\n",
+              );
+              continue;
+            }
+            responses.push(msg);
+            if (stage === 0) {
+              stage = 1;
+              child.stdin.write(
+                JSON.stringify([
+                  { jsonrpc: "2.0", method: "notifications/roots/list_changed" },
+                  {
+                    jsonrpc: "2.0",
+                    id: 22,
+                    method: "tools/call",
+                    params: { name: "read_slices", arguments: { outlines: ["root2.ts"] } },
+                  },
+                ]) + "\n",
+              );
+            } else {
+              child.stdin.end();
+            }
+          }
+        });
+        child.on("close", (code) => {
+          clearTimeout(killTimer);
+          try {
+            const elapsed = Date.now() - startedAt;
+            assert.equal(code, 0);
+            assert.equal(stderr, "");
+            assert.ok(elapsed < 1200, `Batch roots self-deadlocked (${elapsed}ms)`);
+            assert.equal(responses.length, 2);
+            const batch1 = responses[0] as Array<{ id: number; result?: { isError?: boolean; content?: Array<{ text: string }> } }>;
+            const call21 = batch1.find((r) => r.id === 21);
+            assert.equal(call21?.result?.isError, false);
+            assert.match(call21?.result?.content?.[0]?.text ?? "", /greet/);
+            const batch2 = responses[1] as Array<{ id: number; result?: { isError?: boolean; content?: Array<{ text: string }> } }>;
+            const call22 = batch2.find((r) => r.id === 22);
+            assert.equal(call22?.result?.isError, false);
+            assert.match(call22?.result?.content?.[0]?.text ?? "", /fromRoot2/);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+        child.stdin.write(
+          JSON.stringify([
+            {
+              jsonrpc: "2.0",
+              id: 20,
+              method: "initialize",
+              params: { protocolVersion: "2025-11-25", capabilities: { roots: { listChanged: true } } },
+            },
+            { jsonrpc: "2.0", method: "notifications/initialized" },
+            {
+              jsonrpc: "2.0",
+              id: 21,
+              method: "tools/call",
+              params: { name: "read_slices", arguments: { outlines: ["demo.ts"] } },
+            },
+          ]) + "\n",
+        );
+      });
+
+      // Trailing unterminated notifications/initialized right at EOF must not emit spurious roots/list
+      const eofRes = await sendMessagesToServer([
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 30,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25", capabilities: { roots: {} } },
+        }) + "\n",
+        JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      ]);
+      assert.equal(eofRes.code, 0);
+      const eofLines = eofRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      assert.equal(eofLines.filter((l) => l.method === "roots/list").length, 0);
+    } finally {
+      await fs.rm(otherRoot, { recursive: true, force: true });
+    }
   });
 
   it("handles JSON-RPC error codes, chunked UTF-8 input, and Content-Length framing", async () => {

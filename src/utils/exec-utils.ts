@@ -142,6 +142,13 @@ export function decodeProcessOutput(
   }
 }
 
+/**
+ * agy aborts an MCP tool call after 180 s ("timed out after 3m0s") and drops
+ * its result. All commands of one tool call share this budget; the remaining
+ * 10 s cover the kill grace period below and response formatting.
+ */
+export const MCP_CALL_BUDGET_SEC = 170;
+
 function killChildTree(pid: number | undefined, detached: boolean): void {
   if (!pid) return;
   if (process.platform === "win32") {

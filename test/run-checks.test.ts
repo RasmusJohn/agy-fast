@@ -80,6 +80,30 @@ describe("run_checks", () => {
     assert.match(res.text, /TIMEOUT/);
   });
 
+  it("finishes within the shared call budget and reports commands that never started", async () => {
+    const budgetMs = 2_000;
+    const start = Date.now();
+    const res = await runChecks(
+      {
+        concurrency: 1,
+        timeoutSec: 5,
+        commands: [
+          { name: "quick", command: `${nodeBin} -e "setTimeout(() => console.log('ok'), 300)"` },
+          { name: "hang", command: `${nodeBin} -e "setTimeout(() => {}, 10000)"` },
+          { name: "late", command: `${nodeBin} -e "console.log('late')"` },
+        ],
+      },
+      budgetMs,
+    );
+    const elapsed = Date.now() - start;
+
+    assert.ok(elapsed < budgetMs + 1_000, `call took ${elapsed}ms`);
+    assert.match(res.text, /^Checks: 1\/3 passed, 1 failed, 1 not run \(call time budget of 2s used up/);
+    assert.match(res.text, /\[PASS \d+ms\] quick/);
+    assert.match(res.text, /## \[TIMEOUT \d+ms\] hang/);
+    assert.match(res.text, /## \[NOT RUN\] late/);
+  });
+
   it("supports full output mode and rejects invalid inputs", async () => {
     const full = await runChecks({
       outputMode: "full",
@@ -96,6 +120,20 @@ describe("run_checks", () => {
     });
     assert.equal(badSubCwd.isError, true);
     assert.match(badSubCwd.text, /does not exist/);
+
+    // Non-string commands[i].cwd returns a clean validation error; boolean timeoutSec falls back
+    const nonStrSubCwd = await runChecks({
+      commands: [{ name: "bad-type", command: `${nodeBin} -e "0"`, cwd: 123 as unknown as string }],
+    });
+    assert.equal(nonStrSubCwd.isError, true);
+    assert.match(nonStrSubCwd.text, /commands\[0\]\.cwd must be a string/);
+
+    const boolTimeout = await runChecks({
+      timeoutSec: false as unknown as number,
+      commands: [{ name: "bool-timeout", command: `${nodeBin} -e "setTimeout(() => console.log('ok'), 1150)"` }],
+    });
+    assert.equal(boolTimeout.isError, false);
+    assert.match(boolTimeout.text, /1\/1 passed/);
   });
 
   it("captures npm ERR! lines and respects tight maxChars across multiple failures", async () => {
