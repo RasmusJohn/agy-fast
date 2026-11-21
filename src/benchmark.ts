@@ -40,6 +40,76 @@ function parseIsoTimestamp(raw: string, endOfDayIfDateOnly = false): number | nu
   return Number.isFinite(ms) ? ms : null;
 }
 
+function getHomeDir(env: NodeJS.ProcessEnv = process.env): string {
+  return process.platform === "win32"
+    ? env.USERPROFILE || env.HOME || os.homedir()
+    : env.HOME || env.USERPROFILE || os.homedir();
+}
+
+async function discoverLocalBrainDirs(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string[]> {
+  const home = getHomeDir(env);
+  const seen = new Set<string>();
+  const dirs: string[] = [];
+  const addDir = (p: string): void => {
+    const resolved = path.resolve(p);
+    const key =
+      process.platform === "win32" || process.platform === "darwin"
+        ? resolved.toLowerCase()
+        : resolved;
+    if (seen.has(key)) return;
+    seen.add(key);
+    dirs.push(resolved);
+  };
+
+  addDir(path.join(home, ".gemini", "antigravity", "brain"));
+  addDir(path.join(home, ".gemini", "antigravity-cli", "brain"));
+  addDir(path.join(home, ".gemini", "antigravity-ide", "brain"));
+
+  const addIfExistingDir = async (p: string): Promise<void> => {
+    try {
+      const st = await fs.stat(p);
+      if (st.isDirectory()) addDir(p);
+    } catch {
+      // Ignore missing brain dir
+    }
+  };
+
+  // Also discover ACP / T3 Code Antigravity provider brains under ~/.t3/userdata/providers/antigravity/*/antigravity-acp/brain
+  const t3ProvidersDir = path.join(
+    home,
+    ".t3",
+    "userdata",
+    "providers",
+    "antigravity",
+  );
+  try {
+    const entries = await fs.readdir(t3ProvidersDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      await addIfExistingDir(
+        path.join(t3ProvidersDir, entry.name, "antigravity-acp", "brain"),
+      );
+    }
+  } catch {
+    // ~/.t3 not present
+  }
+
+  // Also discover brains under an explicit isolated GEMINI_HOME or ANTIGRAVITY_APP_DATA_DIR
+  const envGeminiHome = env.GEMINI_HOME?.trim();
+  if (envGeminiHome) {
+    await addIfExistingDir(path.join(envGeminiHome, "antigravity-acp", "brain"));
+    await addIfExistingDir(path.join(envGeminiHome, "antigravity-cli", "brain"));
+  }
+  const envAppDataDir = env.ANTIGRAVITY_APP_DATA_DIR?.trim();
+  if (envAppDataDir) {
+    await addIfExistingDir(path.join(envAppDataDir, "brain"));
+  }
+
+  return dirs;
+}
+
 function printUsage(): void {
   process.stdout.write(
     [
@@ -49,7 +119,7 @@ function printUsage(): void {
       "  node dist/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
-      "  --local        Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
+      "  --local        Scan local Antigravity brain dirs (Desktop 2.0, CLI, IDE, and ACP)",
       "  --recent <N>   Analyze only the N most recently modified transcripts",
       "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
       "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
@@ -92,10 +162,7 @@ async function main(argv: string[]): Promise<void> {
         continue;
       }
       if (!afterDoubleDash && a === "--local") {
-        targets.push(
-          path.join(os.homedir(), ".gemini", "antigravity", "brain"),
-          path.join(os.homedir(), ".gemini", "antigravity-cli", "brain"),
-        );
+        targets.push(...(await discoverLocalBrainDirs()));
         continue;
       }
       if (!afterDoubleDash && (a === "--recent" || a.startsWith("--recent="))) {

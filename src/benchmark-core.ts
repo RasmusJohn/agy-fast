@@ -209,17 +209,15 @@ function unwrapJsonString(val: unknown): string {
       const parsed: unknown = JSON.parse(trimmed);
       if (typeof parsed === "string") return parsed;
     } catch {
-      // Not a JSON-encoded string (e.g. `"/path/bin" "arg"`), keep original
+      // May be a middle-truncated JSON-encoded string (e.g. `"rg ... \n<truncated N bytes>\n... src/"`)
     }
-  } else if (
-    trimmed.startsWith('"') &&
-    /<truncated \d+ bytes>$/.test(trimmed)
-  ) {
-    // Antigravity transcript.jsonl truncates long JSON-encoded string args
-    const withoutTrailer = trimmed
-      .slice(1)
-      .replace(/\r?\n?<truncated \d+ bytes>$/, "");
-    return withoutTrailer.replace(
+  }
+  if (trimmed.startsWith('"') && /<truncated \d+ bytes>/.test(trimmed)) {
+    // Antigravity transcript.jsonl truncates long JSON-encoded string args either at the end or in the middle
+    let inner = trimmed.slice(1);
+    if (inner.endsWith('"')) inner = inner.slice(0, -1);
+    const withoutMarkers = inner.replace(/\r?\n?<truncated \d+ bytes>\r?\n?/g, " ");
+    return withoutMarkers.replace(
       /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g,
       (_m, hex: string | undefined, ch: string | undefined) => {
         if (hex !== undefined) {
@@ -607,12 +605,31 @@ function isReadonlyGitBranch(args: string[]): boolean {
       return false;
     }
     if (GIT_BRANCH_VALUE_FLAGS.has(a)) {
+      if (
+        a === "--contains" ||
+        a === "--no-contains" ||
+        a === "--merged" ||
+        a === "--no-merged" ||
+        a === "--points-at"
+      ) {
+        explicitList = true;
+      }
       if (args[i + 1] && !args[i + 1]!.startsWith("-")) {
         i += 1;
       }
       continue;
     }
     if (a.startsWith("--")) {
+      const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+      if (
+        flagName === "--contains" ||
+        flagName === "--no-contains" ||
+        flagName === "--merged" ||
+        flagName === "--no-merged" ||
+        flagName === "--points-at"
+      ) {
+        explicitList = true;
+      }
       continue;
     }
     if (a.startsWith("-") && a.length > 1) {
@@ -643,7 +660,7 @@ function isReadonlyGitTag(args: string[]): boolean {
       positionalCount += args.length - i - 1;
       break;
     }
-    if (a === "-l" || a === "--list") {
+    if (a === "-l" || a === "--list" || a === "--verify") {
       explicitList = true;
       continue;
     }
@@ -661,12 +678,43 @@ function isReadonlyGitTag(args: string[]): boolean {
     ) {
       return false;
     }
-    if (a.startsWith("-") && !a.startsWith("--") && a.length > 1) {
-      if (/[dasufmFv]/.test(a.slice(1))) return false;
-      if (a.slice(1).includes("l")) explicitList = true;
+    if (GIT_BRANCH_VALUE_FLAGS.has(a)) {
+      if (
+        a === "--contains" ||
+        a === "--no-contains" ||
+        a === "--merged" ||
+        a === "--no-merged" ||
+        a === "--points-at"
+      ) {
+        explicitList = true;
+      }
+      if (args[i + 1] && !args[i + 1]!.startsWith("-")) {
+        i += 1;
+      }
       continue;
     }
-    if (a.startsWith("--")) continue;
+    if (a.startsWith("-") && !a.startsWith("--") && a.length > 1) {
+      if (/^-n\d*$/.test(a)) {
+        explicitList = true;
+        continue;
+      }
+      if (/[dasufmF]/.test(a.slice(1))) return false;
+      if (/[lv]/.test(a.slice(1))) explicitList = true;
+      continue;
+    }
+    if (a.startsWith("--")) {
+      const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+      if (
+        flagName === "--contains" ||
+        flagName === "--no-contains" ||
+        flagName === "--merged" ||
+        flagName === "--no-merged" ||
+        flagName === "--points-at"
+      ) {
+        explicitList = true;
+      }
+      continue;
+    }
     positionalCount += 1;
   }
   return explicitList || positionalCount === 0;
@@ -839,7 +887,8 @@ function extractAgyFastToolName(call: TranscriptToolCall): string | null {
 }
 
 function sessionHasStartupSnapshot(steps: TranscriptStep[]): boolean {
-  for (const step of steps) {
+  const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
+  for (const step of identitySteps) {
     if (typeof step.content !== "string") continue;
     if (!step.content.includes("[agy-fast startup snapshot]")) continue;
     if (step.type === "SYSTEM_MESSAGE") return true;
@@ -871,6 +920,41 @@ function extractAgyFastInnerArgs(
   return isPlainRecord(inner) ? inner : null;
 }
 
+function maybeParseJsonValue(val: unknown): unknown {
+  if (typeof val !== "string") return val;
+  const trimmed = val.trim();
+  if (
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("{") ||
+    trimmed === "true" ||
+    trimmed === "false" ||
+    trimmed === "null"
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return val;
+    }
+  }
+  return val;
+}
+
+function getCanonicalToolName(call: TranscriptToolCall): string {
+  const name = call.name ?? "";
+  if (name !== "call_mcp_tool") return name;
+  const callArgs = getCallArgs(call);
+  const serverName = unwrapJsonString(
+    callArgs?.ServerName ?? callArgs?.serverName ?? callArgs?.server_name ?? "",
+  );
+  const toolName = unwrapJsonString(
+    callArgs?.ToolName ?? callArgs?.toolName ?? callArgs?.tool_name ?? "",
+  );
+  if (toolName) {
+    return serverName ? `call_mcp_tool:${serverName}/${toolName}` : `call_mcp_tool:${toolName}`;
+  }
+  return name;
+}
+
 function hasCorruptedAgyFastArgs(
   call: TranscriptToolCall,
   fastTool: string,
@@ -878,14 +962,15 @@ function hasCorruptedAgyFastArgs(
   const inner = extractAgyFastInnerArgs(call);
   if (!inner) return false;
   if (fastTool === "apply_edits") {
-    const eds = inner.edits;
+    const eds = maybeParseJsonValue(inner.edits);
     if (typeof eds === "boolean" || eds === null) return true;
     if (Array.isArray(eds)) {
       return eds.some((e) => {
         if (!isPlainRecord(e)) return true;
         if (e.hunks !== undefined) {
-          if (typeof e.hunks === "boolean" || e.hunks === null) return true;
-          if (Array.isArray(e.hunks) && e.hunks.some((h) => !isPlainRecord(h))) {
+          const hunks = maybeParseJsonValue(e.hunks);
+          if (!Array.isArray(hunks)) return true;
+          if (hunks.some((h) => !isPlainRecord(h))) {
             return true;
           }
         }
@@ -895,22 +980,33 @@ function hasCorruptedAgyFastArgs(
     return false;
   }
   if (fastTool === "batch_search") {
-    const qs = inner.queries;
+    const qs = maybeParseJsonValue(inner.queries);
     if (typeof qs === "boolean" || qs === null) return true;
     return Array.isArray(qs) && qs.some((q) => !isPlainRecord(q));
   }
   if (fastTool === "read_slices") {
-    const outlines = inner.outlines;
+    const outlines = maybeParseJsonValue(inner.outlines);
     if (typeof outlines === "boolean" || outlines === null) return true;
     if (Array.isArray(outlines) && outlines.some((p) => typeof p !== "string")) {
       return true;
     }
-    const slices = inner.slices;
+    const slices = maybeParseJsonValue(inner.slices);
     if (typeof slices === "boolean" || slices === null) return true;
-    return Array.isArray(slices) && slices.some((s) => !isPlainRecord(s));
+    if (Array.isArray(slices)) {
+      return slices.some((s) => {
+        if (!isPlainRecord(s)) return true;
+        if (s.ranges !== undefined) {
+          const ranges = maybeParseJsonValue(s.ranges);
+          if (!Array.isArray(ranges)) return true;
+          if (ranges.some((r) => typeof r === "boolean" || r === null)) return true;
+        }
+        return false;
+      });
+    }
+    return false;
   }
   if (fastTool === "run_checks") {
-    const cmds = inner.commands;
+    const cmds = maybeParseJsonValue(inner.commands);
     if (typeof cmds === "boolean" || cmds === null) return true;
     return (
       Array.isArray(cmds) &&
@@ -920,10 +1016,13 @@ function hasCorruptedAgyFastArgs(
   return false;
 }
 
+const fullSessionStepsMap = new WeakMap<TranscriptStep[], TranscriptStep[]>();
+
 function isSwarmWorkerSession(steps: TranscriptStep[]): boolean {
+  const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
   let hasUserRequest = false;
   let hasSwarmWorkerTool = false;
-  for (const step of steps) {
+  for (const step of identitySteps) {
     if (step.type === "USER_INPUT") {
       const text = typeof step.content === "string" ? step.content : "";
       if (text.includes("<USER_REQUEST>") || text.trim().length > 0) {
@@ -968,6 +1067,7 @@ export function filterStepsByTime(
     if (untilMs !== undefined && ms > untilMs) continue;
     out.push(step);
   }
+  fullSessionStepsMap.set(out, fullSessionStepsMap.get(steps) ?? steps);
   return out;
 }
 
@@ -1033,7 +1133,6 @@ export function analyzeTranscriptSessions(
       const step = steps[i]!;
       if (Array.isArray(step.media) && step.media.length > 0) {
         sessionMediaCount += step.media.length;
-        mediaLoadedCount += step.media.length;
       }
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
@@ -1106,7 +1205,7 @@ export function analyzeTranscriptSessions(
 
         if (calls.length === 1) {
           singleToolTurns += 1;
-          const singleName = calls[0]?.name ?? "";
+          const singleName = calls[0] ? getCanonicalToolName(calls[0]) : "";
           if (singleName && singleName === prevSingleToolName) {
             consecutiveSingleChainsExtraTurns += 1;
           }
@@ -1189,7 +1288,8 @@ export function analyzeTranscriptSessions(
           mcpSpillCalls += 1;
         } else if (
           resText.includes("[truncated:") ||
-          resText.includes("[truncated at ")
+          resText.includes("[truncated at ") ||
+          resText.includes("[truncated; showing ")
         ) {
           agyTruncatedCalls += 1;
         }
@@ -1250,6 +1350,7 @@ export function analyzeTranscriptSessions(
 
     if (hasPlanner) {
       validSessions += 1;
+      mediaLoadedCount += sessionMediaCount;
       if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
       if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
       if (isSwarmWorkerSession(steps)) {
@@ -1529,6 +1630,9 @@ async function loadFilteredSessions(
       const rawSteps = parseTranscriptJsonl(content);
       const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
       if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
+      if (steps !== rawSteps) {
+        fullSessionStepsMap.set(steps, rawSteps);
+      }
       sessions.push(steps);
       if (recent !== undefined && sessions.length >= recent) break;
     } catch {

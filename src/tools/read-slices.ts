@@ -31,7 +31,7 @@ export interface SymbolEntry {
   depth: number;
 }
 
-type BraceLang = "js" | "c" | "shell" | "json";
+type BraceLang = "js" | "c" | "go" | "rust" | "shell" | "json";
 
 interface ScanState {
   inBlockComment: boolean;
@@ -61,6 +61,16 @@ function isRegexStartContext(line: string, slashIdx: number): boolean {
     word === "delete" ||
     word === "new"
   );
+}
+
+function isJsxSelfClosingSlash(line: string, slashIdx: number): boolean {
+  if (line[slashIdx + 1] !== ">") return false;
+  let j = slashIdx - 1;
+  while (j >= 0 && /\s/.test(line[j]!)) j--;
+  // JSX self-closing `/>` only reaches regex-start context after `}` (e.g. `<Icon s={1} />`)
+  // or on a continuation line (`  />`); regex literals like `/>/g` or `/>}/` follow `(`, `=`, `return`, etc.
+  if (j >= 0 && line[j] !== "}") return false;
+  return line[slashIdx + 2] !== "/";
 }
 
 function scanBracesOnLine(
@@ -122,7 +132,7 @@ function scanBracesOnLine(
     }
 
     if (state.inBacktick) {
-      if (ch === "\\") {
+      if (ch === "\\" && lang !== "go") {
         escape = true;
       } else if (ch === "`") {
         state.inBacktick = false;
@@ -154,22 +164,43 @@ function scanBracesOnLine(
     }
 
     // Comments
-    if (lang === "shell" && ch === "#") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "/") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "*") {
+    if (
+      lang === "shell" &&
+      ch === "#" &&
+      (i === 0 || /[\s;&|()]/.test(line[i - 1]!))
+    ) {
+      break;
+    }
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "/") break;
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "*") {
       state.inBlockComment = true;
       i++;
       continue;
     }
 
-    // Regex literal (JS/TS only)
-    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && isRegexStartContext(line, i)) {
+    // Regex literal (JS/TS only); never treat JSX closing `</Tag>` or self-closing `/>` as a regex start
+    if (
+      lang === "js" &&
+      ch === "/" &&
+      next !== "/" &&
+      next !== "*" &&
+      !isJsxSelfClosingSlash(line, i) &&
+      line[i - 1] !== "<" &&
+      isRegexStartContext(line, i)
+    ) {
       inRegex = true;
       inRegexClass = false;
       continue;
     }
 
     if (ch === "'" && lang !== "json") {
+      // In Rust, `'a` / `'static` are lifetimes, not character literals; only treat `'c'` or `'\...'` as char literals
+      if (lang === "rust") {
+        if (next === "\\" || line[i + 2] === "'") {
+          inSingle = true;
+        }
+        continue;
+      }
       inSingle = true;
       continue;
     }
@@ -177,7 +208,7 @@ function scanBracesOnLine(
       inDouble = true;
       continue;
     }
-    if (ch === "`" && (lang === "js" || lang === "c")) {
+    if (ch === "`" && (lang === "js" || lang === "c" || lang === "go")) {
       state.inBacktick = true;
       continue;
     }
@@ -248,7 +279,7 @@ function findBraceBlockEnd(
       lines[i]!,
       state,
       lang,
-      lang === "js",
+      lang === "js" || lang === "go",
       seenOpen,
     );
     if (open > 0) seenOpen = true;
@@ -436,8 +467,9 @@ function extractTsJsSymbols(lines: string[]): SymbolEntry[] {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const wasInComment = commentState.inBlockComment;
+    const wasInBacktick = commentState.inBacktick;
     scanBracesOnLine(line, commentState, "js");
-    if (wasInComment) continue;
+    if (wasInComment || wasInBacktick) continue;
 
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
@@ -564,13 +596,17 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
 
-  // Pre-compute whether each line starts inside a triple-quoted multiline string
+  // Pre-compute triple-quoted multiline string state and paren balance per line
   const inTripleString = new Array<boolean>(lines.length).fill(false);
+  const openParens = new Array<number>(lines.length).fill(0);
+  const closeParens = new Array<number>(lines.length).fill(0);
   let activeQuote: '"""' | "'''" | null = null;
   for (let i = 0; i < lines.length; i++) {
     inTripleString[i] = activeQuote !== null;
     const line = lines[i]!;
     let j = 0;
+    let op = 0;
+    let cp = 0;
     while (j < line.length) {
       if (activeQuote) {
         if (line[j] === "\\") {
@@ -605,9 +641,13 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
           j++;
           continue;
         }
+        if (line[j] === "(") op++;
+        else if (line[j] === ")") cp++;
         j++;
       }
     }
+    openParens[i] = op;
+    closeParens[i] = cp;
   }
 
   const raw: Array<{ indent: number; kind: string; name: string; startIdx: number }> = [];
@@ -622,8 +662,18 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
 
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx]!;
+    // Advance past multiline signature parens before checking dedent
+    let headerEndIdx = item.startIdx;
+    let parenDepth = openParens[item.startIdx]! - closeParens[item.startIdx]!;
+    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
+    while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
+      headerEndIdx++;
+      parenDepth += openParens[headerEndIdx]! - closeParens[headerEndIdx]!;
+    }
+    if (parenDepth > 0) headerEndIdx = item.startIdx;
+
     let endIdx = lines.length - 1;
-    for (let j = item.startIdx + 1; j < lines.length; j++) {
+    for (let j = headerEndIdx + 1; j < lines.length; j++) {
       if (inTripleString[j]) continue;
       const l = lines[j]!;
       const trimmed = l.trim();
@@ -634,14 +684,14 @@ function extractPythonSymbols(lines: string[]): SymbolEntry[] {
         break;
       }
     }
-    while (endIdx > item.startIdx && !lines[endIdx]!.trim()) {
+    while (endIdx > headerEndIdx && !lines[endIdx]!.trim()) {
       endIdx--;
     }
     symbols.push({
       kind: item.kind,
       name: item.name,
       startLine: item.startIdx + 1,
-      endLine: endIdx + 1,
+      endLine: Math.max(item.startIdx + 1, endIdx + 1),
       depth: item.indent > 0 ? 1 : 0,
     });
   }
@@ -963,10 +1013,20 @@ function extractGdScriptSymbols(rawLines: string[]): SymbolEntry[] {
 function extractGoSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
-  const typeRe = /^type\s+([A-Za-z_]\w*)\s+(struct|interface)\b/;
+  const typeRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(struct|interface)\b/;
+  const commentState: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
+    const wasInComment = commentState.inBlockComment;
+    const wasInBacktick = commentState.inBacktick;
+    scanBracesOnLine(line, commentState, "go");
+    if (wasInComment || wasInBacktick) continue;
+
     const fm = funcRe.exec(line);
     if (fm && fm[2]) {
       const recv = fm[1]?.trim();
@@ -975,7 +1035,7 @@ function extractGoSymbols(lines: string[]): SymbolEntry[] {
         kind: recv ? "method" : "function",
         name,
         startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
+        endLine: findBraceBlockEnd(lines, i, "go"),
         depth: 0,
       });
       continue;
@@ -986,7 +1046,7 @@ function extractGoSymbols(lines: string[]): SymbolEntry[] {
         kind: tm[2],
         name: tm[1],
         startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
+        endLine: findBraceBlockEnd(lines, i, "go"),
         depth: 0,
       });
     }
@@ -997,10 +1057,23 @@ function extractGoSymbols(lines: string[]): SymbolEntry[] {
 function extractRustSymbols(lines: string[]): SymbolEntry[] {
   const symbols: SymbolEntry[] = [];
   const re =
-    /^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*(fn|struct|enum|trait|impl|mod)\s+([A-Za-z_][\w:<>,\s]*?)(?:\s*[\({;]|$)/;
+    /^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*(fn|struct|enum|trait|impl|mod)(?:\s+|\s*(?=<))([A-Za-z_<][\w:<>,+'&\s]*?)(?:\s*[\({;]|$)/;
+  const commentState: ScanState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false,
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
+    const wasInComment = commentState.inBlockComment;
+    scanBracesOnLine(line, commentState, "rust");
+    if (wasInComment) continue;
+
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
+      continue;
+    }
     const m = re.exec(line);
     if (!m || !m[2] || !m[3]) continue;
     const indent = m[1]!.length;
@@ -1009,7 +1082,7 @@ function extractRustSymbols(lines: string[]): SymbolEntry[] {
       kind: m[2],
       name: m[3].trim(),
       startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "c"),
+      endLine: findBraceBlockEnd(lines, i, "rust"),
       depth: indent > 0 ? 1 : 0,
     });
   }
@@ -1474,6 +1547,7 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".pcss":
       return extractCssSymbols(lines);
     case ".py":
+    case ".pyi":
       return extractPythonSymbols(lines);
     case ".gd":
       return extractGdScriptSymbols(lines);
@@ -1638,10 +1712,10 @@ export async function runReadSlices(
   }
 
   const baseCwd = resolvePath(input.cwd || process.cwd());
-  const maxChars = Math.max(
-    1000,
-    Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(input.maxChars ?? 8_500)),
-  );
+  const rawMaxChars = Number(input.maxChars ?? 8_500);
+  const maxChars = Number.isFinite(rawMaxChars)
+    ? Math.max(1000, Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(rawMaxChars)))
+    : 8_500;
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
 
   const perFileSymbolLimit =

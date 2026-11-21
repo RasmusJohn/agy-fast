@@ -9,6 +9,7 @@ import {
   analyzePathsByUsage,
   analyzeTranscriptSessions,
   collectTranscriptFiles,
+  filterStepsByTime,
   parseTranscriptJsonl,
 } from "../src/benchmark-core.js";
 
@@ -588,13 +589,16 @@ describe("benchmark analyzer & CLI", () => {
     // --local with --recent on a fresh HOME without brain dirs returns 0 sessions cleanly
     const freshHome = path.join(tmpDir, "fresh-home");
     await fs.mkdir(freshHome, { recursive: true });
+    const freshEnv: NodeJS.ProcessEnv = { ...process.env, HOME: freshHome, USERPROFILE: freshHome };
+    delete freshEnv.GEMINI_HOME;
+    delete freshEnv.ANTIGRAVITY_APP_DATA_DIR;
     const freshOut = JSON.parse(
       execFileSync(
         process.execPath,
         [BENCHMARK_CLI, "analyze", "--local", "--recent", "5", "--json"],
         {
           encoding: "utf8",
-          env: { ...process.env, HOME: freshHome, USERPROFILE: freshHome },
+          env: freshEnv,
         },
       ),
     );
@@ -939,5 +943,145 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(cm.agyCorruptedArgWastedOutTokens, 9000);
     assert.equal(cm.swarmWorkerSessions, 1);
     assert.equal(cm.swarmWorkerSessionsWithAgyFast, 0);
+  });
+
+  it("discovers IDE/ACP --local brains, handles middle-truncated cmds, direct MCP arg corruption, git tag parity, and --since coordinator identity", async () => {
+    // 1. --local discovers Antigravity IDE and ACP/T3 provider brains
+    const multiHome = path.join(tmpDir, "multi-surface-home");
+    const ideLogs = path.join(multiHome, ".gemini", "antigravity-ide", "brain", "ide-1", ".system_generated", "logs");
+    const acpLogs = path.join(
+      multiHome,
+      ".t3",
+      "userdata",
+      "providers",
+      "antigravity",
+      "hash123",
+      "antigravity-acp",
+      "brain",
+      "acp-1",
+      ".system_generated",
+      "logs",
+    );
+    const customGeminiHome = path.join(tmpDir, "custom-gemini-home");
+    const customGeminiLogs = path.join(customGeminiHome, "antigravity-acp", "brain", "gh-1", ".system_generated", "logs");
+    await fs.mkdir(ideLogs, { recursive: true });
+    await fs.mkdir(acpLogs, { recursive: true });
+    await fs.mkdir(customGeminiLogs, { recursive: true });
+    const simpleTurn = (tok: number) =>
+      JSON.stringify({ type: "PLANNER_RESPONSE", created_at: "2026-11-20T10:00:00Z", output_tokens: tok, tool_calls: [] }) + "\n";
+    await fs.writeFile(path.join(ideLogs, "transcript.jsonl"), simpleTurn(150), "utf8");
+    await fs.writeFile(path.join(acpLogs, "transcript.jsonl"), simpleTurn(250), "utf8");
+    await fs.writeFile(path.join(customGeminiLogs, "transcript.jsonl"), simpleTurn(100), "utf8");
+
+    const multiEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: multiHome,
+      USERPROFILE: multiHome,
+      GEMINI_HOME: customGeminiHome,
+    };
+    delete multiEnv.ANTIGRAVITY_APP_DATA_DIR;
+    const localOut = JSON.parse(
+      execFileSync(process.execPath, [BENCHMARK_CLI, "analyze", "--local", "--json"], {
+        encoding: "utf8",
+        env: multiEnv,
+      }),
+    );
+    assert.equal(localOut.sessions, 3);
+    assert.equal(localOut.totalOutputTokens, 500);
+
+    // 2. Middle-truncated JSON CommandLine, git tag/branch parity, direct MCP corrupted args,
+    //    distinct call_mcp_tool chaining, and `[truncated; showing ...` detection
+    const edgeSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-20T09:00:00Z",
+          content: "<USER_REQUEST>audit repo</USER_REQUEST>",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:00Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "run_command", args: { CommandLine: '"rg foo src/\n<truncated 400 bytes>\n... bar/"' } },
+            { name: "run_command", args: { CommandLine: JSON.stringify("git tag --contains HEAD") } },
+            { name: "run_command", args: { CommandLine: JSON.stringify("git tag --merged main") } },
+            { name: "run_command", args: { CommandLine: JSON.stringify("git tag -v v0.2.5") } },
+            { name: "run_command", args: { CommandLine: JSON.stringify("git branch --merged main") } },
+          ],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:05Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "call_mcp_tool", args: { ServerName: '"agy-fast_fast"', ToolName: '"read_slices"', Arguments: '{"slices":[{"path":"a.ts","ranges":true}]}' } },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-20T10:00:06Z",
+          content: "## Query 1\n... [truncated; showing 30 files]",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:08Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "call_mcp_tool", args: { ServerName: '"agy-fast_fast"', ToolName: '"apply_edits"', Arguments: "{}" } },
+          ],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:10Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_apply_edits", args: { edits: "[false, true]" } },
+            { name: "read_board", args: {} },
+          ],
+        }),
+      ].join("\n"),
+    );
+
+    const edgeMetrics = analyzeTranscriptSessions([edgeSteps]);
+    assert.equal(edgeMetrics.readonlySearchRunCommandCalls, 5);
+    assert.equal(edgeMetrics.agyCorruptedArgCalls, 2); // read_slices ranges:true + direct stringified edits:[false, true]
+    assert.equal(edgeMetrics.agyTruncatedCalls, 1); // `[truncated; showing 30 files]`
+    assert.equal(edgeMetrics.consecutiveSingleChainsExtraTurns, 0); // read_slices -> apply_edits are different tools
+
+    // 3. --since slicing after coordinator's initial USER_INPUT must NOT misclassify coordinator as a swarm worker,
+    //    and direct filterStepsByTime also preserves worker + startup-snapshot identity
+    const coordFile = path.join(tmpDir, "resumed-coord.jsonl");
+    await fs.writeFile(coordFile, edgeSteps.map((s) => JSON.stringify(s)).join("\n") + "\n", "utf8");
+    const slicedCoord = await analyzePaths([coordFile], { sinceMs: Date.parse("2026-11-20T09:30:00Z") });
+    assert.equal(slicedCoord.sessions, 1);
+    assert.equal(slicedCoord.swarmWorkerSessions, 0);
+
+    const workerSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-20T09:00:00Z",
+          content: "[agy-fast startup snapshot] Workspace: /tmp/repo",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T09:05:00Z",
+          output_tokens: 50,
+          tool_calls: [{ name: "read_board", args: {} }],
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T10:00:00Z",
+          output_tokens: 80,
+          tool_calls: [{ name: "read_file", args: { Path: "/tmp/a.ts" } }],
+        }),
+      ].join("\n"),
+    );
+    const directSlicedWorker = filterStepsByTime(workerSteps, Date.parse("2026-11-20T09:30:00Z"));
+    const directWorkerMetrics = analyzeTranscriptSessions([directSlicedWorker]);
+    assert.equal(directWorkerMetrics.sessions, 1);
+    assert.equal(directWorkerMetrics.swarmWorkerSessions, 1);
+    assert.equal(directWorkerMetrics.sessionsWithSnapshot, 1);
   });
 });

@@ -6,6 +6,64 @@ import { promises as fs3 } from "node:fs";
 import path3 from "node:path";
 import { fileURLToPath } from "node:url";
 
+// src/utils/output-filter.ts
+function sliceUtf8Bytes(text, maxBytes) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
+  let bytes = 0;
+  let endIndex = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    const unitLen = cp > 65535 ? 2 : 1;
+    const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
+    if (bytes + chBytes > limit) break;
+    bytes += chBytes;
+    i += unitLen;
+    endIndex = i;
+  }
+  return text.slice(0, endIndex);
+}
+function truncateWithByteNotice(text, maxBytes) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= limit) return text;
+  if (limit < 56) {
+    if (limit <= 3) return sliceUtf8Bytes(text, limit);
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
+  }
+  const maxNoticeBytes = Buffer.byteLength(
+    `
+... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
+    "utf8"
+  );
+  const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
+  let slice = sliceUtf8Bytes(text, cutoffBytes);
+  const lastNewline = slice.lastIndexOf("\n");
+  if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
+    slice = slice.slice(0, lastNewline);
+  }
+  const shownBytes = Buffer.byteLength(slice, "utf8");
+  const result = `${slice}
+... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
+}
+function sliceSafeChars(text, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  let end = limit;
+  const lastCode = text.charCodeAt(end - 1);
+  if (lastCode >= 55296 && lastCode <= 56319) {
+    end -= 1;
+  }
+  return text.slice(0, end);
+}
+
 // src/utils/snapshot.ts
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -183,24 +241,40 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
 ]);
 
 // src/utils/snapshot.ts
+var HARDENED_GIT_BASE_ARGS = [
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "diff.external=",
+  "-c",
+  "gpg.program=false",
+  "-c",
+  "gpg.openpgp.program=false",
+  "-c",
+  "gpg.ssh.program=false",
+  "-c",
+  "gpg.x509.program=false",
+  "--no-pager"
+];
 async function getGitSummary(workspaceDir, timeoutMs) {
   const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "symbolic-ref", "--short", "HEAD"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "status", "--porcelain=v1"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 32768
     }),
-    execBinaryAsync("git", ["--no-optional-locks", "log", "-n", "3", "--format=%h %s"], {
+    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192
@@ -235,7 +309,7 @@ async function getGitSummary(workspaceDir, timeoutMs) {
     let currentLen = prefix.length;
     for (let i = 0; i < Math.min(statusLines.length, maxItems); i++) {
       const raw = statusLines[i].trim();
-      const item = raw.length > 100 ? `${raw.slice(0, 97)}...` : raw;
+      const item = raw.length > 100 ? `${sliceSafeChars(raw, 97)}...` : raw;
       const sepLen = shown.length > 0 ? 2 : 0;
       const remainingAfter = statusLines.length - (i + 1);
       const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
@@ -251,7 +325,7 @@ async function getGitSummary(workspaceDir, timeoutMs) {
   if (logLines.length > 0) {
     parts.push(
       `Recent commits:
-${logLines.map((l) => `  - ${l.slice(0, 72)}`).join("\n")}`
+${logLines.map((l) => `  - ${sliceSafeChars(l, 72)}`).join("\n")}`
     );
   }
   return parts.join("\n");
@@ -301,7 +375,7 @@ var MANIFEST_SKIP_SUBDIRS = /* @__PURE__ */ new Set([
   ...SNAPSHOT_COLLAPSE_DIRS
 ]);
 function shortEntryName(name, maxLen = 28) {
-  return name.length > maxLen ? `${name.slice(0, maxLen - 3)}...` : name;
+  return name.length > maxLen ? `${sliceSafeChars(name, maxLen - 3)}...` : name;
 }
 async function getTwoLevelTree(workspaceDir) {
   let topEntries;
@@ -528,13 +602,15 @@ async function getProjectManifestSummary(workspaceDir) {
 ${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
 function fitSectionToChars(section, budget, marker) {
-  if (budget <= 0) return "";
-  if (section.length <= budget) return section;
-  if (budget <= marker.length + 1) {
-    return section.slice(0, budget);
+  if (!Number.isFinite(budget) || budget <= 0) return "";
+  const limit = Math.trunc(budget);
+  if (limit <= 0) return "";
+  if (section.length <= limit) return section;
+  if (limit <= marker.length + 1) {
+    return sliceSafeChars(section, limit);
   }
-  const cutoff = budget - marker.length - 1;
-  let trimmed = section.slice(0, cutoff);
+  const cutoff = limit - marker.length - 1;
+  let trimmed = sliceSafeChars(section, cutoff);
   const lastNl = trimmed.lastIndexOf("\n");
   if (lastNl > 0) {
     trimmed = trimmed.slice(0, lastNl);
@@ -542,8 +618,28 @@ function fitSectionToChars(section, budget, marker) {
   return `${trimmed}
 ${marker}`;
 }
+function fitSectionToBytes(section, budgetBytes, marker) {
+  if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return "";
+  const limit = Math.trunc(budgetBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(section, "utf8") <= limit) return section;
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (limit <= markerBytes + 1) {
+    return sliceUtf8Bytes(section, limit);
+  }
+  const cutoffBytes = limit - markerBytes - 1;
+  let trimmed = sliceUtf8Bytes(section, cutoffBytes);
+  const lastNl = trimmed.lastIndexOf("\n");
+  if (lastNl > 0) {
+    trimmed = trimmed.slice(0, lastNl);
+  }
+  const result = `${trimmed}
+${marker}`;
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
+}
 async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
-  const maxChars = options.maxChars ?? 1500;
+  const maxChars = typeof options.maxChars === "number" && Number.isFinite(options.maxChars) ? Math.max(0, Math.trunc(options.maxChars)) : 1500;
+  const maxBytes = typeof options.maxBytes === "number" && Number.isFinite(options.maxBytes) ? Math.max(0, Math.trunc(options.maxBytes)) : maxChars;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
   try {
     const stat = await fs.stat(workspaceDir);
@@ -562,12 +658,17 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   );
   if (sections.length <= 1) return null;
   const full = sections.join("\n");
-  if (full.length <= maxChars) return full;
-  const suffix = "... [snapshot capped]";
-  if (maxChars <= header.length + suffix.length + 4) {
-    return fitSectionToChars(full, maxChars, suffix);
+  if (full.length <= maxChars && Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
   }
-  const remainingAfterHeader = maxChars - header.length;
+  const suffix = "... [snapshot capped]";
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  if (maxChars <= header.length + suffix.length + 4 || maxBytes <= headerBytes + suffixBytes + 4) {
+    const charCapped = fitSectionToChars(full, maxChars, suffix);
+    return Buffer.byteLength(charCapped, "utf8") <= maxBytes ? charCapped : truncateWithByteNotice(charCapped, maxBytes);
+  }
+  const remainingAfterHeader = maxBytes - headerBytes;
   const nonEmptyCount = (gitSummary ? 1 : 0) + (projectSummary ? 1 : 0) + (treeSummary ? 1 : 0);
   const availableForBodies = remainingAfterHeader - nonEmptyCount;
   let projectPart = "";
@@ -576,30 +677,37 @@ async function buildWorkspaceSnapshot(workspaceDir, options = {}) {
   let budgetLeft = availableForBodies;
   if (projectSummary) {
     const otherPresent = Boolean(gitSummary || treeSummary);
-    const projectCap = otherPresent ? Math.min(projectSummary.length, Math.max(80, Math.floor(availableForBodies * 0.25))) : budgetLeft;
-    projectPart = fitSectionToChars(
+    const projectBytes = Buffer.byteLength(projectSummary, "utf8");
+    const projectCap = otherPresent ? Math.min(projectBytes, Math.max(80, Math.floor(availableForBodies * 0.25))) : budgetLeft;
+    projectPart = fitSectionToBytes(
       projectSummary,
       Math.min(budgetLeft, projectCap),
       "  ... [project capped]"
     );
-    budgetLeft -= projectPart.length;
+    budgetLeft -= Buffer.byteLength(projectPart, "utf8");
   }
   if (gitSummary && budgetLeft > 0) {
-    const gitCap = treeSummary ? Math.min(gitSummary.length, Math.max(100, Math.floor(budgetLeft * 0.48))) : budgetLeft;
-    gitPart = fitSectionToChars(
+    const gitBytes = Buffer.byteLength(gitSummary, "utf8");
+    const gitCap = treeSummary ? Math.min(gitBytes, Math.max(100, Math.floor(budgetLeft * 0.48))) : budgetLeft;
+    gitPart = fitSectionToBytes(
       gitSummary,
       Math.min(budgetLeft, gitCap),
       "  ... [git capped]"
     );
-    budgetLeft -= gitPart.length;
+    budgetLeft -= Buffer.byteLength(gitPart, "utf8");
   }
   if (treeSummary && budgetLeft > 0) {
-    treePart = fitSectionToChars(treeSummary, budgetLeft, suffix);
-    budgetLeft -= treePart.length;
+    treePart = fitSectionToBytes(treeSummary, budgetLeft, suffix);
+    budgetLeft -= Buffer.byteLength(treePart, "utf8");
   }
-  const assembled = [header, gitPart, projectPart, treePart].filter(Boolean).join("\n");
-  if (assembled.length <= maxChars) return assembled;
-  return fitSectionToChars(assembled, maxChars, suffix);
+  let assembled = [header, gitPart, projectPart, treePart].filter(Boolean).join("\n");
+  if (assembled.length > maxChars) {
+    assembled = fitSectionToChars(assembled, maxChars, suffix);
+  }
+  if (Buffer.byteLength(assembled, "utf8") > maxBytes) {
+    assembled = fitSectionToBytes(assembled, maxBytes, suffix);
+  }
+  return assembled;
 }
 
 // src/utils/updater-core.ts
@@ -681,9 +789,12 @@ async function writeJsonAtomically(filePath, data) {
   try {
     await fs2.rename(tmpPath, filePath);
   } catch {
-    await fs2.copyFile(tmpPath, filePath);
-    await fs2.rm(tmpPath, { force: true }).catch(() => {
-    });
+    try {
+      await fs2.copyFile(tmpPath, filePath);
+    } finally {
+      await fs2.rm(tmpPath, { force: true }).catch(() => {
+      });
+    }
   }
 }
 async function readUpdaterConfig(env = process.env) {
@@ -792,23 +903,53 @@ function firstNonEmptyPath(list) {
   }
   return "";
 }
+var MAX_STDIN_BYTES = 256 * 1024;
+var MAX_SNAPSHOT_BYTES = 1500;
 async function readStdin(timeoutMs = 1500) {
   return new Promise((resolve) => {
     const chunks = [];
+    let totalBytes = 0;
     let settled = false;
+    const onData = (chunk) => {
+      if (settled) return;
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      const remaining = MAX_STDIN_BYTES - totalBytes;
+      if (remaining <= 0) {
+        finish();
+        return;
+      }
+      if (buf.length > remaining) {
+        chunks.push(buf.subarray(0, remaining));
+        totalBytes += remaining;
+        finish();
+      } else {
+        chunks.push(buf);
+        totalBytes += buf.length;
+      }
+    };
+    const onEnd = () => finish();
+    const onError = () => finish();
+    const ignoreLateError = () => {
+    };
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onError);
+      process.stdin.on("error", ignoreLateError);
+      process.stdin.pause();
+      if (typeof process.stdin.unref === "function") {
+        process.stdin.unref();
+      }
       resolve(Buffer.concat(chunks).toString("utf8"));
     };
     const timer = setTimeout(finish, timeoutMs);
     timer.unref();
-    process.stdin.on("data", (chunk) => {
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
-    });
-    process.stdin.on("end", finish);
-    process.stdin.on("error", finish);
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("error", onError);
   });
 }
 async function main() {
@@ -831,7 +972,8 @@ async function main() {
       return;
     }
     const snapshot = await buildWorkspaceSnapshot(workspaceDir, {
-      maxChars: 1500,
+      maxChars: MAX_SNAPSHOT_BYTES,
+      maxBytes: MAX_SNAPSHOT_BYTES,
       gitTimeoutMs: 800
     });
     if (!snapshot) {
@@ -868,8 +1010,19 @@ async function main() {
       }
     } catch {
     }
-    const messageText = updateNotice ? `${snapshot}
-${updateNotice}` : snapshot;
+    let messageText = snapshot;
+    if (updateNotice) {
+      const combined = `${snapshot}
+${updateNotice}`;
+      if (Buffer.byteLength(combined, "utf8") <= MAX_SNAPSHOT_BYTES) {
+        messageText = combined;
+      } else {
+        const noticeBytes = Buffer.byteLength(updateNotice, "utf8") + 1;
+        const snapshotBudget = MAX_SNAPSHOT_BYTES - noticeBytes;
+        messageText = snapshotBudget >= 64 ? `${truncateWithByteNotice(snapshot, snapshotBudget)}
+${updateNotice}` : truncateWithByteNotice(combined, MAX_SNAPSHOT_BYTES);
+      }
+    }
     const response = {
       injectSteps: [
         {

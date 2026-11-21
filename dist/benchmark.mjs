@@ -136,9 +136,12 @@ function unwrapJsonString(val) {
       if (typeof parsed === "string") return parsed;
     } catch {
     }
-  } else if (trimmed.startsWith('"') && /<truncated \d+ bytes>$/.test(trimmed)) {
-    const withoutTrailer = trimmed.slice(1).replace(/\r?\n?<truncated \d+ bytes>$/, "");
-    return withoutTrailer.replace(
+  }
+  if (trimmed.startsWith('"') && /<truncated \d+ bytes>/.test(trimmed)) {
+    let inner = trimmed.slice(1);
+    if (inner.endsWith('"')) inner = inner.slice(0, -1);
+    const withoutMarkers = inner.replace(/\r?\n?<truncated \d+ bytes>\r?\n?/g, " ");
+    return withoutMarkers.replace(
       /\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g,
       (_m, hex, ch) => {
         if (hex !== void 0) {
@@ -437,12 +440,19 @@ function isReadonlyGitBranch(args) {
       return false;
     }
     if (GIT_BRANCH_VALUE_FLAGS.has(a)) {
+      if (a === "--contains" || a === "--no-contains" || a === "--merged" || a === "--no-merged" || a === "--points-at") {
+        explicitList = true;
+      }
       if (args[i + 1] && !args[i + 1].startsWith("-")) {
         i += 1;
       }
       continue;
     }
     if (a.startsWith("--")) {
+      const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+      if (flagName === "--contains" || flagName === "--no-contains" || flagName === "--merged" || flagName === "--no-merged" || flagName === "--points-at") {
+        explicitList = true;
+      }
       continue;
     }
     if (a.startsWith("-") && a.length > 1) {
@@ -471,19 +481,38 @@ function isReadonlyGitTag(args) {
       positionalCount += args.length - i - 1;
       break;
     }
-    if (a === "-l" || a === "--list") {
+    if (a === "-l" || a === "--list" || a === "--verify") {
       explicitList = true;
       continue;
     }
     if (a === "--delete" || a === "--annotate" || a === "--sign" || a === "--force" || a === "--message" || a.startsWith("--message=") || a === "--file" || a.startsWith("--file=") || a === "--local-user" || a.startsWith("--local-user=")) {
       return false;
     }
-    if (a.startsWith("-") && !a.startsWith("--") && a.length > 1) {
-      if (/[dasufmFv]/.test(a.slice(1))) return false;
-      if (a.slice(1).includes("l")) explicitList = true;
+    if (GIT_BRANCH_VALUE_FLAGS.has(a)) {
+      if (a === "--contains" || a === "--no-contains" || a === "--merged" || a === "--no-merged" || a === "--points-at") {
+        explicitList = true;
+      }
+      if (args[i + 1] && !args[i + 1].startsWith("-")) {
+        i += 1;
+      }
       continue;
     }
-    if (a.startsWith("--")) continue;
+    if (a.startsWith("-") && !a.startsWith("--") && a.length > 1) {
+      if (/^-n\d*$/.test(a)) {
+        explicitList = true;
+        continue;
+      }
+      if (/[dasufmF]/.test(a.slice(1))) return false;
+      if (/[lv]/.test(a.slice(1))) explicitList = true;
+      continue;
+    }
+    if (a.startsWith("--")) {
+      const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+      if (flagName === "--contains" || flagName === "--no-contains" || flagName === "--merged" || flagName === "--no-merged" || flagName === "--points-at") {
+        explicitList = true;
+      }
+      continue;
+    }
     positionalCount += 1;
   }
   return explicitList || positionalCount === 0;
@@ -622,7 +651,8 @@ function extractAgyFastToolName(call) {
   return m?.[1] ?? null;
 }
 function sessionHasStartupSnapshot(steps) {
-  for (const step of steps) {
+  const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
+  for (const step of identitySteps) {
     if (typeof step.content !== "string") continue;
     if (!step.content.includes("[agy-fast startup snapshot]")) continue;
     if (step.type === "SYSTEM_MESSAGE") return true;
@@ -649,18 +679,46 @@ function extractAgyFastInnerArgs(call) {
   }
   return isPlainRecord(inner) ? inner : null;
 }
+function maybeParseJsonValue(val) {
+  if (typeof val !== "string") return val;
+  const trimmed = val.trim();
+  if (trimmed.startsWith("[") || trimmed.startsWith("{") || trimmed === "true" || trimmed === "false" || trimmed === "null") {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return val;
+    }
+  }
+  return val;
+}
+function getCanonicalToolName(call) {
+  const name = call.name ?? "";
+  if (name !== "call_mcp_tool") return name;
+  const callArgs = getCallArgs(call);
+  const serverName = unwrapJsonString(
+    callArgs?.ServerName ?? callArgs?.serverName ?? callArgs?.server_name ?? ""
+  );
+  const toolName = unwrapJsonString(
+    callArgs?.ToolName ?? callArgs?.toolName ?? callArgs?.tool_name ?? ""
+  );
+  if (toolName) {
+    return serverName ? `call_mcp_tool:${serverName}/${toolName}` : `call_mcp_tool:${toolName}`;
+  }
+  return name;
+}
 function hasCorruptedAgyFastArgs(call, fastTool) {
   const inner = extractAgyFastInnerArgs(call);
   if (!inner) return false;
   if (fastTool === "apply_edits") {
-    const eds = inner.edits;
+    const eds = maybeParseJsonValue(inner.edits);
     if (typeof eds === "boolean" || eds === null) return true;
     if (Array.isArray(eds)) {
       return eds.some((e) => {
         if (!isPlainRecord(e)) return true;
         if (e.hunks !== void 0) {
-          if (typeof e.hunks === "boolean" || e.hunks === null) return true;
-          if (Array.isArray(e.hunks) && e.hunks.some((h) => !isPlainRecord(h))) {
+          const hunks = maybeParseJsonValue(e.hunks);
+          if (!Array.isArray(hunks)) return true;
+          if (hunks.some((h) => !isPlainRecord(h))) {
             return true;
           }
         }
@@ -670,31 +728,44 @@ function hasCorruptedAgyFastArgs(call, fastTool) {
     return false;
   }
   if (fastTool === "batch_search") {
-    const qs = inner.queries;
+    const qs = maybeParseJsonValue(inner.queries);
     if (typeof qs === "boolean" || qs === null) return true;
     return Array.isArray(qs) && qs.some((q) => !isPlainRecord(q));
   }
   if (fastTool === "read_slices") {
-    const outlines = inner.outlines;
+    const outlines = maybeParseJsonValue(inner.outlines);
     if (typeof outlines === "boolean" || outlines === null) return true;
     if (Array.isArray(outlines) && outlines.some((p) => typeof p !== "string")) {
       return true;
     }
-    const slices = inner.slices;
+    const slices = maybeParseJsonValue(inner.slices);
     if (typeof slices === "boolean" || slices === null) return true;
-    return Array.isArray(slices) && slices.some((s) => !isPlainRecord(s));
+    if (Array.isArray(slices)) {
+      return slices.some((s) => {
+        if (!isPlainRecord(s)) return true;
+        if (s.ranges !== void 0) {
+          const ranges = maybeParseJsonValue(s.ranges);
+          if (!Array.isArray(ranges)) return true;
+          if (ranges.some((r) => typeof r === "boolean" || r === null)) return true;
+        }
+        return false;
+      });
+    }
+    return false;
   }
   if (fastTool === "run_checks") {
-    const cmds = inner.commands;
+    const cmds = maybeParseJsonValue(inner.commands);
     if (typeof cmds === "boolean" || cmds === null) return true;
     return Array.isArray(cmds) && cmds.some((c) => typeof c !== "string" && !isPlainRecord(c));
   }
   return false;
 }
+var fullSessionStepsMap = /* @__PURE__ */ new WeakMap();
 function isSwarmWorkerSession(steps) {
+  const identitySteps = fullSessionStepsMap.get(steps) ?? steps;
   let hasUserRequest = false;
   let hasSwarmWorkerTool = false;
-  for (const step of steps) {
+  for (const step of identitySteps) {
     if (step.type === "USER_INPUT") {
       const text = typeof step.content === "string" ? step.content : "";
       if (text.includes("<USER_REQUEST>") || text.trim().length > 0) {
@@ -733,6 +804,7 @@ function filterStepsByTime(steps, sinceMs, untilMs) {
     if (untilMs !== void 0 && ms > untilMs) continue;
     out.push(step);
   }
+  fullSessionStepsMap.set(out, fullSessionStepsMap.get(steps) ?? steps);
   return out;
 }
 function analyzeTranscriptSessions(sessions) {
@@ -791,7 +863,6 @@ function analyzeTranscriptSessions(sessions) {
       const step = steps[i];
       if (Array.isArray(step.media) && step.media.length > 0) {
         sessionMediaCount += step.media.length;
-        mediaLoadedCount += step.media.length;
       }
       if (step.type === "USER_INPUT") {
         prevSingleToolName = null;
@@ -849,7 +920,7 @@ function analyzeTranscriptSessions(sessions) {
         totalToolCalls += calls.length;
         if (calls.length === 1) {
           singleToolTurns += 1;
-          const singleName = calls[0]?.name ?? "";
+          const singleName = calls[0] ? getCanonicalToolName(calls[0]) : "";
           if (singleName && singleName === prevSingleToolName) {
             consecutiveSingleChainsExtraTurns += 1;
           }
@@ -923,7 +994,7 @@ function analyzeTranscriptSessions(sessions) {
         const isSpill = resText.includes("The output was large and was saved to:") || /output was truncated/i.test(resText) && resText.includes("output.txt");
         if (isSpill) {
           mcpSpillCalls += 1;
-        } else if (resText.includes("[truncated:") || resText.includes("[truncated at ")) {
+        } else if (resText.includes("[truncated:") || resText.includes("[truncated at ") || resText.includes("[truncated; showing ")) {
           agyTruncatedCalls += 1;
         }
         if (resStep.status === "ERROR" || resText.includes("Encountered error in step execution") || resText.includes("Partial edit applied") || resText.includes("Atomic edit aborted")) {
@@ -971,6 +1042,7 @@ function analyzeTranscriptSessions(sessions) {
     }
     if (hasPlanner) {
       validSessions += 1;
+      mediaLoadedCount += sessionMediaCount;
       if (sessionFastCalls > 0) sessionsWithAgyFast += 1;
       if (sessionHasStartupSnapshot(steps)) sessionsWithSnapshot += 1;
       if (isSwarmWorkerSession(steps)) {
@@ -1194,6 +1266,9 @@ async function loadFilteredSessions(inputs, options = {}) {
       const rawSteps = parseTranscriptJsonl(content);
       const steps = filterStepsByTime(rawSteps, sinceMs, untilMs);
       if (!steps.some((s) => s.type === "PLANNER_RESPONSE")) continue;
+      if (steps !== rawSteps) {
+        fullSessionStepsMap.set(steps, rawSteps);
+      }
       sessions.push(steps);
       if (recent !== void 0 && sessions.length >= recent) break;
     } catch {
@@ -1348,6 +1423,58 @@ function parseIsoTimestamp(raw, endOfDayIfDateOnly = false) {
   const ms = Date.parse(normalized);
   return Number.isFinite(ms) ? ms : null;
 }
+function getHomeDir(env = process.env) {
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+}
+async function discoverLocalBrainDirs(env = process.env) {
+  const home = getHomeDir(env);
+  const seen = /* @__PURE__ */ new Set();
+  const dirs = [];
+  const addDir = (p) => {
+    const resolved = path2.resolve(p);
+    const key = process.platform === "win32" || process.platform === "darwin" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) return;
+    seen.add(key);
+    dirs.push(resolved);
+  };
+  addDir(path2.join(home, ".gemini", "antigravity", "brain"));
+  addDir(path2.join(home, ".gemini", "antigravity-cli", "brain"));
+  addDir(path2.join(home, ".gemini", "antigravity-ide", "brain"));
+  const addIfExistingDir = async (p) => {
+    try {
+      const st = await fs2.stat(p);
+      if (st.isDirectory()) addDir(p);
+    } catch {
+    }
+  };
+  const t3ProvidersDir = path2.join(
+    home,
+    ".t3",
+    "userdata",
+    "providers",
+    "antigravity"
+  );
+  try {
+    const entries = await fs2.readdir(t3ProvidersDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      await addIfExistingDir(
+        path2.join(t3ProvidersDir, entry.name, "antigravity-acp", "brain")
+      );
+    }
+  } catch {
+  }
+  const envGeminiHome = env.GEMINI_HOME?.trim();
+  if (envGeminiHome) {
+    await addIfExistingDir(path2.join(envGeminiHome, "antigravity-acp", "brain"));
+    await addIfExistingDir(path2.join(envGeminiHome, "antigravity-cli", "brain"));
+  }
+  const envAppDataDir = env.ANTIGRAVITY_APP_DATA_DIR?.trim();
+  if (envAppDataDir) {
+    await addIfExistingDir(path2.join(envAppDataDir, "brain"));
+  }
+  return dirs;
+}
 function printUsage() {
   process.stdout.write(
     [
@@ -1357,7 +1484,7 @@ function printUsage() {
       "  node dist/benchmark.mjs compare --before <path> --after <path> [--json]",
       "",
       "Options:",
-      "  --local        Scan ~/.gemini/antigravity/brain and ~/.gemini/antigravity-cli/brain",
+      "  --local        Scan local Antigravity brain dirs (Desktop 2.0, CLI, IDE, and ACP)",
       "  --recent <N>   Analyze only the N most recently modified transcripts",
       "  --since <ISO>  Include only steps at or after an ISO-8601 timestamp (e.g. 2026-11-19T12:51:00+08:00)",
       "  --until <ISO>  Include only steps at or before an ISO-8601 timestamp",
@@ -1397,10 +1524,7 @@ async function main(argv) {
         continue;
       }
       if (!afterDoubleDash && a === "--local") {
-        targets.push(
-          path2.join(os.homedir(), ".gemini", "antigravity", "brain"),
-          path2.join(os.homedir(), ".gemini", "antigravity-cli", "brain")
-        );
+        targets.push(...await discoverLocalBrainDirs());
         continue;
       }
       if (!afterDoubleDash && (a === "--recent" || a.startsWith("--recent="))) {

@@ -729,4 +729,124 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(busyFile, "utf8"), "precious original\n");
     assert.equal(await fs.readFile(otherFile, "utf8"), "other mod\n");
   });
+
+  it("protects dangling symlinks on create, preserves majority LF EOL, validates verify before writes, and avoids lone surrogates", async () => {
+    const subDir = path.join(tmpDir, "hardening-edge");
+    await fs.mkdir(subDir, { recursive: true });
+    const realSubDir = await fs.realpath(subDir);
+
+    // 1. Dangling symlink protection (overwrite: false refuses; overwrite: true restores symlink on Phase-2 rollback)
+    const danglingLink = path.join(realSubDir, "dangling.txt");
+    let createdFileSymlink = false;
+    try {
+      await fs.symlink("missing-target.txt", danglingLink);
+      createdFileSymlink = true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "ENOTSUP")) {
+        throw err;
+      }
+    }
+    if (createdFileSymlink) {
+      const blockedSym = await runApplyEdits({
+        cwd: realSubDir,
+        edits: [{ path: "dangling.txt", create: "clobbered\n", overwrite: false }],
+      });
+      assert.equal(blockedSym.isError, true);
+      assert.match(blockedSym.text, /dangling symlink/);
+      assert.equal((await fs.lstat(danglingLink)).isSymbolicLink(), true);
+
+      const failTarget = path.join(realSubDir, "fail-after.txt");
+      await fs.writeFile(failTarget, "orig\n", "utf8");
+      const origRename = fs.rename;
+      const origWriteFile = fs.writeFile;
+      fs.rename = (async (...args: Parameters<typeof origRename>) => {
+        if (String(args[1]) === failTarget) throw makeErrnoError("EXDEV", "EXDEV");
+        return origRename(...args);
+      }) as typeof fs.rename;
+      fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
+        if (String(args[0]) === failTarget) throw makeErrnoError("EIO", "EIO");
+        return origWriteFile(...args);
+      }) as typeof fs.writeFile;
+      try {
+        const rbSym = await runApplyEdits({
+          cwd: realSubDir,
+          edits: [
+            { path: "dangling.txt", create: "replaced\n", overwrite: true },
+            { path: "fail-after.txt", hunks: [{ target: "orig", replacement: "mod" }] },
+          ],
+        });
+        assert.equal(rbSym.isError, true);
+        assert.match(rbSym.text, /rolled back/);
+      } finally {
+        fs.rename = origRename;
+        fs.writeFile = origWriteFile;
+      }
+      assert.equal((await fs.lstat(danglingLink)).isSymbolicLink(), true);
+      assert.equal(await fs.readlink(danglingLink), "missing-target.txt");
+    }
+
+    // 2. Symlinked parent directory deduplication for new files
+    const realChildDir = path.join(realSubDir, "real-dir");
+    const symChildDir = path.join(realSubDir, "sym-dir");
+    await fs.mkdir(realChildDir, { recursive: true });
+    await fs.symlink(realChildDir, symChildDir, process.platform === "win32" ? "junction" : "dir");
+    const dupCreate = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [
+        { path: "real-dir/new.ts", create: "a\n" },
+        { path: "sym-dir/new.ts", create: "b\n" },
+      ],
+    });
+    assert.equal(dupCreate.isError, true);
+    assert.match(dupCreate.text, /duplicate entries cannot mix 'create'/);
+
+    // 3. Single CRLF in an LF-majority script must NOT rewrite the whole file to CRLF
+    const scriptPath = path.join(realSubDir, "run.sh");
+    await fs.writeFile(scriptPath, "#!/usr/bin/env bash\necho 1\r\necho 2\necho 3\n", "utf8");
+    const lfRes = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "run.sh", hunks: [{ target: "echo 3", replacement: "echo 4" }] }],
+    });
+    assert.equal(lfRes.isError, false);
+    const scriptAfter = await fs.readFile(scriptPath, "utf8");
+    assert.ok(scriptAfter.startsWith("#!/usr/bin/env bash\n"));
+    assert.ok(!scriptAfter.includes("\r\n"));
+
+    // 4. Malformed verify fails validation BEFORE writing files; non-finite verifyTimeoutSec/maxVerifyChars stay safe
+    const verifyFile = path.join(realSubDir, "v.ts");
+    await fs.writeFile(verifyFile, "export const v = 1;\n", "utf8");
+    const badVerify = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "v.ts", hunks: [{ target: "v = 1", replacement: "v = 2" }] }],
+      verify: { command: true as unknown as string },
+    });
+    assert.equal(badVerify.isError, true);
+    assert.match(badVerify.text, /0 files modified/);
+    assert.equal(await fs.readFile(verifyFile, "utf8"), "export const v = 1;\n");
+
+    const nanVerify = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "v.ts", hunks: [{ target: "v = 1", replacement: "v = 2" }] }],
+      verify: `${JSON.stringify(process.execPath)} -e "console.log('verify ok')"`,
+      verifyTimeoutSec: Number.NaN,
+      maxVerifyChars: Number.NaN,
+    });
+    assert.equal(nanVerify.isError, false);
+    assert.match(nanVerify.text, /Verify \[PASS/);
+    assert.match(nanVerify.text, /verify ok/);
+
+    // 5. Long emoji line in mismatch snippet does not emit a lone surrogate
+    const emojiFile = path.join(realSubDir, "emoji.ts");
+    await fs.writeFile(emojiFile, `const token = "${"x".repeat(142)}${"🚀".repeat(30)}";\n`, "utf8");
+    const emojiMiss = await runApplyEdits({
+      cwd: realSubDir,
+      edits: [{ path: "emoji.ts", hunks: [{ startLine: 1, endLine: 1, target: "nonexistent", replacement: "y" }] }],
+    });
+    assert.equal(emojiMiss.isError, true);
+    assert.equal(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emojiMiss.text),
+      false,
+    );
+  });
 });

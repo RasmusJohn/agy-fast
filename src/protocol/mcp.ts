@@ -74,17 +74,17 @@ export class McpStdioServer {
     const id = hasId ? (msg.id ?? null) : null;
     const method = typeof msg.method === "string" ? msg.method : "";
 
-    // Notifications (no id) must not produce a response
-    if (!hasId) {
-      return null;
-    }
-
     if (!method) {
       return {
         jsonrpc: "2.0",
         id,
         error: { code: -32600, message: "Invalid Request: missing method" },
       };
+    }
+
+    // Notifications (no id) must not produce a response
+    if (!hasId) {
+      return null;
     }
 
     if (method === "initialize") {
@@ -145,10 +145,46 @@ export class McpStdioServer {
       }
 
       const rawArgs = msg.params?.arguments;
-      const args =
-        rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
-          ? (rawArgs as Record<string, unknown>)
-          : {};
+      let args: Record<string, unknown>;
+      if (rawArgs === undefined || rawArgs === null) {
+        args = {};
+      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+        args = rawArgs as Record<string, unknown>;
+      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
+        try {
+          const parsedArgs: unknown = JSON.parse(rawArgs);
+          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+            args = parsedArgs as Record<string, unknown>;
+          } else {
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32602,
+                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`,
+              },
+            };
+          }
+        } catch {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32602,
+              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`,
+            },
+          };
+        }
+      } else {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`,
+          },
+        };
+      }
 
       try {
         const res = await tool.handler(args);
@@ -276,25 +312,52 @@ export class McpStdioServer {
         }
 
         // Check for optional Content-Length / Content-Type LSP-style header framing
-        const headerProbe = buffer.subarray(0, 16).toString("ascii").toLowerCase();
+        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
         if (
           headerProbe.startsWith("content-length:") ||
           headerProbe.startsWith("content-type:")
         ) {
-          const headerEnd = buffer.indexOf("\r\n\r\n");
-          const altHeaderEnd = headerEnd === -1 ? buffer.indexOf("\n\n") : -1;
-          const sepIdx = headerEnd !== -1 ? headerEnd : altHeaderEnd;
-          const sepLen = headerEnd !== -1 ? 4 : 2;
+          const crlfEnd = buffer.indexOf("\r\n\r\n");
+          const lfEnd = buffer.indexOf("\n\n");
+          let sepIdx = -1;
+          let sepLen = 0;
+          if (crlfEnd !== -1 && (lfEnd === -1 || crlfEnd < lfEnd)) {
+            sepIdx = crlfEnd;
+            sepLen = 4;
+          } else if (lfEnd !== -1) {
+            sepIdx = lfEnd;
+            sepLen = 2;
+          }
           if (sepIdx === -1) break; // wait for complete header
 
-          const headerText = buffer.subarray(0, sepIdx).toString("ascii");
-          const match = /content-length:\s*(\d+)/i.exec(headerText);
-          if (!match) {
-            // Skip corrupted header block
+          const headerText = buffer.subarray(0, sepIdx).toString("latin1");
+          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
+          const maxFrameBytes = 64 * 1024 * 1024;
+          if (clMatches.length !== 1) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" },
+              },
+              true,
+            );
             buffer = buffer.subarray(sepIdx + sepLen);
             continue;
           }
-          const contentLength = Number.parseInt(match[1]!, 10);
+          const contentLength = Number(clMatches[0]![1]!);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" },
+              },
+              true,
+            );
+            buffer = Buffer.alloc(0);
+            break;
+          }
           const bodyStart = sepIdx + sepLen;
           if (buffer.length < bodyStart + contentLength) {
             break; // wait for complete body

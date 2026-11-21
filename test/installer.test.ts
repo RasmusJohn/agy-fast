@@ -23,8 +23,22 @@ describe("installer", () => {
     await fs.rm(fakeProject, { recursive: true, force: true });
   });
 
+  function makeIsolatedEnv(
+    homeDir: string,
+    extra: Record<string, string | undefined> = {},
+  ): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
+    delete env.GEMINI_HOME;
+    delete env.ANTIGRAVITY_APP_DATA_DIR;
+    for (const [k, v] of Object.entries(extra)) {
+      if (v === undefined) delete env[k];
+      else env[k] = v;
+    }
+    return env;
+  }
+
   it("installs, runs doctor, upgrades idempotently, and uninstalls cleanly in isolated HOME", async () => {
-    const env = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome };
+    const env = makeIsolatedEnv(fakeHome);
     const expectedDir = path.join(fakeHome, ".gemini", "config", "plugins", "agy-fast");
 
     const out1 = execFileSync(
@@ -87,7 +101,7 @@ describe("installer", () => {
   });
 
   it("supports --project and --link modes and valid shell syntax in install.sh", async () => {
-    const env = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome };
+    const env = makeIsolatedEnv(fakeHome);
     const projectTarget = path.join(fakeProject, ".agents", "plugins", "agy-fast");
 
     execFileSync(
@@ -132,7 +146,7 @@ describe("installer", () => {
     const cleanHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-clean-"));
     try {
       const unOut = execFileSync("sh", [INSTALL_SH, "uninstall", "--no-enable"], {
-        env: { ...process.env, HOME: cleanHome, USERPROFILE: cleanHome },
+        env: makeIsolatedEnv(cleanHome),
         encoding: "utf8",
       });
       assert.match(unOut, /Nothing to remove/);
@@ -174,7 +188,7 @@ describe("installer", () => {
   });
 
   it("protects source repo across symlink/case variants, rejects ancestors and non-plugin dirs, and handles empty/symlink targets safely", async () => {
-    const env = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome };
+    const env = makeIsolatedEnv(fakeHome);
     const linkType = process.platform === "win32" ? "junction" : "dir";
     const run = (args: string[]) =>
       execFileSync(process.execPath, args, { env, encoding: "utf8", stdio: "pipe" });
@@ -295,6 +309,107 @@ describe("installer", () => {
     } finally {
       await fs.unlink(parentAlias).catch(() => {});
       await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("auto-syncs global install, doctor, and uninstall across T3 Code ACP and isolated GEMINI_HOME profiles", async () => {
+    const acpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-acp-home-"));
+    const customGeminiHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-gemini-home-"));
+    try {
+      const t3ProfileRoot = path.join(
+        acpHome,
+        ".t3",
+        "userdata",
+        "providers",
+        "antigravity",
+        "ac0a3dfd12345678",
+      );
+      const t3ConfigPath = path.join(t3ProfileRoot, "config", "config.json");
+      await fs.mkdir(path.dirname(t3ConfigPath), { recursive: true });
+      await fs.mkdir(path.join(t3ProfileRoot, "antigravity-acp"), { recursive: true });
+      await fs.writeFile(
+        t3ConfigPath,
+        JSON.stringify({ plugins: { swarm: { enabled: true } } }, null, 2) + "\n",
+        "utf8",
+      );
+      await fs.mkdir(path.join(customGeminiHome, "config"), { recursive: true });
+
+      const env = makeIsolatedEnv(acpHome, { GEMINI_HOME: customGeminiHome });
+      const primaryDir = path.join(acpHome, ".gemini", "config", "plugins", "agy-fast");
+      const t3PluginDir = path.join(t3ProfileRoot, "config", "plugins", "agy-fast");
+      const envPluginDir = path.join(customGeminiHome, "config", "plugins", "agy-fast");
+
+      // 1. Global install automatically syncs both T3 Code ACP profile and isolated GEMINI_HOME
+      const out = execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable"], {
+        env,
+        encoding: "utf8",
+      });
+      assert.match(out, /Synced T3 Code ACP \(ac0a3dfd\)/);
+      assert.match(out, /Synced GEMINI_HOME/);
+      assert.match(out, /T3 Code ACP \(ac0a3dfd\): OK/);
+      assert.match(out, /GEMINI_HOME: OK/);
+      assert.ok((await fs.stat(path.join(t3PluginDir, "dist", "mcp-server.mjs"))).isFile());
+      assert.ok((await fs.stat(path.join(envPluginDir, "plugin.json"))).isFile());
+      // Existing T3 config.json must stay untouched
+      const t3CfgAfter = JSON.parse(await fs.readFile(t3ConfigPath, "utf8"));
+      assert.deepEqual(t3CfgAfter, { plugins: { swarm: { enabled: true } } });
+
+      // 2. --no-acp opts out of syncing isolated profiles; doctor reports MISSING when removed
+      await fs.rm(t3PluginDir, { recursive: true, force: true });
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"], {
+        env,
+        encoding: "utf8",
+      });
+      await assert.rejects(fs.lstat(t3PluginDir));
+      const docMissing = execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
+        env,
+        encoding: "utf8",
+      });
+      assert.match(docMissing, /T3 Code ACP \(ac0a3dfd\): MISSING/);
+
+      // 3. --project / --target installs never touch T3 Code ACP profiles
+      const customTarget = path.join(acpHome, "custom-only-target");
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--target", customTarget, "--no-enable"],
+        { env, encoding: "utf8" },
+      );
+      await assert.rejects(fs.lstat(t3PluginDir));
+
+      // 4. --link dev mode links isolated profiles directly to repo root (no chained symlinks)
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--link", "--no-enable"], {
+        env,
+        encoding: "utf8",
+      });
+      assert.equal(await fs.realpath(t3PluginDir), await fs.realpath(process.cwd()));
+      assert.equal(await fs.realpath(primaryDir), await fs.realpath(process.cwd()));
+
+      // 5. Global uninstall removes primary AND all isolated ACP/GEMINI_HOME links without touching config.json
+      const unOut = execFileSync(process.execPath, [INSTALL_SCRIPT, "uninstall", "--no-enable"], {
+        env,
+        encoding: "utf8",
+      });
+      assert.match(unOut, /Removed agy-fast from .*T3 Code ACP/);
+      assert.match(unOut, /Removed agy-fast from .*GEMINI_HOME/);
+      await assert.rejects(fs.lstat(primaryDir));
+      await assert.rejects(fs.lstat(t3PluginDir));
+      await assert.rejects(fs.lstat(envPluginDir));
+      assert.ok((await fs.stat(t3ConfigPath)).isFile());
+
+      // 6. Safety guard refuses to delete non-agy-fast user files in an isolated profile's target dir
+      await fs.mkdir(t3PluginDir, { recursive: true });
+      const userFile = path.join(t3PluginDir, "keep-me.txt");
+      await fs.writeFile(userFile, "safe", "utf8");
+      assert.throws(() => {
+        execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable"], {
+          env,
+          stdio: "pipe",
+        });
+      });
+      assert.equal(await fs.readFile(userFile, "utf8"), "safe");
+    } finally {
+      await fs.rm(acpHome, { recursive: true, force: true });
+      await fs.rm(customGeminiHome, { recursive: true, force: true });
     }
   });
 });

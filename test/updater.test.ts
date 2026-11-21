@@ -326,6 +326,8 @@ describe("auto-updater", () => {
       USERPROFILE: cliHome,
       AGY_FAST_CACHE_DIR: cacheDir,
     };
+    delete env.GEMINI_HOME;
+    delete env.ANTIGRAVITY_APP_DATA_DIR;
 
     const cfgOut = execFileSync(
       process.execPath,
@@ -343,13 +345,141 @@ describe("auto-updater", () => {
     assert.match(checkOut, /Update available: v0\.2\.0 -> v0\.3\.0/);
     assert.equal(await readInstalledVersion(pluginDir), "0.2.0");
 
+    // Global update (without --target) also syncs any discovered T3 Code ACP profile
+    const t3ProfileRoot = path.join(cliHome, ".t3", "userdata", "providers", "antigravity", "abcd1234");
+    await fs.mkdir(path.join(t3ProfileRoot, "config"), { recursive: true });
+    const t3PluginDir = path.join(t3ProfileRoot, "config", "plugins", "agy-fast");
+
     const applyOut = execFileSync(
       process.execPath,
-      [INSTALL_SCRIPT, "update", "--target", pluginDir],
+      [INSTALL_SCRIPT, "update"],
       { env, encoding: "utf8" },
     );
     assert.match(applyOut, /Updated agy-fast v0\.2\.0 -> v0\.3\.0/);
+    assert.match(applyOut, /Synced T3 Code ACP \(abcd1234\)/);
     assert.match(applyOut, /Version\s+: v0\.3\.0/);
     assert.equal(await readInstalledVersion(pluginDir), "0.3.0");
+    assert.equal(await readInstalledVersion(t3PluginDir), "0.3.0");
+  });
+
+  it("prevents main-channel silent downgrades, keeps plugin.json last on swap failure, fetches git-clone from verified staging, protects dev-source, and reclaims dead-PID locks", async () => {
+    // 1. Untagged repo at v0.2.0 on main must NOT silently downgrade v0.3.0 or redundantly overwrite v0.2.0
+    const untaggedBare = path.join(rootTmp, "untagged-origin.git");
+    const untaggedWork = path.join(rootTmp, "untagged-work");
+    await fs.mkdir(untaggedBare, { recursive: true });
+    await fs.mkdir(untaggedWork, { recursive: true });
+    git(untaggedBare, ["init", "--bare"]);
+    const untaggedUrl = pathToFileURL(untaggedBare).href;
+    git(untaggedWork, ["init", "-b", "main"]);
+    git(untaggedWork, ["config", "user.email", "test@example.com"]);
+    git(untaggedWork, ["config", "user.name", "Test"]);
+    git(untaggedWork, ["remote", "add", "origin", untaggedUrl]);
+    await copyRuntimeFixture(untaggedWork, "0.2.0", "untagged-0.2.0");
+    git(untaggedWork, ["add", "."]);
+    git(untaggedWork, ["commit", "-m", "main v0.2.0"]);
+    git(untaggedWork, ["push", "origin", "main"]);
+
+    const downgradePlugin = path.join(rootTmp, "downgrade-guard", "plugins", "agy-fast");
+    await copyRuntimeFixture(downgradePlugin, "0.3.0", "installed-0.3.0");
+    const dgRes = await runPluginUpdate({
+      pluginDir: downgradePlugin,
+      channel: "main",
+      repoUrl: untaggedUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "dg-cache") },
+    });
+    assert.equal(dgRes.status, "up-to-date");
+    assert.equal(await readInstalledVersion(downgradePlugin), "0.3.0");
+    assert.match(await fs.readFile(path.join(downgradePlugin, "rules", "AGENTS.md"), "utf8"), /marker:installed-0\.3\.0/);
+
+    const sameVerPlugin = path.join(rootTmp, "samever-guard", "plugins", "agy-fast");
+    await copyRuntimeFixture(sameVerPlugin, "0.2.0", "installed-0.2.0");
+    const svRes = await runPluginUpdate({
+      pluginDir: sameVerPlugin,
+      channel: "main",
+      repoUrl: untaggedUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "sv-cache") },
+    });
+    assert.equal(svRes.status, "up-to-date");
+    assert.match(await fs.readFile(path.join(sameVerPlugin, "rules", "AGENTS.md"), "utf8"), /marker:installed-0\.2\.0/);
+
+    // 2. syncRuntimeFilesAtomically writes plugin.json LAST so a failure on dist/mcp-server.mjs does not advance version or leak tmp files
+    const partialPlugin = path.join(rootTmp, "partial-swap");
+    await copyRuntimeFixture(partialPlugin, "0.2.0", "partial-0.2.0");
+    const mcpDst = path.join(partialPlugin, "dist", "mcp-server.mjs");
+    const origCopyFile = fs.copyFile;
+    const origRename = fs.rename;
+    fs.rename = (async (...args: Parameters<typeof origRename>) => {
+      if (String(args[1]) === mcpDst) {
+        const err = new Error("EBUSY") as NodeJS.ErrnoException;
+        err.code = "EBUSY";
+        throw err;
+      }
+      return origRename(...args);
+    }) as typeof fs.rename;
+    fs.copyFile = (async (...args: Parameters<typeof origCopyFile>) => {
+      if (String(args[1]) === mcpDst) {
+        const err = new Error("EBUSY") as NodeJS.ErrnoException;
+        err.code = "EBUSY";
+        throw err;
+      }
+      return origCopyFile(...args);
+    }) as typeof fs.copyFile;
+    try {
+      const failRes = await runPluginUpdate({
+        pluginDir: partialPlugin,
+        repoUrl: originRepoUrl,
+        env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "partial-cache") },
+      });
+      assert.equal(failRes.status, "error");
+    } finally {
+      fs.copyFile = origCopyFile;
+      fs.rename = origRename;
+    }
+    assert.equal(await readInstalledVersion(partialPlugin), "0.2.0");
+    assert.equal((await fs.readdir(path.join(partialPlugin, "dist"))).some((n) => n.includes(".agy-tmp.")), false);
+
+    // 3. git-clone honors --repo override (fetching from verified stagingDir even if origin is broken)
+    const overrideCloneDir = path.join(rootTmp, "override-home", ".gemini", "config", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(overrideCloneDir), { recursive: true });
+    git(path.dirname(overrideCloneDir), ["clone", "--branch", "v0.2.0", originRepoUrl, overrideCloneDir]);
+    git(overrideCloneDir, ["remote", "set-url", "origin", "file:///nonexistent-agy-fast-origin.git"]);
+    const overrideRes = await runPluginUpdate({
+      pluginDir: overrideCloneDir,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "override-cache") },
+    });
+    assert.equal(overrideRes.status, "updated");
+    assert.equal(await readInstalledVersion(overrideCloneDir), "0.3.0");
+
+    // 4. dev-source outside plugins/agy-fast stays notify-only even with force: true
+    const devCheckout = path.join(rootTmp, "dev-checkout");
+    git(rootTmp, ["clone", "--branch", "v0.2.0", originRepoUrl, devCheckout]);
+    const devRes = await runPluginUpdate({
+      pluginDir: devCheckout,
+      force: true,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "dev-cache") },
+    });
+    assert.equal(devRes.status, "available");
+    assert.equal(devRes.installKind, "dev-source");
+    assert.equal(await readInstalledVersion(devCheckout), "0.2.0");
+
+    // 5. Stale lock held by a dead PID (< 10 min old) is reclaimed immediately
+    const deadLockCache = path.join(rootTmp, "dead-lock-cache");
+    await fs.mkdir(deadLockCache, { recursive: true });
+    const deadChild = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore", windowsHide: true });
+    const deadPid = deadChild.pid!;
+    await new Promise<void>((resolve) => deadChild.on("close", () => resolve()));
+    await fs.writeFile(
+      path.join(deadLockCache, "update.lock"),
+      JSON.stringify({ pid: deadPid, createdAt: new Date().toISOString() }),
+      "utf8",
+    );
+    const reclaimedRes = await runPluginUpdate({
+      pluginDir: overrideCloneDir,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: deadLockCache },
+    });
+    assert.equal(reclaimedRes.status, "up-to-date");
   });
 });

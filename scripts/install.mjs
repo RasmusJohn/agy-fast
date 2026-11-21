@@ -73,8 +73,11 @@ async function writeUpdaterConfigFile(patch) {
   try {
     await fs.rename(tmpPath, cfgPath);
   } catch {
-    await fs.copyFile(tmpPath, cfgPath);
-    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    try {
+      await fs.copyFile(tmpPath, cfgPath);
+    } finally {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+    }
   }
   return { cfgPath, config: merged };
 }
@@ -86,6 +89,7 @@ function parseArgs(argv) {
   let projectDir = "";
   let useLink = false;
   let skipEnable = false;
+  let skipAcp = false;
   let quiet = false;
   let showHelp = false;
   let checkOnly = false;
@@ -104,6 +108,8 @@ function parseArgs(argv) {
       useLink = true;
     } else if (a === "--no-enable") {
       skipEnable = true;
+    } else if (a === "--no-acp") {
+      skipAcp = true;
     } else if (a === "--quiet" || a === "-q") {
       quiet = true;
     } else if (a === "--check") {
@@ -179,6 +185,7 @@ function parseArgs(argv) {
     isCustomTarget,
     useLink,
     skipEnable,
+    skipAcp,
     quiet,
     showHelp,
     checkOnly,
@@ -209,6 +216,7 @@ Options:
   --target <dir>                Use a custom plugin directory
   --link                        Create a symlink to this repository (dev mode)
   --no-enable                   Skip running 'agy plugin enable agy-fast'
+  --no-acp                      Skip syncing isolated T3 Code ACP / GEMINI_HOME profiles
   --check                       (update) Check for newer versions without applying
   --force                       (update) Re-apply even if already on the same version
   --auto-update auto|notify|off Configure background auto-update mode
@@ -495,7 +503,164 @@ async function copyRuntimeFiles(srcRoot, dstRoot) {
   }
 }
 
-async function runDoctor(targetDir, quiet = false) {
+async function isDirSafe(p) {
+  try {
+    return (await fs.stat(p)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function discoverIsolatedPluginDirs(primaryGlobalDir) {
+  const home = getHomeDir();
+  const primaryCompare = toComparePath(primaryGlobalDir);
+  const defaultGeminiCompare = toComparePath(path.join(home, ".gemini"));
+  const seen = new Set([primaryCompare]);
+  const results = [];
+
+  const addCandidate = (geminiRoot, label) => {
+    const resolvedRoot = path.resolve(geminiRoot);
+    if (toComparePath(resolvedRoot) === defaultGeminiCompare) return;
+    const pluginDir = path.join(resolvedRoot, "config", "plugins", PLUGIN_NAME);
+    const key = toComparePath(pluginDir);
+    if (seen.has(key)) return;
+    seen.add(key);
+    results.push({ geminiRoot: resolvedRoot, pluginDir, label });
+  };
+
+  // 1. T3 Code isolated Antigravity ACP provider profiles:
+  //    ~/.t3/userdata/providers/antigravity/<hash>/
+  const t3ProvidersRoot = path.join(home, ".t3", "userdata", "providers", "antigravity");
+  try {
+    const entries = await fs.readdir(t3ProvidersRoot, { withFileTypes: true });
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const profileRoot = path.join(t3ProvidersRoot, entry.name);
+      const hasConfig = await isDirSafe(path.join(profileRoot, "config"));
+      const hasAcp = await isDirSafe(path.join(profileRoot, "antigravity-acp"));
+      if (hasConfig || hasAcp) {
+        addCandidate(profileRoot, `T3 Code ACP (${entry.name.slice(0, 8)})`);
+      }
+    }
+  } catch {
+    // ~/.t3 not present
+  }
+
+  // 2. Explicit GEMINI_HOME env var when pointing to an isolated Antigravity / ACP home
+  const envGeminiHome = process.env.GEMINI_HOME?.trim();
+  if (envGeminiHome) {
+    const resolvedEnv = path.resolve(envGeminiHome);
+    if (await isDirSafe(resolvedEnv)) {
+      const hasConfig = await isDirSafe(path.join(resolvedEnv, "config"));
+      const hasAcp = await isDirSafe(path.join(resolvedEnv, "antigravity-acp"));
+      if (hasConfig || hasAcp) {
+        addCandidate(resolvedEnv, "GEMINI_HOME");
+      }
+    }
+  }
+
+  return results;
+}
+
+async function inspectIsolatedPluginDir(isolated) {
+  const stat = await lstatSafe(isolated.pluginDir);
+  if (!stat) {
+    return { ...isolated, status: "missing", mode: null, linkTarget: null, version: null };
+  }
+  const configJson = await readJsonSafe(path.join(isolated.geminiRoot, "config", "config.json"));
+  const disabledInConfig = configJson?.plugins?.[PLUGIN_NAME]?.enabled === false;
+  const manifest = await readJsonSafe(path.join(isolated.pluginDir, "plugin.json"));
+  const mcpExists = await pathExists(path.join(isolated.pluginDir, "dist", "mcp-server.mjs"));
+  const valid = manifest?.name === PLUGIN_NAME && mcpExists;
+  const version = typeof manifest?.version === "string" ? manifest.version : null;
+
+  if (stat.isSymbolicLink()) {
+    let linkTarget = null;
+    try {
+      linkTarget = await fs.readlink(isolated.pluginDir);
+    } catch {
+      // ignore
+    }
+    if (!valid) {
+      return { ...isolated, status: "broken", mode: "symlink", linkTarget, version: null };
+    }
+    return {
+      ...isolated,
+      status: disabledInConfig ? "disabled" : "ok",
+      mode: "symlink",
+      linkTarget,
+      version,
+    };
+  }
+
+  if (!valid) {
+    return { ...isolated, status: "broken", mode: "copied", linkTarget: null, version: null };
+  }
+  return {
+    ...isolated,
+    status: disabledInConfig ? "disabled" : "ok",
+    mode: "copied",
+    linkTarget: null,
+    version,
+  };
+}
+
+async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, opts) {
+  const isoStat = await lstatSafe(isolated.pluginDir);
+  const srcCompare = toComparePath(resolvedSrc);
+  const primaryCompare = toComparePath(primaryGlobalDir);
+  if (isoStat && !isoStat.isSymbolicLink()) {
+    const isoCompare = toComparePath(await fs.realpath(isolated.pluginDir));
+    if (isoCompare === srcCompare || isoCompare === primaryCompare) {
+      return { synced: true, mode: "same" };
+    }
+    if (isStrictAncestorPath(isoCompare, srcCompare) || isStrictAncestorPath(isoCompare, primaryCompare)) {
+      throw new Error(
+        `Refusing to sync into ${isolated.pluginDir}: target is an ancestor directory of ${resolvedSrc}.`,
+      );
+    }
+  }
+
+  await assertRemovableTarget(isolated.pluginDir, isoStat);
+  await fs.mkdir(path.dirname(isolated.pluginDir), { recursive: true });
+  await removeTargetPath(isolated.pluginDir, isoStat);
+
+  // Link directly to resolvedSrc in --link dev mode (avoids chained NTFS junctions on Windows),
+  // otherwise link to primaryGlobalDir so auto-updates to ~/.gemini/config/plugins/agy-fast
+  // propagate immediately to every isolated ACP profile.
+  const linkSource = opts.useLink ? resolvedSrc : primaryGlobalDir;
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  let mode = "symlink";
+  try {
+    await fs.symlink(linkSource, isolated.pluginDir, linkType);
+  } catch (err) {
+    const code = err?.code;
+    if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
+      await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
+      mode = "copied";
+    } else {
+      throw err;
+    }
+  }
+
+  if (!opts.quiet) {
+    if (mode === "symlink") {
+      console.log(`Synced ${isolated.label}: ${isolated.pluginDir} -> ${linkSource}`);
+    } else {
+      console.log(`Synced ${isolated.label} (copied): ${isolated.pluginDir}`);
+    }
+    const configJson = await readJsonSafe(path.join(isolated.geminiRoot, "config", "config.json"));
+    if (configJson?.plugins?.[PLUGIN_NAME]?.enabled === false) {
+      console.log(
+        `Note: '${PLUGIN_NAME}' is explicitly disabled in ${path.join(isolated.geminiRoot, "config", "config.json")}.`,
+      );
+    }
+  }
+  return { synced: true, mode };
+}
+
+async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const nodeVer = checkNodeVersion();
   const hasRg = hasCommand("rg", ["--version"]);
   const hasAgy = hasCommand("agy", ["--version"]);
@@ -556,6 +721,15 @@ async function runDoctor(targetDir, quiet = false) {
     updaterCfg.channel ||
     "release";
 
+  const isolatedProfiles = doctorOpts.checkIsolated
+    ? await Promise.all(
+        (await discoverIsolatedPluginDirs(targetDir)).map((iso) =>
+          inspectIsolatedPluginDir(iso),
+        ),
+      )
+    : [];
+  report.isolatedProfiles = isolatedProfiles;
+
   if (!quiet) {
     console.log("agy-fast health check:");
     console.log(`  - Plugin path : ${targetDir}`);
@@ -583,11 +757,26 @@ async function runDoctor(targetDir, quiet = false) {
         `  - agy validate: ${report.agyValidated ? "PASSED (--strict)" : "FAILED"}`,
       );
     }
+    for (const iso of isolatedProfiles) {
+      const desc =
+        iso.status === "ok"
+          ? iso.mode === "symlink"
+            ? `OK (linked -> ${iso.linkTarget})`
+            : `OK (installed v${iso.version || "unknown"})`
+          : iso.status === "disabled"
+            ? "DISABLED in profile config.json"
+            : iso.status === "broken"
+              ? `BROKEN (${iso.pluginDir})`
+              : `MISSING (${iso.pluginDir} — run 'install' to sync)`;
+      console.log(`  - ${iso.label}: ${desc}`);
+    }
   }
 
+  const hasBrokenIsolated = isolatedProfiles.some((iso) => iso.status === "broken");
   const ok =
     mcpCheck.tools.length === 4 &&
     hookCheck.bytes > 0 &&
+    !hasBrokenIsolated &&
     (report.agyValidated === null || report.agyValidated === true);
   return { ok, report };
 }
@@ -638,6 +827,12 @@ async function runInstall(opts) {
 
   const hasAgy = hasCommand("agy", ["--version"]);
   const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
+  const syncIsolated = isGlobalTarget && !opts.skipAcp;
+  const isolatedTargets = syncIsolated ? await discoverIsolatedPluginDirs(resolvedDst) : [];
+  for (const isolated of isolatedTargets) {
+    await syncIsolatedPluginDir(resolvedSrc, resolvedDst, isolated, opts);
+  }
+
   if (hasAgy && !opts.skipEnable && isGlobalTarget) {
     const enableRes = spawnCliSync("agy", ["plugin", "enable", PLUGIN_NAME], {
       encoding: "utf8",
@@ -663,7 +858,7 @@ async function runInstall(opts) {
     await writeUpdaterConfigFile(patch);
   }
 
-  const { ok } = await runDoctor(resolvedDst, opts.quiet);
+  const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
   if (!ok) {
     throw new Error("Post-install health check failed.");
   }
@@ -673,6 +868,11 @@ async function runInstall(opts) {
     console.log("Installation complete. Next steps:");
     console.log("  - Antigravity CLI (agy)    : Start a new session to activate agy-fast.");
     console.log("  - Antigravity Desktop / IDE: Open Customizations -> Installed and ensure 'agy-fast' is enabled.");
+    if (isolatedTargets.length > 0) {
+      console.log(
+        `  - T3 Code / ACP (${isolatedTargets.length})        : Start a new thread (or reload provider) to activate agy-fast.`,
+      );
+    }
   }
 }
 
@@ -759,8 +959,35 @@ async function runUpdate(opts) {
     throw new Error(parsed.error || parsed.message);
   }
 
+  const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
+  const syncIsolated = isGlobalTarget && !opts.skipAcp;
+  if (
+    syncIsolated &&
+    !opts.checkOnly &&
+    (parsed.status === "updated" || parsed.status === "up-to-date" || opts.force)
+  ) {
+    const isolatedTargets = await discoverIsolatedPluginDirs(resolvedDst);
+    const dstStat = await lstatSafe(resolvedDst);
+    const linkTarget = dstStat?.isSymbolicLink() ? await fs.realpath(resolvedDst) : resolvedDst;
+    for (const isolated of isolatedTargets) {
+      const info = await inspectIsolatedPluginDir(isolated);
+      const alreadyLinkedToGlobal =
+        (info.status === "ok" || info.status === "disabled") &&
+        info.mode === "symlink" &&
+        info.linkTarget &&
+        toComparePath(path.resolve(path.dirname(isolated.pluginDir), info.linkTarget)) ===
+          toComparePath(linkTarget);
+      if (!alreadyLinkedToGlobal) {
+        await syncIsolatedPluginDir(linkTarget, linkTarget, isolated, {
+          ...opts,
+          useLink: false,
+        });
+      }
+    }
+  }
+
   if (parsed.status === "updated") {
-    const { ok } = await runDoctor(resolvedDst, opts.quiet);
+    const { ok } = await runDoctor(resolvedDst, opts.quiet, { checkIsolated: syncIsolated });
     if (!ok) {
       throw new Error("Post-update health check failed.");
     }
@@ -774,45 +1001,71 @@ async function runUpdate(opts) {
 async function runUninstall(opts) {
   const resolvedDst = path.resolve(opts.targetDir);
   const dstStat = await lstatSafe(resolvedDst);
-  if (!dstStat) {
+  const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
+  const syncIsolated = isGlobalTarget && !opts.skipAcp;
+  const isolatedTargets = syncIsolated ? await discoverIsolatedPluginDirs(resolvedDst) : [];
+  const existingIsolated = [];
+  for (const isolated of isolatedTargets) {
+    const isoStat = await lstatSafe(isolated.pluginDir);
+    if (isoStat) {
+      existingIsolated.push({ isolated, stat: isoStat });
+    }
+  }
+
+  if (!dstStat && existingIsolated.length === 0) {
     if (!opts.quiet) {
       console.log(`Nothing to remove (${resolvedDst} does not exist).`);
     }
     return;
   }
 
-  if (!dstStat.isSymbolicLink()) {
-    const resolvedSrc = await fs.realpath(REPO_ROOT);
-    const srcCompare = toComparePath(resolvedSrc);
-    const dstCompare = toComparePath(await fs.realpath(resolvedDst));
-    if (
-      srcCompare === dstCompare &&
-      (await pathExists(path.join(resolvedSrc, "src")))
-    ) {
-      throw new Error(
-        `Refusing to delete the active source repository at ${resolvedDst}. Remove it manually if desired.`,
-      );
+  const resolvedSrc = await fs.realpath(REPO_ROOT);
+  const srcCompare = toComparePath(resolvedSrc);
+  const hasSrcDir = await pathExists(path.join(resolvedSrc, "src"));
+
+  const guardTarget = async (targetPath, stat) => {
+    if (!stat.isSymbolicLink()) {
+      const targetCompare = toComparePath(await fs.realpath(targetPath));
+      if (srcCompare === targetCompare && hasSrcDir) {
+        throw new Error(
+          `Refusing to delete the active source repository at ${targetPath}. Remove it manually if desired.`,
+        );
+      }
+      if (isStrictAncestorPath(targetCompare, srcCompare)) {
+        throw new Error(
+          `Refusing to delete ${targetPath}: target is an ancestor directory of ${resolvedSrc}.`,
+        );
+      }
     }
-    if (isStrictAncestorPath(dstCompare, srcCompare)) {
-      throw new Error(
-        `Refusing to delete ${resolvedDst}: target is an ancestor directory of ${resolvedSrc}.`,
-      );
-    }
+    await assertRemovableTarget(targetPath, stat);
+  };
+
+  if (dstStat) {
+    await guardTarget(resolvedDst, dstStat);
+  }
+  for (const { isolated, stat } of existingIsolated) {
+    await guardTarget(isolated.pluginDir, stat);
   }
 
-  await assertRemovableTarget(resolvedDst, dstStat);
-
-  const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
-  if (hasCommand("agy", ["--version"]) && !opts.skipEnable && isGlobalTarget) {
+  if (dstStat && hasCommand("agy", ["--version"]) && !opts.skipEnable && isGlobalTarget) {
     spawnCliSync("agy", ["plugin", "disable", PLUGIN_NAME], {
       stdio: "ignore",
       timeout: 10_000,
     });
   }
 
-  await removeTargetPath(resolvedDst, dstStat);
-  if (!opts.quiet) {
-    console.log(`Removed agy-fast from ${resolvedDst}`);
+  for (const { isolated, stat } of existingIsolated) {
+    await removeTargetPath(isolated.pluginDir, stat);
+    if (!opts.quiet) {
+      console.log(`Removed agy-fast from ${isolated.pluginDir} (${isolated.label})`);
+    }
+  }
+
+  if (dstStat) {
+    await removeTargetPath(resolvedDst, dstStat);
+    if (!opts.quiet) {
+      console.log(`Removed agy-fast from ${resolvedDst}`);
+    }
   }
 }
 
@@ -838,7 +1091,8 @@ async function main() {
       break;
     case "status":
     case "doctor": {
-      const { ok } = await runDoctor(opts.targetDir, opts.quiet);
+      const checkIsolated = !opts.isProject && !opts.isCustomTarget && !opts.skipAcp;
+      const { ok } = await runDoctor(opts.targetDir, opts.quiet, { checkIsolated });
       if (!ok) process.exitCode = 1;
       break;
     }

@@ -18,6 +18,7 @@ import {
 import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
+  sliceSafeChars,
 } from "../utils/output-filter.js";
 
 export type SearchQueryType = "text" | "regex" | "glob" | "fuzzy" | "git";
@@ -89,12 +90,21 @@ const ALLOWED_BRANCH_BOOL_FLAGS = new Set([
   "--quiet",
 ]);
 
-const ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS = new Set([
-  "--merged",
-  "--no-merged",
+const ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS = new Set([
   "--abbrev",
   "--color",
   "--column",
+]);
+
+const ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS = new Set([
+  "--merged",
+  "--no-merged",
+]);
+
+const ALLOWED_BRANCH_COMMIT_VALUE_FLAGS = new Set([
+  "--contains",
+  "--no-contains",
+  "--points-at",
 ]);
 
 const ALLOWED_BRANCH_VALUE_FLAGS = new Set([
@@ -109,18 +119,26 @@ const ALLOWED_BRANCH_SHORT_CHARS = new Set(["a", "r", "v", "l", "q", "i"]);
 
 const ALLOWED_TAG_BOOL_FLAGS = new Set([
   "--list",
-  "--verify",
   "--no-color",
   "--ignore-case",
   "--omit-empty",
   "--no-column",
 ]);
 
-const ALLOWED_TAG_OPTIONAL_VALUE_FLAGS = new Set([
-  "--merged",
-  "--no-merged",
+const ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS = new Set([
   "--color",
   "--column",
+]);
+
+const ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS = new Set([
+  "--merged",
+  "--no-merged",
+]);
+
+const ALLOWED_TAG_COMMIT_VALUE_FLAGS = new Set([
+  "--contains",
+  "--no-contains",
+  "--points-at",
 ]);
 
 const ALLOWED_TAG_VALUE_FLAGS = new Set([
@@ -131,7 +149,7 @@ const ALLOWED_TAG_VALUE_FLAGS = new Set([
   "--format",
 ]);
 
-const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "v", "i"]);
+const ALLOWED_TAG_SHORT_CHARS = new Set(["l", "i"]);
 
 const ALLOWED_REMOTE_SUBCOMMANDS = new Set(["show", "get-url"]);
 
@@ -213,6 +231,9 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
     if (
       FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) ||
       arg.startsWith("--output=") ||
+      flagName === "--ext" ||
+      flagName.startsWith("--ext-") ||
+      flagName.startsWith("--textc") ||
       (arg.startsWith("-c") && arg.length > 2)
     ) {
       throw new Error(`Flag '${arg}' is not allowed in read-only git query`);
@@ -222,9 +243,19 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
   if (subcmd === "branch") {
     let hasListFlag = false;
     let expectValue = false;
+    let expectNonFlagCommit = false;
     for (const arg of rest) {
       if (expectValue) {
         expectValue = false;
+        continue;
+      }
+      if (expectNonFlagCommit) {
+        expectNonFlagCommit = false;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`,
+          );
+        }
         continue;
       }
       if (arg === "--") {
@@ -241,19 +272,32 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         if (eqIdx !== -1) {
           if (
             !ALLOWED_BRANCH_VALUE_FLAGS.has(flagName) &&
-            !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)
+            !ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS.has(flagName) &&
+            !ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName)
           ) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
           }
+        } else if (ALLOWED_BRANCH_COMMIT_VALUE_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          hasListFlag = true;
+        } else if (ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          hasListFlag = true;
         } else if (ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
           expectValue = true;
         } else if (
           !ALLOWED_BRANCH_BOOL_FLAGS.has(flagName) &&
-          !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)
+          !ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS.has(flagName)
         ) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
         }
-        if (flagName === "--list") hasListFlag = true;
+        if (
+          flagName === "--list" ||
+          ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName) ||
+          ALLOWED_BRANCH_COMMIT_VALUE_FLAGS.has(flagName)
+        ) {
+          hasListFlag = true;
+        }
       } else if (arg.startsWith("-") && arg.length > 1) {
         for (const ch of arg.slice(1)) {
           if (!ALLOWED_BRANCH_SHORT_CHARS.has(ch)) {
@@ -270,15 +314,25 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
   } else if (subcmd === "tag") {
     let allowsPositionals = false;
     let expectValue = false;
+    let expectNonFlagCommit = false;
     for (const arg of rest) {
       if (expectValue) {
         expectValue = false;
         continue;
       }
+      if (expectNonFlagCommit) {
+        expectNonFlagCommit = false;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`,
+          );
+        }
+        continue;
+      }
       if (arg === "--") {
         if (!allowsPositionals) {
           throw new Error(
-            "Positional tag arguments are only allowed with --list or --verify in read-only mode",
+            "Positional tag arguments are only allowed with --list in read-only mode",
           );
         }
         break;
@@ -289,19 +343,30 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
         if (eqIdx !== -1) {
           if (
             !ALLOWED_TAG_VALUE_FLAGS.has(flagName) &&
-            !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)
+            !ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS.has(flagName) &&
+            !ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName)
           ) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
           }
+        } else if (ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          allowsPositionals = true;
+        } else if (ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          allowsPositionals = true;
         } else if (ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
           expectValue = true;
         } else if (
           !ALLOWED_TAG_BOOL_FLAGS.has(flagName) &&
-          !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)
+          !ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS.has(flagName)
         ) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
         }
-        if (flagName === "--list" || flagName === "--verify") {
+        if (
+          flagName === "--list" ||
+          ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName) ||
+          ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)
+        ) {
           allowsPositionals = true;
         }
       } else if (arg.startsWith("-") && arg.length > 1) {
@@ -312,7 +377,7 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
             if (!ALLOWED_TAG_SHORT_CHARS.has(ch)) {
               throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
             }
-            if (ch === "l" || ch === "v") allowsPositionals = true;
+            if (ch === "l") allowsPositionals = true;
           }
         }
       } else if (!allowsPositionals) {
@@ -342,6 +407,15 @@ export function validateReadonlyGitArgs(pattern: string): string[] {
             `Flag '${arg}' is not allowed for read-only git remote ${remoteSubcmd}`,
           );
         }
+      } else if (
+        arg.includes("://") ||
+        arg.includes(":") ||
+        arg.includes("/") ||
+        arg.includes("\\")
+      ) {
+        throw new Error(
+          `Remote target '${arg}' must be a configured remote name, not a URL or path`,
+        );
       }
     }
   }
@@ -426,9 +500,11 @@ async function runTextOrRegexWithRg(
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  if (typeGlobs && !matchesType(searchRoot) && (await fs.stat(searchRoot)).isFile()) {
+  const isFileTarget = (await fs.stat(searchRoot)).isFile();
+  if (typeGlobs && !matchesType(searchRoot) && isFileTarget) {
     return { files: [], totalMatches: 0, truncated: false };
   }
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
 
   const args = ["--no-messages", "--max-filesize", "2M"];
   if (summary || typeGlobs || query.multiline) args.push("--no-config");
@@ -474,8 +550,8 @@ async function runTextOrRegexWithRg(
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  // Cap per-file matches so a single minified file cannot consume the budget
-  if (!summary && !query.multiline) args.push("--max-count", String(Math.min(maxResults, 50)));
+  // Request perFileCap + 1 so hitting the per-file cap still surfaces a sentinel match for `truncated`
+  if (!summary && !query.multiline) args.push("--max-count", String(perFileCap + 1));
   args.push("--", query.pattern, searchRoot);
 
   const res = await execBinaryAsync("rg", args, {
@@ -522,6 +598,7 @@ async function runTextOrRegexWithRg(
   }
 
   const byFile = new Map<string, Map<number, SearchLine>>();
+  const matchCountByFile = new Map<string, number>();
   let totalMatches = 0;
   let truncated = false;
   let pendingBeforeContext: Array<{ relFile: string; lineNumber: number; text: string }> = [];
@@ -588,14 +665,18 @@ async function runTextOrRegexWithRg(
         lineNumber <= lastKeptMatchLine + contextLines
       ) {
         upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (!truncated) {
+      } else if (
+        totalMatches < maxResults &&
+        (query.multiline || (matchCountByFile.get(relFile) ?? 0) < perFileCap)
+      ) {
         pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
       }
       continue;
     }
 
     // ev.type === "match"
-    if (totalMatches >= maxResults) {
+    const fileHits = matchCountByFile.get(relFile) ?? 0;
+    if (totalMatches >= maxResults || (!query.multiline && fileHits >= perFileCap)) {
       truncated = true;
       pendingBeforeContext = [];
       continue;
@@ -612,17 +693,20 @@ async function runTextOrRegexWithRg(
     pendingBeforeContext = [];
     const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
     lastKeptMatchFile = relFile;
+    let addedForFile = fileHits;
     for (const [offset, text] of segments.entries()) {
       const line = lineNumber + offset;
       if (byFile.get(relFile)?.get(line)?.isMatch) continue;
-      if (totalMatches >= maxResults) {
+      if (totalMatches >= maxResults || (!query.multiline && addedForFile >= perFileCap)) {
         truncated = true;
         break;
       }
       upsertLine(relFile, { lineNumber: line, text, isMatch: true });
       lastKeptMatchLine = line;
       totalMatches++;
+      addedForFile++;
     }
+    matchCountByFile.set(relFile, addedForFile);
   }
 
   const files: FileMatches[] = [...byFile.entries()]
@@ -632,7 +716,11 @@ async function runTextOrRegexWithRg(
       lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber),
     }));
 
-  return { files, totalMatches, truncated: truncated || res.truncated || Boolean(query.multiline && res.timedOut) };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || res.truncated || res.timedOut || res.exitCode === null,
+  };
 }
 
 function* multilineMatches(content: string, regex: RegExp): Generator<RegExpMatchArray> {
@@ -725,6 +813,7 @@ async function runTextOrRegexWithNode(
   };
 
   const stat = await fs.stat(searchRoot);
+  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles: string[];
   if (stat.isFile()) {
     const relPosix =
@@ -780,10 +869,11 @@ async function runTextOrRegexWithNode(
   };
 
   const batchSize = 16;
+  let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
-      batch.map(async (absFile): Promise<{ relFile: string; lines: string[]; matchedIndices: number[]; count: number } | null> => {
+      batch.map(async (absFile): Promise<{ relFile: string; lines: string[]; matchedIndices: number[]; count: number; fileTruncated: boolean } | null> => {
         try {
           const st = await fs.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
@@ -791,10 +881,11 @@ async function runTextOrRegexWithNode(
           if (isLikelyBinary(buf)) return null;
           const content = buf.toString("utf8");
           const lines = content.split(/\r?\n/);
-          if ((summary || query.multiline) && lines.at(-1) === "") lines.pop();
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
           const relFile = relativeFile(baseCwd, absFile);
           let matchedIndices: number[] = [];
           let count = 0;
+          let fileTruncated = false;
           if (query.multiline && summary) {
             for (const _match of multilineMatches(content, regex)) {
               count++;
@@ -806,13 +897,17 @@ async function runTextOrRegexWithNode(
           } else {
             for (let idx = 0; idx < lines.length; idx++) {
               if (regex.test(lines[idx]!)) {
+                if (!summary && matchedIndices.length >= perFileCap) {
+                  fileTruncated = true;
+                  break;
+                }
                 matchedIndices.push(idx);
-                if (query.outputMode === "files_with_matches" || (!summary && matchedIndices.length >= 50)) break;
+                if (query.outputMode === "files_with_matches") break;
               }
             }
             count = matchedIndices.length;
           }
-          return count ? { relFile, lines, matchedIndices, count } : null;
+          return count ? { relFile, lines, matchedIndices, count, fileTruncated } : null;
         } catch {
           return null;
         }
@@ -829,6 +924,9 @@ async function runTextOrRegexWithNode(
         files.push({ file: item.relFile, lines: [], count: item.count });
         continue;
       }
+      if (item.fileTruncated) {
+        anyFileTruncated = true;
+      }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
@@ -844,7 +942,11 @@ async function runTextOrRegexWithNode(
     }
   }
 
-  return { files, totalMatches, truncated: truncated || ((summary || query.multiline === true) && discoveryTruncated) };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || ((summary || query.multiline === true) && discoveryTruncated),
+  };
 }
 
 interface GlobFallbackPlan {
@@ -1049,9 +1151,103 @@ async function runFuzzyQuery(
   return body + footer;
 }
 
+const SHORTLOG_VALUE_FLAGS = new Set([
+  "--group",
+  "--format",
+  "--since",
+  "--after",
+  "--until",
+  "--before",
+  "--author",
+  "--committer",
+  "--grep",
+  "--max-count",
+  "--skip",
+]);
+
+const SHORTLOG_REV_SELECTOR_FLAGS = new Set([
+  "--all",
+  "--branches",
+  "--tags",
+  "--remotes",
+  "--glob",
+  "--stdin",
+]);
+
+function hardenGitExecArgs(validatedArgs: string[]): string[] {
+  // validatedArgs is ["--no-pager", subcmd, ...rest]
+  const subcmd = validatedArgs[1];
+  const rest = validatedArgs.slice(2);
+  let subArgs = rest;
+
+  if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
+    subArgs = ["--no-ext-diff", "--no-textconv", ...rest];
+  } else if (subcmd === "blame") {
+    subArgs = ["--no-textconv", ...rest];
+  } else if (subcmd === "remote") {
+    const remoteSubIdx = rest.findIndex((a) => !a.startsWith("-"));
+    if (remoteSubIdx !== -1 && rest[remoteSubIdx] === "show" && !rest.includes("-n")) {
+      subArgs = [...rest.slice(0, remoteSubIdx + 1), "-n", ...rest.slice(remoteSubIdx + 1)];
+    }
+  } else if (subcmd === "shortlog") {
+    // With stdin ignored (/dev/null), `git shortlog` without a revision reads empty stdin
+    // unless HEAD (or an explicit rev/selector) is provided.
+    let hasRev = false;
+    let expectVal = false;
+    let dashDashIdx = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i]!;
+      if (expectVal) {
+        expectVal = false;
+        continue;
+      }
+      if (a === "--") {
+        dashDashIdx = i;
+        break;
+      }
+      if (a.startsWith("-")) {
+        const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+        if (SHORTLOG_REV_SELECTOR_FLAGS.has(flagName)) {
+          hasRev = true;
+        } else if (!a.includes("=") && SHORTLOG_VALUE_FLAGS.has(flagName)) {
+          expectVal = true;
+        }
+        continue;
+      }
+      hasRev = true;
+    }
+    if (!hasRev) {
+      subArgs =
+        dashDashIdx === -1
+          ? [...rest, "HEAD"]
+          : [...rest.slice(0, dashDashIdx), "HEAD", ...rest.slice(dashDashIdx)];
+    }
+    subArgs = ["--no-ext-diff", "--no-textconv", ...subArgs];
+  }
+
+  return [
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "gpg.program=false",
+    "-c",
+    "gpg.openpgp.program=false",
+    "-c",
+    "gpg.ssh.program=false",
+    "-c",
+    "gpg.x509.program=false",
+    "--no-pager",
+    ...(subcmd ? [subcmd, ...subArgs] : subArgs),
+  ];
+}
+
 async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<string> {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
-  const res = await execBinaryAsync("git", ["--no-optional-locks", ...gitArgs], {
+  const execArgs = hardenGitExecArgs(gitArgs);
+  const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
     timeoutMs: 10_000,
     maxOutputBytes: 512 * 1024,
@@ -1084,7 +1280,7 @@ function formatFileMatches(
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      const text = l.text.length > 240 ? `${l.text.slice(0, 240)}...` : l.text;
+      const text = l.text.length > 240 ? `${sliceSafeChars(l.text, 240)}...` : l.text;
       return `  ${l.lineNumber}${sep} ${text}`;
     });
     blocks.push(`${fm.file}\n${lines.join("\n")}`);

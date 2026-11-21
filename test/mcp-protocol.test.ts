@@ -303,4 +303,62 @@ describe("MCP Stdio Server end-to-end", () => {
       assert.match(text, /use parallel read_file/);
     }
   });
+
+  it("handles pipelined LF+CRLF Content-Length frames, rejects empty {} requests, and surfaces non-object tool arguments", async () => {
+    const p1 = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" });
+    const p2 = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" });
+    const mixedFrames =
+      `Content-Length: ${Buffer.byteLength(p1, "utf8")}\n\n${p1}` +
+      `Content-Length: ${Buffer.byteLength(p2, "utf8")}\r\n\r\n${p2}`;
+    const clRes = await sendMessagesToServer([mixedFrames]);
+    assert.equal(clRes.code, 0);
+    const frameBodies = [...clRes.stdout.matchAll(/Content-Length: \d+\r\n\r\n(\{[^\n]*\})/g)].map(
+      (m) => JSON.parse(m[1]!),
+    );
+    assert.deepEqual(
+      frameBodies.map((b) => b.id).sort((a, b) => a - b),
+      [1, 2],
+    );
+
+    const protoRes = await sendMessagesToServer([
+      "{}\n",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 301,
+        method: "tools/call",
+        params: { name: "batch_search", arguments: true },
+      }) + "\n",
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 302,
+        method: "tools/call",
+        params: {
+          name: "batch_search",
+          arguments: JSON.stringify({ cwd: tmpDir, queries: [{ type: "text", pattern: "greet" }] }),
+        },
+      }) + "\n",
+    ]);
+    assert.equal(protoRes.code, 0);
+    const lines = protoRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines.length, 3);
+    assert.equal(lines[0].error.code, -32600);
+    assert.equal(lines[1].id, 301);
+    assert.equal(lines[1].error.code, -32602);
+    assert.equal(lines[2].id, 302);
+    assert.match(lines[2].result.content[0].text, /demo\.ts/);
+
+    // Duplicate or overflowing Content-Length headers fail cleanly with -32600 instead of wedging
+    const badClRes = await sendMessagesToServer([
+      `Content-Type: application/json; content-length: 5\r\nContent-Length: ${Buffer.byteLength(p1, "utf8")}\r\n\r\n${p1}`,
+      `Content-Length: 5\r\nContent-Length: 5\r\n\r\n`,
+      `Content-Length: 99999999999999999999\r\n\r\n`,
+    ]);
+    assert.equal(badClRes.code, 0);
+    const badFrameBodies = [...badClRes.stdout.matchAll(/Content-Length: \d+\r\n\r\n(\{[^\n]*\})/g)].map(
+      (m) => JSON.parse(m[1]!),
+    );
+    assert.equal(badFrameBodies.length, 3);
+    assert.equal(badFrameBodies.filter((b) => b.id === 1).length, 1);
+    assert.equal(badFrameBodies.filter((b) => b.error?.code === -32600).length, 2);
+  });
 });

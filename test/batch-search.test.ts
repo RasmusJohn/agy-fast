@@ -657,4 +657,123 @@ describe("batch_search", () => {
     assert.equal(chainedGit.isError, false);
     assert.match(chainedGit.text, /Shell operator '&&' is not supported/);
   });
+
+  it("hardens untrusted git config execution, fixes branch/tag --merged & shortlog, and enforces truncation + surrogate safety", async () => {
+    // 1. branch/tag --merged <commit> and tag --contains HEAD v* allowed; flag bypasses still blocked
+    assert.deepEqual(validateReadonlyGitArgs("branch --merged main"), ["--no-pager", "branch", "--merged", "main"]);
+    assert.deepEqual(validateReadonlyGitArgs("branch --no-merged origin/main"), ["--no-pager", "branch", "--no-merged", "origin/main"]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --merged main"), ["--no-pager", "tag", "--merged", "main"]);
+    assert.deepEqual(validateReadonlyGitArgs("tag --contains HEAD v*"), ["--no-pager", "tag", "--contains", "HEAD", "v*"]);
+    for (const bad of [
+      "branch --merged -D victim",
+      "branch --merged --delete victim",
+      "branch --points-at -- --no-points-at -D victim",
+      "branch --merged -- -D victim",
+      "tag --merged -d v1.0",
+      "tag --points-at -- --no-points-at -d v1.0",
+      "tag --contains -- -d v1.0",
+      "tag -v v1.0",
+      "tag --verify v1.0",
+      "remote show ssh://git@127.0.0.1:2222/repo.git",
+      "remote show https://example.com/repo.git",
+    ]) {
+      assert.throws(() => validateReadonlyGitArgs(bad), `Expected '${bad}' to be rejected`);
+    }
+
+    // 2. Untrusted .git/config diff.external, textconv, and core.fsmonitor must NOT execute
+    const untrustedRepo = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-git-hardening-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "user.name", "Test User"], { cwd: untrustedRepo });
+      await fs.writeFile(path.join(untrustedRepo, "doc.txt"), "v1\n", "utf8");
+      await fs.writeFile(path.join(untrustedRepo, ".gitattributes"), "*.txt diff=evil\n", "utf8");
+      execFileSync("git", ["add", "."], { cwd: untrustedRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: untrustedRepo });
+      await fs.writeFile(path.join(untrustedRepo, "doc.txt"), "v2\n", "utf8");
+
+      const markerExt = path.join(untrustedRepo, "pwn_ext");
+      const markerTc = path.join(untrustedRepo, "pwn_tc");
+      const markerFs = path.join(untrustedRepo, "pwn_fs");
+      const markerGpg = path.join(untrustedRepo, "pwn_gpg");
+      const touchCmd = (p: string) =>
+        `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(p)},'1')`)}`;
+      execFileSync("git", ["config", "diff.external", touchCmd(markerExt)], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "diff.evil.textconv", touchCmd(markerTc)], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "core.fsmonitor", touchCmd(markerFs)], { cwd: untrustedRepo });
+      execFileSync("git", ["config", "gpg.program", touchCmd(markerGpg)], { cwd: untrustedRepo });
+      execFileSync("git", ["remote", "add", "show", "https://example.invalid/repo.git"], { cwd: untrustedRepo });
+
+      const gRes = await runBatchSearch({
+        cwd: untrustedRepo,
+        queries: [
+          { type: "git", pattern: "status --short" },
+          { type: "git", pattern: "diff" },
+          { type: "git", pattern: "blame doc.txt" },
+          { type: "git", pattern: "shortlog -sn" },
+          { type: "git", pattern: "shortlog -S v1 HEAD" },
+          { type: "git", pattern: "log --show-signature -n 1" },
+          { type: "git", pattern: "remote get-url show" },
+        ],
+      });
+      assert.equal(gRes.isError, false);
+      assert.match(gRes.text, /Test User/); // shortlog returns actual commit count instead of (empty output)
+      assert.match(gRes.text, /https:\/\/example\.invalid\/repo\.git/); // remote named 'show' must not inject -n
+      assert.equal(await fs.access(markerExt).then(() => true, () => false), false);
+      assert.equal(await fs.access(markerTc).then(() => true, () => false), false);
+      assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
+      assert.equal(await fs.access(markerGpg).then(() => true, () => false), false);
+
+      // Prefix abbreviations of --ext-diff / --textconv are also rejected
+      assert.throws(() => validateReadonlyGitArgs("diff --textc"), /not allowed/i);
+      assert.throws(() => validateReadonlyGitArgs("diff --ext-dif"), /not allowed/i);
+    } finally {
+      await fs.rm(untrustedRepo, { recursive: true, force: true });
+    }
+
+    // 3. Single-file search accurately reports truncation, preserves contextLines across files after perFileCap, avoids phantom EOF ^$ match, and avoids lone surrogates
+    const edgeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-edge-"));
+    try {
+      await fs.writeFile(
+        path.join(edgeDir, "a-many.txt"),
+        "needle\n".repeat(80) + "a" + "🚀".repeat(130) + "\n",
+        "utf8",
+      );
+      await fs.writeFile(path.join(edgeDir, "b-ctx.txt"), "before-ctx-line\nneedle\nafter-ctx-line\n", "utf8");
+      await fs.writeFile(path.join(edgeDir, "nonempty.txt"), "line1\nline2\n", "utf8");
+      for (let i = 0; i < 18; i++) {
+        await fs.writeFile(path.join(edgeDir, `m-pad-${String(i).padStart(2, "0")}.txt`), "filler\n", "utf8");
+      }
+      await fs.writeFile(path.join(edgeDir, "z-batch2.txt"), "batch2-before\nneedle\nbatch2-after\n", "utf8");
+      for (const forceNodeFallback of [false, true]) {
+        const res = await runBatchSearch(
+          {
+            cwd: edgeDir,
+            queries: [
+              { type: "text", pattern: "needle", path: "a-many.txt", maxResults: 40 },
+              { type: "text", pattern: "needle", path: "a-many.txt", maxResults: 60 },
+              { type: "text", pattern: "a🚀", path: "a-many.txt" },
+              { type: "regex", pattern: "^$", path: "nonempty.txt" },
+              { type: "text", pattern: "needle", contextLines: 1, maxResults: 80 },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(res.isError, false);
+        const sections = res.text.split("\n\n");
+        assert.match(sections[0]!, /truncated at 40 matches/);
+        assert.match(sections[1]!, /truncated at 60 matches/);
+        assert.equal(
+          /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(res.text),
+          false,
+          "batch_search output must not contain lone UTF-16 surrogates",
+        );
+        assert.match(sections[3]!, /\(no matches\)/);
+        assert.match(sections[4]!, /before-ctx-line/);
+        assert.match(sections[4]!, /z-batch2\.txt/);
+      }
+    } finally {
+      await fs.rm(edgeDir, { recursive: true, force: true });
+    }
+  });
 });

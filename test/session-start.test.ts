@@ -269,4 +269,85 @@ describe("session-start hook", () => {
       await fs.rm(monoDir, { recursive: true, force: true });
     }
   });
+
+  it("exits promptly when stdin stays open without EOF and enforces <=1500 UTF-8 bytes with zero lone surrogates", async () => {
+    const cjkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hook-cjk-"));
+    try {
+      // Create CJK + 4-byte emoji filenames positioned across shortEntryName(28) and byte cap boundaries
+      await fs.writeFile(path.join(cjkDir, `${"a".repeat(24)}🚀b.ts`), "export const a = 1;\n", "utf8");
+      for (let i = 0; i < 20; i++) {
+        await fs.writeFile(
+          path.join(cjkDir, `中文模块文件名称很长_${String(i).padStart(2, "0")}_🚀数据.ts`),
+          "export {};\n",
+          "utf8",
+        );
+      }
+      const res = await runHook(JSON.stringify({ cwd: cjkDir, workspacePaths: [cjkDir] }));
+      assert.equal(res.code, 0);
+      const msg: string = JSON.parse(res.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.equal(typeof msg, "string");
+      assert.ok(
+        Buffer.byteLength(msg, "utf8") <= 1500,
+        `Expected snapshot <= 1500 UTF-8 bytes, got ${Buffer.byteLength(msg, "utf8")}`,
+      );
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(msg),
+        false,
+        "Snapshot must not contain unpaired UTF-16 surrogates",
+      );
+
+      // Verify hook exits cleanly after readStdin timeout even if parent never closes stdin
+      const noEofResult = await new Promise<{ code: number | null; stdout: string; durationMs: number }>(
+        (resolve, reject) => {
+          const start = Date.now();
+          const child = spawn(process.execPath, [HOOK_SCRIPT], {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: { ...process.env, AGY_FAST_AUTO_UPDATE: "off" },
+          });
+          let stdout = "";
+          const killer = setTimeout(() => {
+            child.kill("SIGKILL");
+            reject(new Error("SessionStart hook hung when stdin stayed open without EOF"));
+          }, 3500);
+          killer.unref();
+          child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+          child.on("error", (err) => {
+            clearTimeout(killer);
+            reject(err);
+          });
+          child.on("close", (code) => {
+            clearTimeout(killer);
+            resolve({ code, stdout, durationMs: Date.now() - start });
+          });
+          // Write payload WITHOUT calling child.stdin.end()
+          child.stdin.write(JSON.stringify({ cwd: cjkDir }));
+        },
+      );
+      assert.equal(noEofResult.code, 0);
+      const parsed = JSON.parse(noEofResult.stdout);
+      assert.match(parsed?.injectSteps?.[0]?.systemMessage?.systemMessage ?? "", /agy-fast startup snapshot/);
+
+      // Verify SessionStart git snapshot does NOT execute untrusted .git/config core.fsmonitor
+      const untrustedGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hook-fsmon-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: untrustedGitDir });
+        execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: untrustedGitDir });
+        execFileSync("git", ["config", "user.name", "Test"], { cwd: untrustedGitDir });
+        await fs.writeFile(path.join(untrustedGitDir, "a.txt"), "1\n", "utf8");
+        execFileSync("git", ["add", "."], { cwd: untrustedGitDir });
+        execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: untrustedGitDir });
+        const markerFs = path.join(untrustedGitDir, "pwn_hook_fs");
+        const touchCmd = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(markerFs)},'1')`)}`;
+        execFileSync("git", ["config", "core.fsmonitor", touchCmd], { cwd: untrustedGitDir });
+        const snapRes = await runHook(JSON.stringify({ cwd: untrustedGitDir }));
+        assert.equal(snapRes.code, 0);
+        assert.equal(await fs.access(markerFs).then(() => true, () => false), false);
+      } finally {
+        await fs.rm(untrustedGitDir, { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(cjkDir, { recursive: true, force: true });
+    }
+  });
 });

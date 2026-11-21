@@ -586,4 +586,149 @@ describe("read_slices", () => {
     assert.equal(stringified.isError, false);
     assert.match(stringified.text, /L1 \[class_name\] Inventory/);
   });
+
+  it("handles JSX tags, TS template literals, Python multiline signatures, Rust lifetimes, Shell ${#var}, Go raw strings, non-finite maxChars, and lone surrogates", async () => {
+    // 1. TSX closing </Tag> and self-closing /> must not enter regex mode and leak brace depth
+    const tsxClose = extractSymbols(
+      "App.tsx",
+      [
+        "export function A({ xs }: { xs: string[] }) {",
+        "  return <ul>{xs.map((x) => <li>{x}</li>)}</ul>;",
+        "}",
+        "export function B() { return <div />; }",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsxClose.map((s) => `${s.name}:${s.startLine}-${s.endLine}`),
+      ["A:1-3", "B:4-4"],
+    );
+
+    const tsxSelfClose = extractSymbols(
+      "Icon.tsx",
+      [
+        "export function A() {",
+        "  return <div>{ok && <Icon s={1} />}</div>;",
+        "}",
+        "export function B() { return null; }",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      tsxSelfClose.map((s) => `${s.name}:${s.startLine}-${s.endLine}`),
+      ["A:1-3", "B:4-4"],
+    );
+
+    // JS/TS regex literals starting with `>` (e.g. `/>/g`, `/>}/`) must still enter regex mode
+    for (const fname of ["escape.ts", "escape.tsx"]) {
+      const gtRegex = extractSymbols(
+        fname,
+        [
+          "export function escapeHtml(s: string) {",
+          '  return s.replace(/>/g, "&gt;").replace(/{/g, "&#123;");',
+          "}",
+          "export function closeBraceRegex(s: string) {",
+          "  return />}/.test(s);",
+          "}",
+          "export function after() { return 1; }",
+        ].join("\n"),
+      );
+      assert.deepEqual(
+        gtRegex.map((s) => `${s.name}:${s.startLine}-${s.endLine}`),
+        ["escapeHtml:1-3", "closeBraceRegex:4-6", "after:7-7"],
+      );
+    }
+
+    // 2. TS multiline backtick template must not emit fake symbols or swallow real classes below
+    const tplSyms = extractSymbols(
+      "tpl.ts",
+      ["const s = `", "export class Fake {", "`;", "export class Real {", "  m() {}", "}"].join("\n"),
+    );
+    assert.deepEqual(
+      tplSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["class:Real:4-6", "method:m:5-5"],
+    );
+
+    // 3. Python multiline signatures & .pyi stubs
+    const pyMulti = extractSymbols(
+      "stub.pyi",
+      ["def f(", "    a: int,", ") -> int:", "    return a"].join("\n"),
+    );
+    assert.deepEqual(
+      pyMulti.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["function:f:1-4"],
+    );
+
+    // 4. Rust lifetimes, impl<T>, trait bounds, and block comments
+    const rsSyms = extractSymbols(
+      "lib.rs",
+      [
+        "/* pub fn commented_out() {} */",
+        "pub struct View<'a> {",
+        "  buf: &'a [u8],",
+        "}",
+        "impl<T> Cache<T> {",
+        "  pub fn next<U: Clone + Send>() -> usize { 1 }",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      rsSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["struct:View<'a>:2-4", "impl:<T> Cache<T>:5-7", "fn:next<U: Clone + Send>:6-6"],
+    );
+
+    // 5. Shell parameter expansion with `#` inside `${...}`
+    const shSyms = extractSymbols(
+      "s.sh",
+      ["f() {", "  local b=${1##*/}", "  local n=${#b}", '  echo "$b $n"', "}", "g() { :; }"].join("\n"),
+    );
+    assert.deepEqual(
+      shSyms.map((s) => `${s.name}:${s.startLine}-${s.endLine}`),
+      ["f:1-5", "g:6-6"],
+    );
+
+    // 6. Go raw backtick string ending in `\` & wrapped `interface{}` params & generic struct
+    const goSyms = extractSymbols(
+      "a.go",
+      [
+        "type Box[T any] struct {",
+        "  Val T",
+        "}",
+        "func a() {",
+        "  s := `dir\\`",
+        "  _ = s",
+        "}",
+        "func c(",
+        "  v interface{},",
+        ") {",
+        "  a()",
+        "}",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      goSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["struct:Box[T any]:1-3", "function:a:4-7", "function:c:8-12"],
+    );
+
+    // 7. Non-finite maxChars falls back cleanly instead of returning empty output, and single-line emoji truncation avoids lone surrogates
+    const longEmoji = path.join(tmpDir, "long-emoji.md");
+    await fs.writeFile(longEmoji, "a".repeat(938) + "🚀".repeat(50) + "\n", "utf8");
+    const nanRes = await runReadSlices({
+      cwd: tmpDir,
+      outlines: ["sample.ts"],
+      maxChars: "auto" as unknown as number,
+    });
+    assert.equal(nanRes.isError, false);
+    assert.match(nanRes.text, /\[class\] Server/);
+
+    const surrRes = await runReadSlices({
+      cwd: tmpDir,
+      slices: [{ path: "long-emoji.md", ranges: [[1, 1]] }],
+      maxChars: 1000,
+    });
+    assert.equal(surrRes.isError, false);
+    assert.equal(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(surrRes.text),
+      false,
+      "read_slices output must not contain lone UTF-16 surrogates",
+    );
+  });
 });

@@ -211,9 +211,12 @@ async function writeJsonAtomically(filePath: string, data: unknown): Promise<voi
   try {
     await fs.rename(tmpPath, filePath);
   } catch {
-    // Windows fallback when destination is briefly locked
-    await fs.copyFile(tmpPath, filePath);
-    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    try {
+      // Windows fallback when destination is briefly locked
+      await fs.copyFile(tmpPath, filePath);
+    } finally {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+    }
   }
 }
 
@@ -584,12 +587,16 @@ export async function syncRuntimeFilesAtomically(
   dstRoot: string,
 ): Promise<void> {
   await fs.mkdir(dstRoot, { recursive: true });
-  const toCopy: string[] = [...UPDATER_RUNTIME_FILES];
+  // Sync plugin.json LAST so a partial failure never advances the installed version marker
+  // while dist/*.mjs remain on the previous version.
+  const runtimeWithoutManifest = UPDATER_RUNTIME_FILES.filter((rel) => rel !== "plugin.json");
+  const toCopy: string[] = [...runtimeWithoutManifest];
   for (const opt of UPDATER_OPTIONAL_FILES) {
     if (await pathExists(path.join(srcRoot, opt))) {
       toCopy.push(opt);
     }
   }
+  toCopy.push("plugin.json");
 
   let seq = 0;
   for (const rel of toCopy) {
@@ -597,14 +604,32 @@ export async function syncRuntimeFilesAtomically(
     const dst = path.join(dstRoot, rel);
     await fs.mkdir(path.dirname(dst), { recursive: true });
     const tmp = `${dst}.agy-tmp.${process.pid}.${seq++}`;
-    await fs.copyFile(src, tmp);
+    try {
+      await fs.copyFile(src, tmp);
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
     try {
       await fs.rename(tmp, dst);
     } catch {
-      // Fallback on Windows if target file is briefly open
-      await fs.copyFile(tmp, dst);
-      await fs.rm(tmp, { force: true }).catch(() => {});
+      try {
+        // Fallback on Windows if target file is briefly open
+        await fs.copyFile(tmp, dst);
+      } finally {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+      }
     }
+  }
+}
+
+function isProcessDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ESRCH";
   }
 }
 
@@ -627,7 +652,18 @@ async function acquireUpdateLock(lockPath: string): Promise<boolean> {
       if (code !== "EEXIST") return false;
       try {
         const st = await fs.stat(lockPath);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        let stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
+        if (!stale) {
+          const info = await readJsonFile<{ pid?: unknown }>(lockPath);
+          if (
+            typeof info?.pid === "number" &&
+            info.pid !== process.pid &&
+            isProcessDead(info.pid)
+          ) {
+            stale = true;
+          }
+        }
+        if (stale) {
           await fs.rm(lockPath, { force: true });
           continue;
         }
@@ -715,7 +751,7 @@ export async function runPluginUpdate(
       (opts.background && settings.mode === "notify") ||
       installKind === "symlink" ||
       installKind === "git-dirty" ||
-      (installKind === "dev-source" && !opts.force);
+      installKind === "dev-source";
 
     if (effectiveNotifyOnly) {
       const reason =
@@ -785,8 +821,9 @@ export async function runPluginUpdate(
     if (
       !opts.force &&
       remote.version === null &&
-      compareSemver(stagedCheck.version, currentVersion) <= 0 &&
-      remote.commitSha === prevState.lastAppliedCommit
+      (compareSemver(stagedCheck.version, currentVersion) < 0 ||
+        (compareSemver(stagedCheck.version, currentVersion) === 0 &&
+          !prevState.lastAppliedCommit))
     ) {
       await writeUpdateState(
         {
@@ -808,22 +845,31 @@ export async function runPluginUpdate(
     }
 
     if (installKind === "git-clone") {
-      // Safe update for clean direct-clone installs inside plugins/agy-fast
+      // Fetch directly from the already smoke-tested local stagingDir so we honor
+      // --repo/AGY_FAST_REPO overrides and avoid TOCTOU mismatch with a second network fetch.
       const fetchRes = await execBinaryAsync(
         "git",
-        ["fetch", "--depth", "1", "origin", remote.ref],
+        ["fetch", "--depth", "1", stagingDir, "HEAD"],
         { cwd: pluginDir, timeoutMs: Math.max(timeoutMs, 20_000), env: gitEnv },
       );
-      if (fetchRes.error || fetchRes.exitCode !== 0) {
-        throw new Error(fetchRes.stderr.trim() || "git fetch failed in plugin clone");
+      if (fetchRes.error || fetchRes.timedOut || fetchRes.exitCode !== 0) {
+        throw new Error(
+          fetchRes.stderr.trim() ||
+            fetchRes.error ||
+            (fetchRes.timedOut ? "git fetch timed out in plugin clone" : "git fetch failed in plugin clone"),
+        );
       }
       const checkoutRes = await execBinaryAsync(
         "git",
         ["checkout", "-q", "FETCH_HEAD"],
         { cwd: pluginDir, timeoutMs: 10_000, env: gitEnv },
       );
-      if (checkoutRes.error || checkoutRes.exitCode !== 0) {
-        throw new Error(checkoutRes.stderr.trim() || "git checkout failed in plugin clone");
+      if (checkoutRes.error || checkoutRes.timedOut || checkoutRes.exitCode !== 0) {
+        throw new Error(
+          checkoutRes.stderr.trim() ||
+            checkoutRes.error ||
+            (checkoutRes.timedOut ? "git checkout timed out in plugin clone" : "git checkout failed in plugin clone"),
+        );
       }
     } else {
       await syncRuntimeFilesAtomically(stagingDir, pluginDir);

@@ -11,6 +11,7 @@ import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
   formatCompactCommandOutput,
+  sliceSafeChars,
   truncateWithByteNotice,
 } from "../utils/output-filter.js";
 
@@ -59,6 +60,7 @@ interface PlannedWrite {
   existed: boolean;
   originalBuffer: Buffer | null;
   originalMode: number | null;
+  originalSymlinkTarget?: string | null;
   newContent: string;
   hunkCount: number;
   lineDelta: number;
@@ -143,7 +145,7 @@ function formatNearbyLines(
   for (let ln = from; ln <= to; ln++) {
     const lineText = lines[ln - 1] ?? "";
     snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`,
+      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`,
     );
   }
   const extra = truncated ? `\n    ... (${rawTo - to} more lines in range omitted)` : "";
@@ -269,7 +271,7 @@ function findClosestRegionSnippet(
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
     snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`,
+      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`,
     );
   }
   return `\n  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):\n${snippet.join("\n")}`;
@@ -476,6 +478,14 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
           // ignore cleanup failure
         }
         written.push(plan);
+        if (plan.originalSymlinkTarget) {
+          // Replace dangling symlink itself instead of following it on fallback write
+          try {
+            await fs.unlink(target);
+          } catch {
+            // ignore unlink failure
+          }
+        }
         await fs.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
@@ -493,7 +503,10 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
       const item = written[i]!;
       const target = item.writeTargetPath;
       try {
-        if (item.existed && item.originalBuffer !== null) {
+        if (item.originalSymlinkTarget) {
+          await fs.unlink(target).catch(() => {});
+          await fs.symlink(item.originalSymlinkTarget, target);
+        } else if (item.existed && item.originalBuffer !== null) {
           await fs.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
             await fs.chmod(target, item.originalMode);
@@ -600,9 +613,44 @@ export async function runApplyEdits(
     };
   }
 
+  // Validate optional verify spec up front before touching any files on disk
+  let validatedVerify: VerifySpec | null = null;
+  if (input.verify !== undefined) {
+    if (typeof input.verify === "string") {
+      if (input.verify.trim()) {
+        validatedVerify = { command: input.verify };
+      }
+    } else if (isPlainObject(input.verify)) {
+      const cmd = input.verify.command;
+      if (typeof cmd !== "string" || !cmd.trim()) {
+        return {
+          text: "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+          isError: true,
+        };
+      }
+      if (input.verify.cwd !== undefined && typeof input.verify.cwd !== "string") {
+        return {
+          text: "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+          isError: true,
+        };
+      }
+      validatedVerify = {
+        command: cmd,
+        cwd: input.verify.cwd,
+        timeoutSec:
+          typeof input.verify.timeoutSec === "number" ? input.verify.timeoutSec : undefined,
+      };
+    } else {
+      return {
+        text: "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+        isError: true,
+      };
+    }
+  }
+
   const baseCwd = resolvePath(input.cwd || process.cwd());
 
-  // Merge entries targeting the same resolved file (including symlink aliases)
+  // Merge entries targeting the same resolved file (including symlink aliases and symlinked parent dirs)
   const mergedByPath = new Map<
     string,
     {
@@ -629,7 +677,14 @@ export async function runApplyEdits(
       // Canonicalize existing paths (including symlinks and symlinked parent dirs like /var -> /private/var)
       writeTargetPath = await fs.realpath(absPath);
     } catch {
-      // File does not exist yet or broken symlink — keep absPath
+      // File does not exist yet or dangling symlink — still canonicalize existing parent dir
+      // so `sym_dir/new.ts` and `real_dir/new.ts` deduplicate cleanly.
+      try {
+        const realParent = await fs.realpath(path.dirname(absPath));
+        writeTargetPath = path.join(realParent, path.basename(absPath));
+      } catch {
+        // Parent directory does not exist yet — keep absPath
+      }
     }
     const relPath = toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
     const hasCreate = typeof entry.create === "string";
@@ -677,21 +732,59 @@ export async function runApplyEdits(
       let exists = false;
       let originalBuffer: Buffer | null = null;
       let originalMode: number | null = null;
+      let originalSymlinkTarget: string | null = null;
       try {
-        const st = await fs.stat(item.writeTargetPath);
-        if (st.isDirectory()) {
-          errors.push(`${item.relPath}: target path is a directory`);
-          continue;
+        const lst = await fs.lstat(item.writeTargetPath);
+        if (lst.isSymbolicLink()) {
+          try {
+            const st = await fs.stat(item.writeTargetPath);
+            if (st.isDirectory()) {
+              errors.push(`${item.relPath}: target path is a directory`);
+              continue;
+            }
+            exists = true;
+            if (!item.overwrite) {
+              errors.push(
+                `${item.relPath}: file already exists (set overwrite: true to replace it)`,
+              );
+              continue;
+            }
+            originalMode = st.mode & 0o7777;
+            originalBuffer = await fs.readFile(item.writeTargetPath);
+          } catch (statErr) {
+            if ((statErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+              // Dangling symlink: never clobber without overwrite: true, and preserve target for rollback
+              exists = true;
+              if (!item.overwrite) {
+                errors.push(
+                  `${item.relPath}: dangling symlink already exists (set overwrite: true to replace it)`,
+                );
+                continue;
+              }
+              originalSymlinkTarget = await fs.readlink(item.writeTargetPath);
+            } else {
+              errors.push(
+                `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`,
+              );
+              continue;
+            }
+          }
+        } else {
+          const st = await fs.stat(item.writeTargetPath);
+          if (st.isDirectory()) {
+            errors.push(`${item.relPath}: target path is a directory`);
+            continue;
+          }
+          exists = true;
+          if (!item.overwrite) {
+            errors.push(
+              `${item.relPath}: file already exists (set overwrite: true to replace it)`,
+            );
+            continue;
+          }
+          originalMode = st.mode & 0o7777;
+          originalBuffer = await fs.readFile(item.writeTargetPath);
         }
-        exists = true;
-        if (!item.overwrite) {
-          errors.push(
-            `${item.relPath}: file already exists (set overwrite: true to replace it)`,
-          );
-          continue;
-        }
-        originalMode = st.mode & 0o7777;
-        originalBuffer = await fs.readFile(item.writeTargetPath);
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
           exists = false;
@@ -714,6 +807,7 @@ export async function runApplyEdits(
         existed: exists,
         originalBuffer,
         originalMode,
+        originalSymlinkTarget,
         newContent: item.create,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
@@ -828,47 +922,41 @@ export async function runApplyEdits(
   const parts = [`${header}\n${summaryLines.join("\n")}`];
 
   // Phase 3: optional inline verify
-  if (!input.dryRun && input.verify) {
-    const verifySpec: VerifySpec =
-      typeof input.verify === "string" ? { command: input.verify } : input.verify;
-    if (verifySpec.command && verifySpec.command.trim()) {
-      const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-      const timeoutMs =
-        Math.max(
-          1,
-          Math.min(
-            300,
-            Math.trunc(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60),
-          ),
-        ) * 1000;
-      const maxVerifyChars = Math.max(
-        300,
-        Math.min(7_500, Math.trunc(input.maxVerifyChars ?? 4000)),
-      );
+  if (!input.dryRun && validatedVerify) {
+    const verifySpec = validatedVerify;
+    const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
+    const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
+    const timeoutMs =
+      (Number.isFinite(rawTimeoutSec)
+        ? Math.max(1, Math.min(300, Math.trunc(rawTimeoutSec)))
+        : 60) * 1000;
+    const rawMaxVerifyChars = Number(input.maxVerifyChars ?? 4000);
+    const maxVerifyChars = Number.isFinite(rawMaxVerifyChars)
+      ? Math.max(300, Math.min(7_500, Math.trunc(rawMaxVerifyChars)))
+      : 4000;
 
-      const res = await runShellCommandAsync(verifySpec.command, {
-        cwd: verifyCwd,
-        timeoutMs,
-      });
+    const res = await runShellCommandAsync(verifySpec.command, {
+      cwd: verifyCwd,
+      timeoutMs,
+    });
 
-      const status = res.timedOut
-        ? "TIMEOUT"
-        : res.exitCode === 0
-          ? "PASS"
-          : `FAIL (exit ${res.exitCode ?? "err"})`;
-      const formatted = formatCompactCommandOutput({
-        stdout: res.stdout,
-        stderr: res.stderr,
-        exitCode: res.exitCode,
-        timedOut: res.timedOut,
-        error: res.error,
-        maxChars: maxVerifyChars,
-      });
+    const status = res.timedOut
+      ? "TIMEOUT"
+      : res.exitCode === 0
+        ? "PASS"
+        : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const formatted = formatCompactCommandOutput({
+      stdout: res.stdout,
+      stderr: res.stderr,
+      exitCode: res.exitCode,
+      timedOut: res.timedOut,
+      error: res.error,
+      maxChars: maxVerifyChars,
+    });
 
-      parts.push(
-        `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n${formatted}`,
-      );
-    }
+    parts.push(
+      `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n${formatted}`,
+    );
   }
 
   const outText = parts.join("\n");

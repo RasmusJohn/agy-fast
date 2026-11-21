@@ -79,7 +79,15 @@ export async function readTextFile(
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
   const content = buf.toString("utf8");
-  const eol: "\r\n" | "\n" = content.includes("\r\n") ? "\r\n" : "\n";
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n") {
+      if (i > 0 && content[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  const eol: "\r\n" | "\n" = crlfCount > lfOnlyCount ? "\r\n" : "\n";
   return { content, eol, size: stat.size, mode: stat.mode & 0o7777, rawBuffer: buf };
 }
 

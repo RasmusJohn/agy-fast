@@ -35,15 +35,15 @@ var McpStdioServer = class {
     const hasId = Object.prototype.hasOwnProperty.call(msg, "id") && msg.id !== void 0;
     const id = hasId ? msg.id ?? null : null;
     const method = typeof msg.method === "string" ? msg.method : "";
-    if (!hasId) {
-      return null;
-    }
     if (!method) {
       return {
         jsonrpc: "2.0",
         id,
         error: { code: -32600, message: "Invalid Request: missing method" }
       };
+    }
+    if (!hasId) {
+      return null;
     }
     if (method === "initialize") {
       const requested = typeof msg.params?.protocolVersion === "string" ? msg.params.protocolVersion.trim() : "";
@@ -90,7 +90,46 @@ var McpStdioServer = class {
         };
       }
       const rawArgs = msg.params?.arguments;
-      const args = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs) ? rawArgs : {};
+      let args;
+      if (rawArgs === void 0 || rawArgs === null) {
+        args = {};
+      } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+        args = rawArgs;
+      } else if (typeof rawArgs === "string" && rawArgs.trim().startsWith("{")) {
+        try {
+          const parsedArgs = JSON.parse(rawArgs);
+          if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+            args = parsedArgs;
+          } else {
+            return {
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32602,
+                message: `Invalid params: 'arguments' for '${name}' must be a JSON object`
+              }
+            };
+          }
+        } catch {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32602,
+              message: `Invalid params: malformed JSON string in 'arguments' for '${name}'`
+            }
+          };
+        }
+      } else {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: `Invalid params: 'arguments' for '${name}' must be an object (received ${Array.isArray(rawArgs) ? "array" : typeof rawArgs})`
+          }
+        };
+      }
       try {
         const res = await tool.handler(args);
         return {
@@ -195,20 +234,48 @@ ${serialized}`);
           buffer = buffer.subarray(offset);
           if (buffer.length === 0) break;
         }
-        const headerProbe = buffer.subarray(0, 16).toString("ascii").toLowerCase();
+        const headerProbe = buffer.subarray(0, 16).toString("latin1").toLowerCase();
         if (headerProbe.startsWith("content-length:") || headerProbe.startsWith("content-type:")) {
-          const headerEnd = buffer.indexOf("\r\n\r\n");
-          const altHeaderEnd = headerEnd === -1 ? buffer.indexOf("\n\n") : -1;
-          const sepIdx = headerEnd !== -1 ? headerEnd : altHeaderEnd;
-          const sepLen = headerEnd !== -1 ? 4 : 2;
+          const crlfEnd = buffer.indexOf("\r\n\r\n");
+          const lfEnd = buffer.indexOf("\n\n");
+          let sepIdx = -1;
+          let sepLen = 0;
+          if (crlfEnd !== -1 && (lfEnd === -1 || crlfEnd < lfEnd)) {
+            sepIdx = crlfEnd;
+            sepLen = 4;
+          } else if (lfEnd !== -1) {
+            sepIdx = lfEnd;
+            sepLen = 2;
+          }
           if (sepIdx === -1) break;
-          const headerText = buffer.subarray(0, sepIdx).toString("ascii");
-          const match = /content-length:\s*(\d+)/i.exec(headerText);
-          if (!match) {
+          const headerText = buffer.subarray(0, sepIdx).toString("latin1");
+          const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
+          const maxFrameBytes = 64 * 1024 * 1024;
+          if (clMatches.length !== 1) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: invalid Content-Length header" }
+              },
+              true
+            );
             buffer = buffer.subarray(sepIdx + sepLen);
             continue;
           }
-          const contentLength = Number.parseInt(match[1], 10);
+          const contentLength = Number(clMatches[0][1]);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: { code: -32600, message: "Invalid Request: Content-Length out of bounds" }
+              },
+              true
+            );
+            buffer = Buffer.alloc(0);
+            break;
+          }
           const bodyStart = sepIdx + sepLen;
           if (buffer.length < bodyStart + contentLength) {
             break;
@@ -541,7 +608,15 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
   const content = buf.toString("utf8");
-  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n") {
+      if (i > 0 && content[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
   return { content, eol, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
 }
 function globToRegExp(pattern) {
@@ -700,15 +775,17 @@ function normalizeTerminalOutput(raw) {
 }
 var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
   let bytes = 0;
   let endIndex = 0;
   for (let i = 0; i < text.length; ) {
     const cp = text.codePointAt(i);
     const unitLen = cp > 65535 ? 2 : 1;
     const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
-    if (bytes + chBytes > maxBytes) break;
+    if (bytes + chBytes > limit) break;
     bytes += chBytes;
     i += unitLen;
     endIndex = i;
@@ -716,19 +793,21 @@ function sliceUtf8Bytes(text, maxBytes) {
   return text.slice(0, endIndex);
 }
 function truncateWithByteNotice(text, maxBytes) {
-  if (maxBytes <= 0) return "";
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
   const totalBytes = Buffer.byteLength(text, "utf8");
-  if (totalBytes <= maxBytes) return text;
-  if (maxBytes < 56) {
-    if (maxBytes <= 3) return sliceUtf8Bytes(text, maxBytes);
-    return `${sliceUtf8Bytes(text, maxBytes - 3)}...`;
+  if (totalBytes <= limit) return text;
+  if (limit < 56) {
+    if (limit <= 3) return sliceUtf8Bytes(text, limit);
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
   }
   const maxNoticeBytes = Buffer.byteLength(
     `
 ... [truncated: showed ${totalBytes} of ${totalBytes} bytes]`,
     "utf8"
   );
-  const cutoffBytes = Math.max(0, maxBytes - maxNoticeBytes);
+  const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -737,29 +816,43 @@ function truncateWithByteNotice(text, maxBytes) {
   const shownBytes = Buffer.byteLength(slice, "utf8");
   const result = `${slice}
 ... [truncated: showed ${shownBytes} of ${totalBytes} bytes]`;
-  return Buffer.byteLength(result, "utf8") <= maxBytes ? result : sliceUtf8Bytes(result, maxBytes);
+  return Buffer.byteLength(result, "utf8") <= limit ? result : sliceUtf8Bytes(result, limit);
+}
+function sliceSafeChars(text, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  let end = limit;
+  const lastCode = text.charCodeAt(end - 1);
+  if (lastCode >= 55296 && lastCode <= 56319) {
+    end -= 1;
+  }
+  return text.slice(0, end);
 }
 function truncateWithNotice(text, maxChars) {
-  if (maxChars <= 0) return "";
-  if (text.length <= maxChars) return text;
-  if (maxChars < 48) {
-    if (maxChars <= 3) return text.slice(0, maxChars);
-    return `${text.slice(0, maxChars - 3)}...`;
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  if (limit < 48) {
+    if (limit <= 3) return sliceSafeChars(text, limit);
+    return `${sliceSafeChars(text, limit - 3)}...`;
   }
   const maxNoticeLen = `
 ... [truncated: showed ${text.length} of ${text.length} chars]`.length;
-  const cutoff = Math.max(0, maxChars - maxNoticeLen);
-  let slice = text.slice(0, cutoff);
+  const cutoff = Math.max(0, limit - maxNoticeLen);
+  let slice = sliceSafeChars(text, cutoff);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > cutoff * 0.6) {
     slice = slice.slice(0, lastNewline);
   }
   const result = `${slice}
 ... [truncated: showed ${slice.length} of ${text.length} chars]`;
-  return result.length <= maxChars ? result : result.slice(0, maxChars);
+  return result.length <= limit ? result : sliceSafeChars(result, limit);
 }
 function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
-  if (sections.length === 0 || maxChars <= 0) return "";
+  if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
   const joined = sections.join(separator);
   if (joined.length <= maxChars) return joined;
   const sepTotal = separator.length * (sections.length - 1);
@@ -791,7 +884,11 @@ function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
 }
 function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n") {
   const charFitted = fitSectionsToBudget(sections, maxChars, separator);
-  if (maxBytes === void 0 || Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
+  if (maxBytes === void 0) {
+    return charFitted;
+  }
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  if (Buffer.byteLength(charFitted, "utf8") <= maxBytes) {
     return charFitted;
   }
   const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
@@ -962,7 +1059,7 @@ function formatNearbyLines(text, startLine, endLine) {
   for (let ln = from; ln <= to; ln++) {
     const lineText = lines[ln - 1] ?? "";
     snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`
+      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`
     );
   }
   const extra = truncated ? `
@@ -1059,7 +1156,7 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
     snippet.push(
-      `    ${ln}: ${lineText.length > 160 ? `${lineText.slice(0, 157)}...` : lineText}`
+      `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`
     );
   }
   return `
@@ -1230,6 +1327,12 @@ async function commitPlannedWrites(plans) {
         } catch {
         }
         written.push(plan);
+        if (plan.originalSymlinkTarget) {
+          try {
+            await fs2.unlink(target);
+          } catch {
+          }
+        }
         await fs2.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
@@ -1245,7 +1348,11 @@ async function commitPlannedWrites(plans) {
       const item = written[i];
       const target = item.writeTargetPath;
       try {
-        if (item.existed && item.originalBuffer !== null) {
+        if (item.originalSymlinkTarget) {
+          await fs2.unlink(target).catch(() => {
+          });
+          await fs2.symlink(item.originalSymlinkTarget, target);
+        } else if (item.existed && item.originalBuffer !== null) {
           await fs2.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
             await fs2.chmod(target, item.originalMode);
@@ -1342,6 +1449,38 @@ async function runApplyEdits(input) {
       isError: true
     };
   }
+  let validatedVerify = null;
+  if (input.verify !== void 0) {
+    if (typeof input.verify === "string") {
+      if (input.verify.trim()) {
+        validatedVerify = { command: input.verify };
+      }
+    } else if (isPlainObject(input.verify)) {
+      const cmd = input.verify.command;
+      if (typeof cmd !== "string" || !cmd.trim()) {
+        return {
+          text: "Validation failed (0 files modified):\n- 'verify.command' must be a non-empty string.",
+          isError: true
+        };
+      }
+      if (input.verify.cwd !== void 0 && typeof input.verify.cwd !== "string") {
+        return {
+          text: "Validation failed (0 files modified):\n- 'verify.cwd' must be a string.",
+          isError: true
+        };
+      }
+      validatedVerify = {
+        command: cmd,
+        cwd: input.verify.cwd,
+        timeoutSec: typeof input.verify.timeoutSec === "number" ? input.verify.timeoutSec : void 0
+      };
+    } else {
+      return {
+        text: "Validation failed (0 files modified):\n- 'verify' must be a command string or { command, cwd?, timeoutSec? } object.",
+        isError: true
+      };
+    }
+  }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
@@ -1356,6 +1495,11 @@ async function runApplyEdits(input) {
     try {
       writeTargetPath = await fs2.realpath(absPath);
     } catch {
+      try {
+        const realParent = await fs2.realpath(path2.dirname(absPath));
+        writeTargetPath = path2.join(realParent, path2.basename(absPath));
+      } catch {
+      }
     }
     const relPath = toPosixPath(path2.relative(baseCwd, absPath)) || path2.basename(absPath);
     const hasCreate = typeof entry.create === "string";
@@ -1399,21 +1543,58 @@ async function runApplyEdits(input) {
       let exists = false;
       let originalBuffer = null;
       let originalMode = null;
+      let originalSymlinkTarget = null;
       try {
-        const st = await fs2.stat(item.writeTargetPath);
-        if (st.isDirectory()) {
-          errors.push(`${item.relPath}: target path is a directory`);
-          continue;
+        const lst = await fs2.lstat(item.writeTargetPath);
+        if (lst.isSymbolicLink()) {
+          try {
+            const st = await fs2.stat(item.writeTargetPath);
+            if (st.isDirectory()) {
+              errors.push(`${item.relPath}: target path is a directory`);
+              continue;
+            }
+            exists = true;
+            if (!item.overwrite) {
+              errors.push(
+                `${item.relPath}: file already exists (set overwrite: true to replace it)`
+              );
+              continue;
+            }
+            originalMode = st.mode & 4095;
+            originalBuffer = await fs2.readFile(item.writeTargetPath);
+          } catch (statErr) {
+            if (statErr?.code === "ENOENT") {
+              exists = true;
+              if (!item.overwrite) {
+                errors.push(
+                  `${item.relPath}: dangling symlink already exists (set overwrite: true to replace it)`
+                );
+                continue;
+              }
+              originalSymlinkTarget = await fs2.readlink(item.writeTargetPath);
+            } else {
+              errors.push(
+                `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
+              );
+              continue;
+            }
+          }
+        } else {
+          const st = await fs2.stat(item.writeTargetPath);
+          if (st.isDirectory()) {
+            errors.push(`${item.relPath}: target path is a directory`);
+            continue;
+          }
+          exists = true;
+          if (!item.overwrite) {
+            errors.push(
+              `${item.relPath}: file already exists (set overwrite: true to replace it)`
+            );
+            continue;
+          }
+          originalMode = st.mode & 4095;
+          originalBuffer = await fs2.readFile(item.writeTargetPath);
         }
-        exists = true;
-        if (!item.overwrite) {
-          errors.push(
-            `${item.relPath}: file already exists (set overwrite: true to replace it)`
-          );
-          continue;
-        }
-        originalMode = st.mode & 4095;
-        originalBuffer = await fs2.readFile(item.writeTargetPath);
       } catch (err) {
         if (err?.code === "ENOENT") {
           exists = false;
@@ -1435,6 +1616,7 @@ async function runApplyEdits(input) {
         existed: exists,
         originalBuffer,
         originalMode,
+        originalSymlinkTarget,
         newContent: item.create,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
@@ -1526,40 +1708,31 @@ ${summaryLines.join("\n")}`,
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
   const parts = [`${header}
 ${summaryLines.join("\n")}`];
-  if (!input.dryRun && input.verify) {
-    const verifySpec = typeof input.verify === "string" ? { command: input.verify } : input.verify;
-    if (verifySpec.command && verifySpec.command.trim()) {
-      const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
-      const timeoutMs = Math.max(
-        1,
-        Math.min(
-          300,
-          Math.trunc(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60)
-        )
-      ) * 1e3;
-      const maxVerifyChars = Math.max(
-        300,
-        Math.min(7500, Math.trunc(input.maxVerifyChars ?? 4e3))
-      );
-      const res = await runShellCommandAsync(verifySpec.command, {
-        cwd: verifyCwd,
-        timeoutMs
-      });
-      const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-      const formatted = formatCompactCommandOutput({
-        stdout: res.stdout,
-        stderr: res.stderr,
-        exitCode: res.exitCode,
-        timedOut: res.timedOut,
-        error: res.error,
-        maxChars: maxVerifyChars
-      });
-      parts.push(
-        `
+  if (!input.dryRun && validatedVerify) {
+    const verifySpec = validatedVerify;
+    const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
+    const rawTimeoutSec = Number(verifySpec.timeoutSec ?? input.verifyTimeoutSec ?? 60);
+    const timeoutMs = (Number.isFinite(rawTimeoutSec) ? Math.max(1, Math.min(300, Math.trunc(rawTimeoutSec))) : 60) * 1e3;
+    const rawMaxVerifyChars = Number(input.maxVerifyChars ?? 4e3);
+    const maxVerifyChars = Number.isFinite(rawMaxVerifyChars) ? Math.max(300, Math.min(7500, Math.trunc(rawMaxVerifyChars))) : 4e3;
+    const res = await runShellCommandAsync(verifySpec.command, {
+      cwd: verifyCwd,
+      timeoutMs
+    });
+    const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const formatted = formatCompactCommandOutput({
+      stdout: res.stdout,
+      stderr: res.stderr,
+      exitCode: res.exitCode,
+      timedOut: res.timedOut,
+      error: res.error,
+      maxChars: maxVerifyChars
+    });
+    parts.push(
+      `
 Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
 ${formatted}`
-      );
-    }
+    );
   }
   const outText = parts.join("\n");
   const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
@@ -1704,12 +1877,19 @@ var ALLOWED_BRANCH_BOOL_FLAGS = /* @__PURE__ */ new Set([
   "--no-column",
   "--quiet"
 ]);
-var ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS = /* @__PURE__ */ new Set([
-  "--merged",
-  "--no-merged",
+var ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS = /* @__PURE__ */ new Set([
   "--abbrev",
   "--color",
   "--column"
+]);
+var ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS = /* @__PURE__ */ new Set([
+  "--merged",
+  "--no-merged"
+]);
+var ALLOWED_BRANCH_COMMIT_VALUE_FLAGS = /* @__PURE__ */ new Set([
+  "--contains",
+  "--no-contains",
+  "--points-at"
 ]);
 var ALLOWED_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--contains",
@@ -1721,17 +1901,23 @@ var ALLOWED_BRANCH_VALUE_FLAGS = /* @__PURE__ */ new Set([
 var ALLOWED_BRANCH_SHORT_CHARS = /* @__PURE__ */ new Set(["a", "r", "v", "l", "q", "i"]);
 var ALLOWED_TAG_BOOL_FLAGS = /* @__PURE__ */ new Set([
   "--list",
-  "--verify",
   "--no-color",
   "--ignore-case",
   "--omit-empty",
   "--no-column"
 ]);
-var ALLOWED_TAG_OPTIONAL_VALUE_FLAGS = /* @__PURE__ */ new Set([
-  "--merged",
-  "--no-merged",
+var ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS = /* @__PURE__ */ new Set([
   "--color",
   "--column"
+]);
+var ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS = /* @__PURE__ */ new Set([
+  "--merged",
+  "--no-merged"
+]);
+var ALLOWED_TAG_COMMIT_VALUE_FLAGS = /* @__PURE__ */ new Set([
+  "--contains",
+  "--no-contains",
+  "--points-at"
 ]);
 var ALLOWED_TAG_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--contains",
@@ -1740,7 +1926,7 @@ var ALLOWED_TAG_VALUE_FLAGS = /* @__PURE__ */ new Set([
   "--sort",
   "--format"
 ]);
-var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "v", "i"]);
+var ALLOWED_TAG_SHORT_CHARS = /* @__PURE__ */ new Set(["l", "i"]);
 var ALLOWED_REMOTE_SUBCOMMANDS = /* @__PURE__ */ new Set(["show", "get-url"]);
 function tokenizeArgs(input) {
   const tokens = [];
@@ -1812,16 +1998,26 @@ function validateReadonlyGitArgs(pattern) {
       );
     }
     const flagName = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
-    if (FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) || arg.startsWith("--output=") || arg.startsWith("-c") && arg.length > 2) {
+    if (FORBIDDEN_GIT_GLOBAL_FLAGS.has(flagName) || arg.startsWith("--output=") || flagName === "--ext" || flagName.startsWith("--ext-") || flagName.startsWith("--textc") || arg.startsWith("-c") && arg.length > 2) {
       throw new Error(`Flag '${arg}' is not allowed in read-only git query`);
     }
   }
   if (subcmd === "branch") {
     let hasListFlag = false;
     let expectValue = false;
+    let expectNonFlagCommit = false;
     for (const arg of rest) {
       if (expectValue) {
         expectValue = false;
+        continue;
+      }
+      if (expectNonFlagCommit) {
+        expectNonFlagCommit = false;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`
+          );
+        }
         continue;
       }
       if (arg === "--") {
@@ -1836,15 +2032,23 @@ function validateReadonlyGitArgs(pattern) {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_BRANCH_VALUE_FLAGS.has(flagName) && !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)) {
+          if (!ALLOWED_BRANCH_VALUE_FLAGS.has(flagName) && !ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS.has(flagName) && !ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
           }
+        } else if (ALLOWED_BRANCH_COMMIT_VALUE_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          hasListFlag = true;
+        } else if (ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          hasListFlag = true;
         } else if (ALLOWED_BRANCH_VALUE_FLAGS.has(flagName)) {
           expectValue = true;
-        } else if (!ALLOWED_BRANCH_BOOL_FLAGS.has(flagName) && !ALLOWED_BRANCH_OPTIONAL_VALUE_FLAGS.has(flagName)) {
+        } else if (!ALLOWED_BRANCH_BOOL_FLAGS.has(flagName) && !ALLOWED_BRANCH_EQ_ONLY_OPTIONAL_FLAGS.has(flagName)) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git branch query`);
         }
-        if (flagName === "--list") hasListFlag = true;
+        if (flagName === "--list" || ALLOWED_BRANCH_COMMIT_OPTIONAL_FLAGS.has(flagName) || ALLOWED_BRANCH_COMMIT_VALUE_FLAGS.has(flagName)) {
+          hasListFlag = true;
+        }
       } else if (arg.startsWith("-") && arg.length > 1) {
         for (const ch of arg.slice(1)) {
           if (!ALLOWED_BRANCH_SHORT_CHARS.has(ch)) {
@@ -1861,15 +2065,25 @@ function validateReadonlyGitArgs(pattern) {
   } else if (subcmd === "tag") {
     let allowsPositionals = false;
     let expectValue = false;
+    let expectNonFlagCommit = false;
     for (const arg of rest) {
       if (expectValue) {
         expectValue = false;
         continue;
       }
+      if (expectNonFlagCommit) {
+        expectNonFlagCommit = false;
+        if (arg.startsWith("-")) {
+          throw new Error(
+            `Expected commit ref after commit filter flag (got '${arg}')`
+          );
+        }
+        continue;
+      }
       if (arg === "--") {
         if (!allowsPositionals) {
           throw new Error(
-            "Positional tag arguments are only allowed with --list or --verify in read-only mode"
+            "Positional tag arguments are only allowed with --list in read-only mode"
           );
         }
         break;
@@ -1878,15 +2092,21 @@ function validateReadonlyGitArgs(pattern) {
         const eqIdx = arg.indexOf("=");
         const flagName = eqIdx !== -1 ? arg.slice(0, eqIdx) : arg;
         if (eqIdx !== -1) {
-          if (!ALLOWED_TAG_VALUE_FLAGS.has(flagName) && !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)) {
+          if (!ALLOWED_TAG_VALUE_FLAGS.has(flagName) && !ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS.has(flagName) && !ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
             throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
           }
+        } else if (ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          allowsPositionals = true;
+        } else if (ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName)) {
+          expectNonFlagCommit = true;
+          allowsPositionals = true;
         } else if (ALLOWED_TAG_VALUE_FLAGS.has(flagName)) {
           expectValue = true;
-        } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName) && !ALLOWED_TAG_OPTIONAL_VALUE_FLAGS.has(flagName)) {
+        } else if (!ALLOWED_TAG_BOOL_FLAGS.has(flagName) && !ALLOWED_TAG_EQ_ONLY_OPTIONAL_FLAGS.has(flagName)) {
           throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
         }
-        if (flagName === "--list" || flagName === "--verify") {
+        if (flagName === "--list" || ALLOWED_TAG_COMMIT_OPTIONAL_FLAGS.has(flagName) || ALLOWED_TAG_COMMIT_VALUE_FLAGS.has(flagName)) {
           allowsPositionals = true;
         }
       } else if (arg.startsWith("-") && arg.length > 1) {
@@ -1897,7 +2117,7 @@ function validateReadonlyGitArgs(pattern) {
             if (!ALLOWED_TAG_SHORT_CHARS.has(ch)) {
               throw new Error(`Flag '${arg}' is not allowed in read-only git tag query`);
             }
-            if (ch === "l" || ch === "v") allowsPositionals = true;
+            if (ch === "l") allowsPositionals = true;
           }
         }
       } else if (!allowsPositionals) {
@@ -1925,6 +2145,10 @@ function validateReadonlyGitArgs(pattern) {
             `Flag '${arg}' is not allowed for read-only git remote ${remoteSubcmd}`
           );
         }
+      } else if (arg.includes("://") || arg.includes(":") || arg.includes("/") || arg.includes("\\")) {
+        throw new Error(
+          `Remote target '${arg}' must be a configured remote name, not a URL or path`
+        );
       }
     }
   }
@@ -1988,9 +2212,11 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  if (typeGlobs && !matchesType(searchRoot) && (await fs3.stat(searchRoot)).isFile()) {
+  const isFileTarget = (await fs3.stat(searchRoot)).isFile();
+  if (typeGlobs && !matchesType(searchRoot) && isFileTarget) {
     return { files: [], totalMatches: 0, truncated: false };
   }
+  const perFileCap = isFileTarget ? maxResults : Math.min(maxResults, 50);
   const args = ["--no-messages", "--max-filesize", "2M"];
   if (summary || typeGlobs || query.multiline) args.push("--no-config");
   if (query.multiline) args.push("--multiline", "--multiline-dotall", "--crlf");
@@ -2033,7 +2259,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
-  if (!summary && !query.multiline) args.push("--max-count", String(Math.min(maxResults, 50)));
+  if (!summary && !query.multiline) args.push("--max-count", String(perFileCap + 1));
   args.push("--", query.pattern, searchRoot);
   const res = await execBinaryAsync("rg", args, {
     cwd: baseCwd,
@@ -2075,6 +2301,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     };
   }
   const byFile = /* @__PURE__ */ new Map();
+  const matchCountByFile = /* @__PURE__ */ new Map();
   let totalMatches = 0;
   let truncated = false;
   let pendingBeforeContext = [];
@@ -2120,12 +2347,13 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     if (ev.type === "context") {
       if (lastKeptMatchFile === relFile && lastKeptMatchLine !== -1 && lineNumber > lastKeptMatchLine && lineNumber <= lastKeptMatchLine + contextLines) {
         upsertLine(relFile, { lineNumber, text: lineText, isMatch: false });
-      } else if (!truncated) {
+      } else if (totalMatches < maxResults && (query.multiline || (matchCountByFile.get(relFile) ?? 0) < perFileCap)) {
         pendingBeforeContext.push({ relFile, lineNumber, text: lineText });
       }
       continue;
     }
-    if (totalMatches >= maxResults) {
+    const fileHits = matchCountByFile.get(relFile) ?? 0;
+    if (totalMatches >= maxResults || !query.multiline && fileHits >= perFileCap) {
       truncated = true;
       pendingBeforeContext = [];
       continue;
@@ -2142,23 +2370,30 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     pendingBeforeContext = [];
     const segments = query.multiline ? lineText.split(/\r?\n/) : [lineText];
     lastKeptMatchFile = relFile;
+    let addedForFile = fileHits;
     for (const [offset, text] of segments.entries()) {
       const line = lineNumber + offset;
       if (byFile.get(relFile)?.get(line)?.isMatch) continue;
-      if (totalMatches >= maxResults) {
+      if (totalMatches >= maxResults || !query.multiline && addedForFile >= perFileCap) {
         truncated = true;
         break;
       }
       upsertLine(relFile, { lineNumber: line, text, isMatch: true });
       lastKeptMatchLine = line;
       totalMatches++;
+      addedForFile++;
     }
+    matchCountByFile.set(relFile, addedForFile);
   }
   const files = [...byFile.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([file, lineMap]) => ({
     file,
     lines: [...lineMap.values()].sort((a, b) => a.lineNumber - b.lineNumber)
   }));
-  return { files, totalMatches, truncated: truncated || res.truncated || Boolean(query.multiline && res.timedOut) };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || res.truncated || res.timedOut || res.exitCode === null
+  };
 }
 function* multilineMatches(content, regex) {
   let previousEnd = -1;
@@ -2235,6 +2470,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     return false;
   };
   const stat = await fs3.stat(searchRoot);
+  const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
     const relPosix = toPosixPath(path3.relative(baseCwd, searchRoot)) || path3.basename(searchRoot);
@@ -2282,6 +2518,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     };
   };
   const batchSize = 16;
+  let anyFileTruncated = false;
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
@@ -2293,10 +2530,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           if (isLikelyBinary(buf)) return null;
           const content = buf.toString("utf8");
           const lines = content.split(/\r?\n/);
-          if ((summary || query.multiline) && lines.at(-1) === "") lines.pop();
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
           const relFile = relativeFile(baseCwd, absFile);
           let matchedIndices = [];
           let count = 0;
+          let fileTruncated = false;
           if (query.multiline && summary) {
             for (const _match of multilineMatches(content, regex)) {
               count++;
@@ -2308,13 +2546,17 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           } else {
             for (let idx = 0; idx < lines.length; idx++) {
               if (regex.test(lines[idx])) {
+                if (!summary && matchedIndices.length >= perFileCap) {
+                  fileTruncated = true;
+                  break;
+                }
                 matchedIndices.push(idx);
-                if (query.outputMode === "files_with_matches" || !summary && matchedIndices.length >= 50) break;
+                if (query.outputMode === "files_with_matches") break;
               }
             }
             count = matchedIndices.length;
           }
-          return count ? { relFile, lines, matchedIndices, count } : null;
+          return count ? { relFile, lines, matchedIndices, count, fileTruncated } : null;
         } catch {
           return null;
         }
@@ -2330,6 +2572,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
         files.push({ file: item.relFile, lines: [], count: item.count });
         continue;
       }
+      if (item.fileTruncated) {
+        anyFileTruncated = true;
+      }
       if (totalMatches + item.matchedIndices.length > maxResults) {
         const remaining = maxResults - totalMatches;
         if (remaining > 0) {
@@ -2344,7 +2589,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       totalMatches += item.matchedIndices.length;
     }
   }
-  return { files, totalMatches, truncated: truncated || (summary || query.multiline === true) && discoveryTruncated };
+  return {
+    files,
+    totalMatches,
+    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+  };
 }
 function buildGlobFallbackPlan(pattern) {
   if (!pattern.includes("{") && pattern.includes("|")) {
@@ -2493,9 +2742,92 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
 ... [truncated; showing ${matches.length} files]` : "";
   return body + footer;
 }
+var SHORTLOG_VALUE_FLAGS = /* @__PURE__ */ new Set([
+  "--group",
+  "--format",
+  "--since",
+  "--after",
+  "--until",
+  "--before",
+  "--author",
+  "--committer",
+  "--grep",
+  "--max-count",
+  "--skip"
+]);
+var SHORTLOG_REV_SELECTOR_FLAGS = /* @__PURE__ */ new Set([
+  "--all",
+  "--branches",
+  "--tags",
+  "--remotes",
+  "--glob",
+  "--stdin"
+]);
+function hardenGitExecArgs(validatedArgs) {
+  const subcmd = validatedArgs[1];
+  const rest = validatedArgs.slice(2);
+  let subArgs = rest;
+  if (subcmd === "diff" || subcmd === "log" || subcmd === "show") {
+    subArgs = ["--no-ext-diff", "--no-textconv", ...rest];
+  } else if (subcmd === "blame") {
+    subArgs = ["--no-textconv", ...rest];
+  } else if (subcmd === "remote") {
+    const remoteSubIdx = rest.findIndex((a) => !a.startsWith("-"));
+    if (remoteSubIdx !== -1 && rest[remoteSubIdx] === "show" && !rest.includes("-n")) {
+      subArgs = [...rest.slice(0, remoteSubIdx + 1), "-n", ...rest.slice(remoteSubIdx + 1)];
+    }
+  } else if (subcmd === "shortlog") {
+    let hasRev = false;
+    let expectVal = false;
+    let dashDashIdx = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (expectVal) {
+        expectVal = false;
+        continue;
+      }
+      if (a === "--") {
+        dashDashIdx = i;
+        break;
+      }
+      if (a.startsWith("-")) {
+        const flagName = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+        if (SHORTLOG_REV_SELECTOR_FLAGS.has(flagName)) {
+          hasRev = true;
+        } else if (!a.includes("=") && SHORTLOG_VALUE_FLAGS.has(flagName)) {
+          expectVal = true;
+        }
+        continue;
+      }
+      hasRev = true;
+    }
+    if (!hasRev) {
+      subArgs = dashDashIdx === -1 ? [...rest, "HEAD"] : [...rest.slice(0, dashDashIdx), "HEAD", ...rest.slice(dashDashIdx)];
+    }
+    subArgs = ["--no-ext-diff", "--no-textconv", ...subArgs];
+  }
+  return [
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "gpg.program=false",
+    "-c",
+    "gpg.openpgp.program=false",
+    "-c",
+    "gpg.ssh.program=false",
+    "-c",
+    "gpg.x509.program=false",
+    "--no-pager",
+    ...subcmd ? [subcmd, ...subArgs] : subArgs
+  ];
+}
 async function runGitQuery(query, searchRoot) {
   const gitArgs = validateReadonlyGitArgs(query.pattern);
-  const res = await execBinaryAsync("git", ["--no-optional-locks", ...gitArgs], {
+  const execArgs = hardenGitExecArgs(gitArgs);
+  const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
     timeoutMs: 1e4,
     maxOutputBytes: 512 * 1024
@@ -2521,7 +2853,7 @@ function formatFileMatches(files, totalMatches, truncated) {
   for (const fm of files) {
     const lines = fm.lines.map((l) => {
       const sep = l.isMatch ? ":" : "-";
-      const text = l.text.length > 240 ? `${l.text.slice(0, 240)}...` : l.text;
+      const text = l.text.length > 240 ? `${sliceSafeChars(l.text, 240)}...` : l.text;
       return `  ${l.lineNumber}${sep} ${text}`;
     });
     blocks.push(`${fm.file}
@@ -2695,6 +3027,13 @@ function isRegexStartContext(line, slashIdx) {
   const word = line.slice(k + 1, j + 1);
   return word === "return" || word === "case" || word === "throw" || word === "in" || word === "of" || word === "typeof" || word === "void" || word === "delete" || word === "new";
 }
+function isJsxSelfClosingSlash(line, slashIdx) {
+  if (line[slashIdx + 1] !== ">") return false;
+  let j = slashIdx - 1;
+  while (j >= 0 && /\s/.test(line[j])) j--;
+  if (j >= 0 && line[j] !== "}") return false;
+  return line[slashIdx + 2] !== "/";
+}
 function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = false, alreadySeenOpen = false) {
   let open = 0;
   let close = 0;
@@ -2736,7 +3075,7 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       continue;
     }
     if (state.inBacktick) {
-      if (ch === "\\") {
+      if (ch === "\\" && lang !== "go") {
         escape = true;
       } else if (ch === "`") {
         state.inBacktick = false;
@@ -2764,19 +3103,27 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       }
       continue;
     }
-    if (lang === "shell" && ch === "#") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "/") break;
-    if ((lang === "js" || lang === "c") && ch === "/" && next === "*") {
+    if (lang === "shell" && ch === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) {
+      break;
+    }
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "/") break;
+    if ((lang === "js" || lang === "c" || lang === "go" || lang === "rust") && ch === "/" && next === "*") {
       state.inBlockComment = true;
       i++;
       continue;
     }
-    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && isRegexStartContext(line, i)) {
+    if (lang === "js" && ch === "/" && next !== "/" && next !== "*" && !isJsxSelfClosingSlash(line, i) && line[i - 1] !== "<" && isRegexStartContext(line, i)) {
       inRegex = true;
       inRegexClass = false;
       continue;
     }
     if (ch === "'" && lang !== "json") {
+      if (lang === "rust") {
+        if (next === "\\" || line[i + 2] === "'") {
+          inSingle = true;
+        }
+        continue;
+      }
       inSingle = true;
       continue;
     }
@@ -2784,7 +3131,7 @@ function scanBracesOnLine(line, state, lang, ignoreBracesInParensBeforeOpen = fa
       inDouble = true;
       continue;
     }
-    if (ch === "`" && (lang === "js" || lang === "c")) {
+    if (ch === "`" && (lang === "js" || lang === "c" || lang === "go")) {
       state.inBacktick = true;
       continue;
     }
@@ -2846,7 +3193,7 @@ function findBraceBlockEnd(lines, startIdx, lang = "c") {
       lines[i],
       state,
       lang,
-      lang === "js",
+      lang === "js" || lang === "go",
       seenOpen
     );
     if (open > 0) seenOpen = true;
@@ -3012,8 +3359,9 @@ function extractTsJsSymbols(lines) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const wasInComment = commentState.inBlockComment;
+    const wasInBacktick = commentState.inBacktick;
     scanBracesOnLine(line, commentState, "js");
-    if (wasInComment) continue;
+    if (wasInComment || wasInBacktick) continue;
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
       continue;
@@ -3130,11 +3478,15 @@ function extractPythonSymbols(lines) {
   const symbols = [];
   const re = /^([ \t]*)(async\s+def|def|class)\s+([A-Za-z_]\w*)/;
   const inTripleString = new Array(lines.length).fill(false);
+  const openParens = new Array(lines.length).fill(0);
+  const closeParens = new Array(lines.length).fill(0);
   let activeQuote = null;
   for (let i = 0; i < lines.length; i++) {
     inTripleString[i] = activeQuote !== null;
     const line = lines[i];
     let j = 0;
+    let op = 0;
+    let cp = 0;
     while (j < line.length) {
       if (activeQuote) {
         if (line[j] === "\\") {
@@ -3169,9 +3521,13 @@ function extractPythonSymbols(lines) {
           j++;
           continue;
         }
+        if (line[j] === "(") op++;
+        else if (line[j] === ")") cp++;
         j++;
       }
     }
+    openParens[i] = op;
+    closeParens[i] = cp;
   }
   const raw = [];
   for (let i = 0; i < lines.length; i++) {
@@ -3184,8 +3540,16 @@ function extractPythonSymbols(lines) {
   }
   for (let idx = 0; idx < raw.length; idx++) {
     const item = raw[idx];
+    let headerEndIdx = item.startIdx;
+    let parenDepth = openParens[item.startIdx] - closeParens[item.startIdx];
+    const maxHeaderScan = Math.min(lines.length - 1, item.startIdx + 40);
+    while (parenDepth > 0 && headerEndIdx < maxHeaderScan) {
+      headerEndIdx++;
+      parenDepth += openParens[headerEndIdx] - closeParens[headerEndIdx];
+    }
+    if (parenDepth > 0) headerEndIdx = item.startIdx;
     let endIdx = lines.length - 1;
-    for (let j = item.startIdx + 1; j < lines.length; j++) {
+    for (let j = headerEndIdx + 1; j < lines.length; j++) {
       if (inTripleString[j]) continue;
       const l = lines[j];
       const trimmed = l.trim();
@@ -3196,14 +3560,14 @@ function extractPythonSymbols(lines) {
         break;
       }
     }
-    while (endIdx > item.startIdx && !lines[endIdx].trim()) {
+    while (endIdx > headerEndIdx && !lines[endIdx].trim()) {
       endIdx--;
     }
     symbols.push({
       kind: item.kind,
       name: item.name,
       startLine: item.startIdx + 1,
-      endLine: endIdx + 1,
+      endLine: Math.max(item.startIdx + 1, endIdx + 1),
       depth: item.indent > 0 ? 1 : 0
     });
   }
@@ -3464,9 +3828,18 @@ function extractGdScriptSymbols(rawLines) {
 function extractGoSymbols(lines) {
   const symbols = [];
   const funcRe = /^func\s+(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)/;
-  const typeRe = /^type\s+([A-Za-z_]\w*)\s+(struct|interface)\b/;
+  const typeRe = /^type\s+([A-Za-z_]\w*(?:\[[^\]]*\])?)\s+(struct|interface)\b/;
+  const commentState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const wasInComment = commentState.inBlockComment;
+    const wasInBacktick = commentState.inBacktick;
+    scanBracesOnLine(line, commentState, "go");
+    if (wasInComment || wasInBacktick) continue;
     const fm = funcRe.exec(line);
     if (fm && fm[2]) {
       const recv = fm[1]?.trim();
@@ -3475,7 +3848,7 @@ function extractGoSymbols(lines) {
         kind: recv ? "method" : "function",
         name,
         startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
+        endLine: findBraceBlockEnd(lines, i, "go"),
         depth: 0
       });
       continue;
@@ -3486,7 +3859,7 @@ function extractGoSymbols(lines) {
         kind: tm[2],
         name: tm[1],
         startLine: i + 1,
-        endLine: findBraceBlockEnd(lines, i, "c"),
+        endLine: findBraceBlockEnd(lines, i, "go"),
         depth: 0
       });
     }
@@ -3495,9 +3868,21 @@ function extractGoSymbols(lines) {
 }
 function extractRustSymbols(lines) {
   const symbols = [];
-  const re = /^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*(fn|struct|enum|trait|impl|mod)\s+([A-Za-z_][\w:<>,\s]*?)(?:\s*[\({;]|$)/;
+  const re = /^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*(fn|struct|enum|trait|impl|mod)(?:\s+|\s*(?=<))([A-Za-z_<][\w:<>,+'&\s]*?)(?:\s*[\({;]|$)/;
+  const commentState = {
+    inBlockComment: false,
+    templateExprStack: [],
+    inBacktick: false
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const wasInComment = commentState.inBlockComment;
+    scanBracesOnLine(line, commentState, "rust");
+    if (wasInComment) continue;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
+      continue;
+    }
     const m = re.exec(line);
     if (!m || !m[2] || !m[3]) continue;
     const indent = m[1].length;
@@ -3506,7 +3891,7 @@ function extractRustSymbols(lines) {
       kind: m[2],
       name: m[3].trim(),
       startLine: i + 1,
-      endLine: findBraceBlockEnd(lines, i, "c"),
+      endLine: findBraceBlockEnd(lines, i, "rust"),
       depth: indent > 0 ? 1 : 0
     });
   }
@@ -3917,6 +4302,7 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".pcss":
       return extractCssSymbols(lines);
     case ".py":
+    case ".pyi":
       return extractPythonSymbols(lines);
     case ".gd":
       return extractGdScriptSymbols(lines);
@@ -4061,10 +4447,8 @@ async function runReadSlices(input) {
     };
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
-  const maxChars = Math.max(
-    1e3,
-    Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(input.maxChars ?? 8500))
-  );
+  const rawMaxChars = Number(input.maxChars ?? 8500);
+  const maxChars = Number.isFinite(rawMaxChars) ? Math.max(1e3, Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(rawMaxChars))) : 8500;
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : outlines.length <= 20 ? 16 : 10;
   const fileCache = /* @__PURE__ */ new Map();
