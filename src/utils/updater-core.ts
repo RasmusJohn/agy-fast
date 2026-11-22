@@ -39,7 +39,16 @@ export const UPDATER_OPTIONAL_FILES = [
 
 export type AutoUpdateMode = "auto" | "notify" | "off";
 export type UpdateChannel = "release" | "main";
+export type ToolLoadingMode = "eager" | "lazy";
 export type InstallKind = "copied" | "git-clone" | "git-dirty" | "symlink" | "dev-source";
+
+export const EAGER_MCP_TOOLS = [
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks",
+] as const;
 
 export interface UpdaterConfig {
   autoUpdate?: AutoUpdateMode;
@@ -47,6 +56,7 @@ export interface UpdaterConfig {
   channel?: UpdateChannel;
   repoUrl?: string;
   editsFormat?: "auto" | "array" | "string";
+  toolLoading?: ToolLoadingMode;
 }
 
 export interface ResolvedUpdaterSettings {
@@ -55,6 +65,7 @@ export interface ResolvedUpdaterSettings {
   checkIntervalMs: number;
   channel: UpdateChannel;
   repoUrl: string;
+  toolLoading: ToolLoadingMode;
 }
 
 export interface UpdateState {
@@ -263,6 +274,42 @@ export async function writeUpdateState(
   return merged;
 }
 
+export function parseToolLoadingMode(raw: unknown): ToolLoadingMode | null {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "eager" || v === "lazy") return v;
+  return null;
+}
+
+export async function applyToolLoadingToMcpConfig(
+  pluginDir: string,
+  mode: ToolLoadingMode,
+): Promise<boolean> {
+  const mcpPath = path.join(pluginDir, "mcp_config.json");
+  const cfg = await readJsonFile<Record<string, unknown>>(mcpPath);
+  if (!cfg) return false;
+  const servers = cfg.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    return false;
+  }
+  const fast = (servers as Record<string, unknown>).fast;
+  if (!fast || typeof fast !== "object" || Array.isArray(fast)) {
+    return false;
+  }
+  const fastObj = fast as Record<string, unknown>;
+  if (mode === "lazy") {
+    delete fastObj.tools;
+  } else {
+    const toolsMap: Record<string, { eager: boolean }> = {};
+    for (const tool of EAGER_MCP_TOOLS) {
+      toolsMap[tool] = { eager: true };
+    }
+    fastObj.tools = toolsMap;
+  }
+  await writeJsonAtomically(mcpPath, cfg);
+  return true;
+}
+
 export async function resolveUpdaterSettings(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ResolvedUpdaterSettings> {
@@ -284,6 +331,10 @@ export async function resolveUpdaterSettings(
   const cfgChan = parseUpdateChannel(cfg.channel);
   const channel: UpdateChannel = envChan ?? cfgChan ?? "release";
 
+  const envToolLoading = parseToolLoadingMode(env.AGY_FAST_TOOL_LOADING);
+  const cfgToolLoading = parseToolLoadingMode(cfg.toolLoading);
+  const toolLoading: ToolLoadingMode = envToolLoading ?? cfgToolLoading ?? "eager";
+
   const repoUrl =
     env.AGY_FAST_REPO?.trim() || cfg.repoUrl?.trim() || DEFAULT_REPO_URL;
 
@@ -293,6 +344,7 @@ export async function resolveUpdaterSettings(
     checkIntervalMs: Math.round(checkIntervalHours * 3600 * 1000),
     channel,
     repoUrl,
+    toolLoading,
   };
 }
 
@@ -879,6 +931,7 @@ export async function runPluginUpdate(
         );
       }
     } else {
+      await applyToolLoadingToMcpConfig(stagingDir, settings.toolLoading);
       await syncRuntimeFilesAtomically(stagingDir, pluginDir);
     }
 

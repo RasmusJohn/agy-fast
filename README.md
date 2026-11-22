@@ -248,6 +248,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 | **Check for updates** *(read-only)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update --check` |
 | **Update now** *(stages & runs MCP smoke test before swapping)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
 | **Configure auto-update** *(`auto` \| `notify` \| `off`)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
+| **Switch MCP tool loading** *(`eager` \| `lazy`, preserved across updates)* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
 | **Uninstall cleanly** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > From a local repository clone, `./install.sh <command>` (macOS/Linux) and `.\install.ps1 <command>` (Windows) accept the same subcommands (`doctor`, `update`, `config`, `uninstall`).

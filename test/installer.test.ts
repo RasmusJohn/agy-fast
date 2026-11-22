@@ -614,4 +614,63 @@ describe("installer", () => {
       await fs.rm(localRulesHome, { recursive: true, force: true });
     }
   });
+
+  it("persists --tool-loading lazy|eager across config, doctor, and re-installs without dirtying git links", async () => {
+    const modeHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-tool-loading-"));
+    try {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: modeHome,
+        USERPROFILE: modeHome,
+        AGY_FAST_AUTO_UPDATE: "off",
+        AGY_FAST_CACHE_DIR: path.join(modeHome, ".gemini", "cache", "agy-fast"),
+      };
+      delete env.AGY_FAST_TOOL_LOADING;
+      const pluginDir = path.join(modeHome, ".gemini", "config", "plugins", "agy-fast");
+      const mcpConfigPath = path.join(pluginDir, "mcp_config.json");
+
+      // 1. Install with --tool-loading lazy strips eager declarations while passing doctor & agy validate
+      const installOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp", "--tool-loading", "lazy"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(installOut, /Tool loading: lazy \(0\/5 tools eager in mcp_config\.json\)/);
+      const lazyCfg = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+      assert.equal(lazyCfg.mcpServers.fast.tools, undefined);
+
+      // 2. Plain re-install preserves persisted toolLoading: "lazy" from config.json
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable", "--no-acp"],
+        { env, encoding: "utf8" },
+      );
+      const afterReinstall = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+      assert.equal(afterReinstall.mcpServers.fast.tools, undefined);
+
+      // 3. `config --tool-loading eager` flips installed mcp_config.json back to 5/5 eager in-place
+      const eagerOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "config", "--no-acp", "--tool-loading", "eager"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(eagerOut, /toolLoading\s*: eager/);
+      assert.match(eagerOut, /Applied 'eager' mode/);
+      const eagerCfg = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+      assert.equal(eagerCfg.mcpServers.fast.tools.batch_search.eager, true);
+      assert.equal(eagerCfg.mcpServers.fast.tools.quick_outline.eager, true);
+      assert.equal(Object.keys(eagerCfg.mcpServers.fast.tools).length, 5);
+
+      // 4. `config --tool-loading lazy` switches back cleanly in-place
+      execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "config", "--no-acp", "--tool-loading", "lazy"],
+        { env, encoding: "utf8" },
+      );
+      const backToLazy = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+      assert.equal(backToLazy.mcpServers.fast.tools, undefined);
+    } finally {
+      await fs.rm(modeHome, { recursive: true, force: true });
+    }
+  });
 });

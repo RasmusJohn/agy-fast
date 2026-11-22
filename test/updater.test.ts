@@ -520,5 +520,26 @@ describe("auto-updater", () => {
       await fs.readFile(path.join(localGitDir, "rules", "AGENTS.local.md"), "utf8"),
       "---\ntrigger: always_on\n---\n# Git clone local rule\n",
     );
+
+    // 7. Persisted toolLoading: "lazy" in config.json is preserved across copied auto-updates
+    const lazyUpdateDir = path.join(rootTmp, "lazy-copied-plugin");
+    const lazyCacheDir = path.join(rootTmp, "lazy-copied-cache");
+    await copyRuntimeFixture(lazyUpdateDir, "0.2.0", "release-0.2.0");
+    await fs.mkdir(lazyCacheDir, { recursive: true });
+    await fs.writeFile(
+      path.join(lazyCacheDir, "config.json"),
+      JSON.stringify({ toolLoading: "lazy" }),
+      "utf8",
+    );
+    const lazyUpdRes = await runPluginUpdate({
+      pluginDir: lazyUpdateDir,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: lazyCacheDir },
+    });
+    assert.equal(lazyUpdRes.status, "updated");
+    const updatedMcpCfg = JSON.parse(
+      await fs.readFile(path.join(lazyUpdateDir, "mcp_config.json"), "utf8"),
+    );
+    assert.equal(updatedMcpCfg.mcpServers.fast.tools, undefined);
   });
 });

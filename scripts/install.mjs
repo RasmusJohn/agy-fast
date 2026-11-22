@@ -111,6 +111,7 @@ function parseArgs(argv) {
   let channel = "";
   let repoUrl = "";
   let editsFormat = "";
+  let toolLoading = "";
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -163,6 +164,14 @@ function parseArgs(argv) {
         );
       }
       editsFormat = args[++i].toLowerCase();
+    } else if (a === "--tool-loading") {
+      const next = args[i + 1];
+      if (!next || !["eager", "lazy"].includes(next.toLowerCase())) {
+        throw new Error(
+          "Invalid value after --tool-loading (expected: eager | lazy)",
+        );
+      }
+      toolLoading = args[++i].toLowerCase();
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -216,6 +225,7 @@ function parseArgs(argv) {
     channel,
     repoUrl,
     editsFormat,
+    toolLoading,
   };
 }
 
@@ -247,6 +257,7 @@ Options:
   --repo <url>                  Override git repository URL for updates
   --edits-format auto|array|string
                                 Configure apply_edits.edits schema preference (default auto)
+  --tool-loading eager|lazy     Configure MCP tool loading mode in mcp_config.json (default eager)
   -h, --help                    Show this help
 `);
 }
@@ -567,6 +578,57 @@ async function copyRuntimeFiles(srcRoot, dstRoot) {
   }
 }
 
+function parseToolLoadingValue(raw) {
+  if (typeof raw !== "string") return "";
+  const v = raw.trim().toLowerCase();
+  return v === "eager" || v === "lazy" ? v : "";
+}
+
+async function resolveEffectiveToolLoading(explicitOverride = "") {
+  const explicit = parseToolLoadingValue(explicitOverride);
+  if (explicit) return explicit;
+  const fromEnv = parseToolLoadingValue(process.env.AGY_FAST_TOOL_LOADING || "");
+  if (fromEnv) return fromEnv;
+  const cfgPath = path.join(getUpdaterCacheDir(), "config.json");
+  const cfg = (await readJsonSafe(cfgPath)) || {};
+  return parseToolLoadingValue(cfg.toolLoading) || "eager";
+}
+
+async function applyToolLoadingToCopiedPluginDir(pluginDir, mode) {
+  const dirStat = await lstatSafe(pluginDir);
+  if (!dirStat) return { applied: false, reason: "missing" };
+  if (dirStat.isSymbolicLink()) return { applied: false, reason: "symlink" };
+  if (await pathExists(path.join(pluginDir, ".git"))) {
+    return { applied: false, reason: "git-clone" };
+  }
+  const mcpPath = path.join(pluginDir, "mcp_config.json");
+  const cfg = await readJsonSafe(mcpPath);
+  if (!cfg?.mcpServers?.fast || typeof cfg.mcpServers.fast !== "object") {
+    return { applied: false, reason: "invalid-mcp-config" };
+  }
+  if (mode === "lazy") {
+    delete cfg.mcpServers.fast.tools;
+  } else {
+    const toolsMap = {};
+    for (const tool of EXPECTED_MCP_TOOLS) {
+      toolsMap[tool] = { eager: true };
+    }
+    cfg.mcpServers.fast.tools = toolsMap;
+  }
+  const tmpPath = `${mcpPath}.tmp.${process.pid}.${Date.now()}`;
+  await fs.writeFile(tmpPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  try {
+    await fs.rename(tmpPath, mcpPath);
+  } catch {
+    try {
+      await fs.copyFile(tmpPath, mcpPath);
+    } finally {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+    }
+  }
+  return { applied: true, reason: null };
+}
+
 async function snapshotLocalRuleFiles(pluginDir) {
   const preserved = [];
   const skipped = [];
@@ -813,6 +875,9 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
     const code = err?.code;
     if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
       await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
+      if (opts.effectiveToolLoading) {
+        await applyToolLoadingToCopiedPluginDir(isolated.pluginDir, opts.effectiveToolLoading);
+      }
       await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
       mode = "copied";
     } else {
@@ -936,6 +1001,19 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       ? updaterCfg.editsFormat.trim().toLowerCase()
       : "";
   const effectiveEditsFormat = validEnvEditsFormat || validCfgEditsFormat || "auto";
+  const effectiveToolLoading =
+    parseToolLoadingValue(process.env.AGY_FAST_TOOL_LOADING || "") ||
+    parseToolLoadingValue(updaterCfg.toolLoading) ||
+    "eager";
+  const installedMcpCfg = await readJsonSafe(path.join(targetDir, "mcp_config.json"));
+  const installedToolsMap =
+    installedMcpCfg?.mcpServers?.fast?.tools &&
+    typeof installedMcpCfg.mcpServers.fast.tools === "object"
+      ? installedMcpCfg.mcpServers.fast.tools
+      : {};
+  const eagerToolCount = EXPECTED_MCP_TOOLS.filter(
+    (t) => installedToolsMap?.[t]?.eager === true,
+  ).length;
   const rawHostOverride = process.env.AGY_FAST_HOST?.trim() || "";
   const validHostOverride =
     /^(?:cli|desktop|app|antigravity|ide|unknown)(?:[@\-/\s]v?\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)?$/i.test(
@@ -974,6 +1052,9 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
           ? `OK (${mcpCheck.tools.length} tools: ${mcpCheck.tools.join(", ")})`
           : `FAILED (missing: ${missingTools.join(", ")}; found: ${mcpCheck.tools.join(", ") || "none"})`
       }`,
+    );
+    console.log(
+      `  - Tool loading: ${effectiveToolLoading} (${eagerToolCount}/${EXPECTED_MCP_TOOLS.length} tools eager in mcp_config.json)`,
     );
     console.log(
       `  - Host compat : editsFormat=${effectiveEditsFormat} (active edits schema: ${mcpCheck.applyEditsSchemaType}; host=${hostEnvLabel})`,
@@ -1048,6 +1129,8 @@ async function runInstall(opts) {
   }
 
   await assertSourceFilesPresent(resolvedSrc);
+  const effectiveToolLoading = await resolveEffectiveToolLoading(opts.toolLoading);
+  const installOpts = { ...opts, effectiveToolLoading };
 
   if (sameDirectory) {
     if (!opts.quiet) {
@@ -1075,9 +1158,13 @@ async function runInstall(opts) {
       await snapshotLocalRuleFiles(resolvedDst);
     await removeTargetPath(resolvedDst, dstStat);
     await copyRuntimeFiles(resolvedSrc, resolvedDst);
+    await applyToolLoadingToCopiedPluginDir(resolvedDst, effectiveToolLoading);
     const { restored } = await restoreLocalRuleFiles(resolvedDst, preservedLocalRules);
     if (!opts.quiet) {
       console.log(`Installed agy-fast to ${resolvedDst}`);
+      if (effectiveToolLoading === "lazy") {
+        console.log("Applied MCP tool loading mode: lazy (all 5 tools via call_mcp_tool).");
+      }
       if (restored.length > 0) {
         console.log(
           `Preserved local rule file(s): ${restored.map((n) => `rules/${n}`).join(", ")}`,
@@ -1096,7 +1183,7 @@ async function runInstall(opts) {
   const syncIsolated = isGlobalTarget && !opts.skipAcp;
   const isolatedTargets = syncIsolated ? await discoverIsolatedPluginDirs(resolvedDst) : [];
   for (const isolated of isolatedTargets) {
-    await syncIsolatedPluginDir(resolvedSrc, resolvedDst, isolated, opts);
+    await syncIsolatedPluginDir(resolvedSrc, resolvedDst, isolated, installOpts);
   }
 
   if (hasAgy && !opts.skipEnable && isGlobalTarget) {
@@ -1120,7 +1207,8 @@ async function runInstall(opts) {
     opts.intervalHours !== null ||
     opts.channel ||
     opts.repoUrl ||
-    opts.editsFormat
+    opts.editsFormat ||
+    opts.toolLoading
   ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
@@ -1128,6 +1216,7 @@ async function runInstall(opts) {
     if (opts.channel) patch.channel = opts.channel;
     if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
+    if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -1156,6 +1245,7 @@ async function runConfig(opts) {
   if (opts.channel) patch.channel = opts.channel;
   if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
   if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
+  if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
 
   let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
   let cfg;
@@ -1167,6 +1257,24 @@ async function runConfig(opts) {
     cfg = (await readJsonSafe(cfgPath)) || {};
   }
 
+  let appliedToolLoadingNote = "";
+  if (opts.toolLoading) {
+    const resolvedDst = path.resolve(opts.targetDir);
+    const applyRes = await applyToolLoadingToCopiedPluginDir(resolvedDst, opts.toolLoading);
+    if (applyRes.applied) {
+      const isGlobalTarget = !opts.isProject && !opts.isCustomTarget;
+      if (isGlobalTarget && !opts.skipAcp) {
+        const isolatedTargets = await discoverIsolatedPluginDirs(resolvedDst);
+        for (const iso of isolatedTargets) {
+          await applyToolLoadingToCopiedPluginDir(iso.pluginDir, opts.toolLoading);
+        }
+      }
+      appliedToolLoadingNote = `Applied '${opts.toolLoading}' mode to ${path.join(resolvedDst, "mcp_config.json")} (start a new session to take effect).`;
+    } else if (applyRes.reason === "symlink" || applyRes.reason === "git-clone") {
+      appliedToolLoadingNote = `Saved toolLoading='${opts.toolLoading}' in config.json (skipped rewriting ${resolvedDst}/mcp_config.json because it is a ${applyRes.reason}; edit manually or reinstall as a copied install).`;
+    }
+  }
+
   if (!opts.quiet) {
     console.log(`agy-fast updater config (${cfgPath}):`);
     console.log(`  - autoUpdate        : ${cfg.autoUpdate || "auto"}`);
@@ -1174,6 +1282,10 @@ async function runConfig(opts) {
     console.log(`  - channel           : ${cfg.channel || "release"}`);
     console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
     console.log(`  - editsFormat       : ${cfg.editsFormat || "auto"}`);
+    console.log(`  - toolLoading       : ${cfg.toolLoading || "eager"}`);
+    if (appliedToolLoadingNote) {
+      console.log(`  ${appliedToolLoadingNote}`);
+    }
   }
 }
 
@@ -1186,10 +1298,12 @@ async function runUpdate(opts) {
     );
   }
 
-  if (opts.autoUpdate || opts.intervalHours !== null) {
+  if (opts.autoUpdate || opts.intervalHours !== null || opts.editsFormat || opts.toolLoading) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
     if (opts.intervalHours !== null) patch.checkIntervalHours = opts.intervalHours;
+    if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
+    if (opts.toolLoading) patch.toolLoading = opts.toolLoading;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -1213,6 +1327,9 @@ async function runUpdate(opts) {
     timeout: 60_000,
     windowsHide: true,
   });
+  if (opts.toolLoading && !opts.checkOnly) {
+    await applyToolLoadingToCopiedPluginDir(resolvedDst, opts.toolLoading);
+  }
 
   let parsed = null;
   try {

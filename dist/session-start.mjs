@@ -1458,6 +1458,12 @@ async function writeUpdateState(patch, env = process.env) {
   await writeJsonAtomically(paths.stateFile, merged);
   return merged;
 }
+function parseToolLoadingMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "eager" || v === "lazy") return v;
+  return null;
+}
 async function resolveUpdaterSettings(env = process.env) {
   const cfg = await readUpdaterConfig(env);
   const envMode = parseAutoUpdateMode(env.AGY_FAST_AUTO_UPDATE);
@@ -1469,13 +1475,17 @@ async function resolveUpdaterSettings(env = process.env) {
   const envChan = parseUpdateChannel(env.AGY_FAST_UPDATE_CHANNEL);
   const cfgChan = parseUpdateChannel(cfg.channel);
   const channel = envChan ?? cfgChan ?? "release";
+  const envToolLoading = parseToolLoadingMode(env.AGY_FAST_TOOL_LOADING);
+  const cfgToolLoading = parseToolLoadingMode(cfg.toolLoading);
+  const toolLoading = envToolLoading ?? cfgToolLoading ?? "eager";
   const repoUrl = env.AGY_FAST_REPO?.trim() || cfg.repoUrl?.trim() || DEFAULT_REPO_URL;
   return {
     mode,
     checkIntervalHours,
     checkIntervalMs: Math.round(checkIntervalHours * 3600 * 1e3),
     channel,
-    repoUrl
+    repoUrl,
+    toolLoading
   };
 }
 async function readInstalledVersion(pluginDir) {

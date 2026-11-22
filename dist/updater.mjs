@@ -296,6 +296,13 @@ var UPDATER_OPTIONAL_FILES = [
   "docs/ANALYSIS_REPORT.md",
   "docs/ANALYSIS_REPORT.zh-CN.md"
 ];
+var EAGER_MCP_TOOLS = [
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks"
+];
 function getHomeDir(env = process.env) {
   return process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
 }
@@ -410,6 +417,37 @@ async function writeUpdateState(patch, env = process.env) {
   await writeJsonAtomically(paths.stateFile, merged);
   return merged;
 }
+function parseToolLoadingMode(raw) {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (v === "eager" || v === "lazy") return v;
+  return null;
+}
+async function applyToolLoadingToMcpConfig(pluginDir, mode) {
+  const mcpPath = path2.join(pluginDir, "mcp_config.json");
+  const cfg = await readJsonFile(mcpPath);
+  if (!cfg) return false;
+  const servers = cfg.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    return false;
+  }
+  const fast = servers.fast;
+  if (!fast || typeof fast !== "object" || Array.isArray(fast)) {
+    return false;
+  }
+  const fastObj = fast;
+  if (mode === "lazy") {
+    delete fastObj.tools;
+  } else {
+    const toolsMap = {};
+    for (const tool of EAGER_MCP_TOOLS) {
+      toolsMap[tool] = { eager: true };
+    }
+    fastObj.tools = toolsMap;
+  }
+  await writeJsonAtomically(mcpPath, cfg);
+  return true;
+}
 async function resolveUpdaterSettings(env = process.env) {
   const cfg = await readUpdaterConfig(env);
   const envMode = parseAutoUpdateMode(env.AGY_FAST_AUTO_UPDATE);
@@ -421,13 +459,17 @@ async function resolveUpdaterSettings(env = process.env) {
   const envChan = parseUpdateChannel(env.AGY_FAST_UPDATE_CHANNEL);
   const cfgChan = parseUpdateChannel(cfg.channel);
   const channel = envChan ?? cfgChan ?? "release";
+  const envToolLoading = parseToolLoadingMode(env.AGY_FAST_TOOL_LOADING);
+  const cfgToolLoading = parseToolLoadingMode(cfg.toolLoading);
+  const toolLoading = envToolLoading ?? cfgToolLoading ?? "eager";
   const repoUrl = env.AGY_FAST_REPO?.trim() || cfg.repoUrl?.trim() || DEFAULT_REPO_URL;
   return {
     mode,
     checkIntervalHours,
     checkIntervalMs: Math.round(checkIntervalHours * 3600 * 1e3),
     channel,
-    repoUrl
+    repoUrl,
+    toolLoading
   };
 }
 async function readInstalledVersion(pluginDir) {
@@ -845,6 +887,7 @@ async function runPluginUpdate(opts) {
         );
       }
     } else {
+      await applyToolLoadingToMcpConfig(stagingDir, settings.toolLoading);
       await syncRuntimeFilesAtomically(stagingDir, pluginDir);
     }
     await writeUpdateState(
