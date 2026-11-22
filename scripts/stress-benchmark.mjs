@@ -364,7 +364,7 @@ async function buildLargeMonorepo(rootDir) {
   for (let i = 0; i < NOISE_COUNT; i++) {
     writeTasks.push({
       file: path.join(rootDir, "node_modules/fake-huge-pkg/dist", `bundle_${i}.js`),
-      body: `var NOISE_ONLY_TOKEN = "HOT_STRESS_TOKEN_${i}";`,
+      body: `var NOISE_ONLY_MARKER = "HOT_STRESS_FIXTURE_${i}";`,
     });
   }
 
@@ -429,7 +429,7 @@ async function runScenario1BatchSearch(client, nodeFallbackClient, monoDir) {
     { type: "git", pattern: "status --short" },
     { type: "git", pattern: "log -n 10 --oneline" },
     { type: "git", pattern: "diff --stat" },
-    { type: "text", pattern: "NOISE_ONLY_TOKEN", maxResults: 20 }, // must NOT leak node_modules
+    { type: "text", pattern: "NOISE_ONLY_MARKER", maxResults: 20 }, // must NOT leak node_modules
     { type: "regex", pattern: "minTarget\\(\\)", path: "packages/web/src/components" },
   ];
 
