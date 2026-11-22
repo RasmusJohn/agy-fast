@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
 import { MCP_CALL_BUDGET_SEC } from "./utils/exec-utils.js";
 import {
@@ -19,10 +20,75 @@ import {
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
 const SERVER_VERSION = "0.2.9";
+const DEFAULT_PLUGIN_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 export interface AgyFastServerOptions {
   env?: NodeJS.ProcessEnv;
   configEditsFormat?: EditsFormatMode;
+  processCwd?: () => string;
+  pluginRoot?: string;
+}
+
+function canonicalizeDir(dirPath: string): string {
+  const resolved = path.resolve(dirPath);
+  try {
+    return typeof fs.realpathSync.native === "function"
+      ? fs.realpathSync.native(resolved)
+      : fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isSameOrSubdir(candidate: string, root: string): boolean {
+  const caseInsensitive =
+    process.platform === "win32" || process.platform === "darwin";
+  const normCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
+  const normRoot = caseInsensitive ? root.toLowerCase() : root;
+  const rel = path.relative(normRoot, normCandidate);
+  return (
+    rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
+  );
+}
+
+function isInstalledPluginPath(dirPath: string): boolean {
+  const posix = dirPath.replace(/\\/g, "/");
+  return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
+    posix,
+  );
+}
+
+function detectPluginInstallCwd(
+  env: NodeJS.ProcessEnv,
+  currentCwd: string,
+  scriptPluginRoot: string,
+): string | null {
+  const canonCwd = canonicalizeDir(currentCwd);
+
+  for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
+    if (typeof envRoot === "string" && envRoot.trim()) {
+      const canonEnvRoot = canonicalizeDir(envRoot.trim());
+      if (isSameOrSubdir(canonCwd, canonEnvRoot)) {
+        return envRoot.trim();
+      }
+    }
+  }
+
+  const canonScriptRoot = canonicalizeDir(scriptPluginRoot);
+  if (isSameOrSubdir(canonCwd, canonScriptRoot)) {
+    const isRuntimeOnlyInstall =
+      fs.existsSync(path.join(canonScriptRoot, "plugin.json")) &&
+      !fs.existsSync(path.join(canonScriptRoot, "src", "mcp-server.ts"));
+    if (isInstalledPluginPath(canonScriptRoot) || isRuntimeOnlyInstall) {
+      return scriptPluginRoot;
+    }
+  }
+
+  return null;
 }
 
 function buildApplyEditsToolDefinition(
@@ -94,7 +160,7 @@ function buildApplyEditsToolDefinition(
         cwd: {
           type: "string",
           description:
-            "Base directory for relative file paths and verify command (defaults to the first workspace root).",
+            "Workspace root directory for relative file paths and verify command (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
         },
         edits: editsSchema,
         dryRun: {
@@ -134,6 +200,8 @@ export function createAgyFastServer(
   options: AgyFastServerOptions = {},
 ): McpStdioServer {
   const env = options.env ?? process.env;
+  const getProcessCwd = options.processCwd ?? (() => process.cwd());
+  const scriptPluginRoot = options.pluginRoot ?? DEFAULT_PLUGIN_ROOT;
   const savedEditsFormat =
     options.configEditsFormat ?? readSavedEditsFormatSync(env);
   let hostCompat = resolveHostCompat({
@@ -143,6 +211,7 @@ export function createAgyFastServer(
 
   // agy starts plugin servers in the plugin directory; resolve omitted or relative
   // tool `cwd` values against the first valid workspace root without mutating process.cwd().
+  // Never silently fall back to the installed plugin directory when roots/list is unavailable.
   let defaultCwd: string | undefined;
 
   const resolveToolArgs = <T extends { cwd?: string }>(
@@ -155,18 +224,49 @@ export function createAgyFastServer(
       };
     }
     const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "";
+    const isHomePath =
+      rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
     if (!rawCwd) {
+      if (defaultCwd) {
+        return {
+          ok: true,
+          value: { ...args, cwd: defaultCwd } as unknown as T,
+        };
+      }
+      const pluginFallbackDir = detectPluginInstallCwd(
+        env,
+        getProcessCwd(),
+        scriptPluginRoot,
+      );
+      if (pluginFallbackDir) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Pass the active workspace root explicitly in 'cwd'.`,
+        };
+      }
       return {
         ok: true,
-        value: (defaultCwd ? { ...args, cwd: defaultCwd } : { ...args, cwd: undefined }) as unknown as T,
+        value: { ...args, cwd: undefined } as unknown as T,
       };
     }
-    const isHomePath = rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
-    if (defaultCwd && !path.isAbsolute(rawCwd) && !isHomePath) {
-      return {
-        ok: true,
-        value: { ...args, cwd: path.resolve(defaultCwd, rawCwd) } as unknown as T,
-      };
+    if (!path.isAbsolute(rawCwd) && !isHomePath) {
+      if (defaultCwd) {
+        return {
+          ok: true,
+          value: { ...args, cwd: path.resolve(defaultCwd, rawCwd) } as unknown as T,
+        };
+      }
+      const pluginFallbackDir = detectPluginInstallCwd(
+        env,
+        getProcessCwd(),
+        scriptPluginRoot,
+      );
+      if (pluginFallbackDir) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Received relative cwd: ${JSON.stringify(rawCwd)}.`,
+        };
+      }
     }
     return { ok: true, value: { ...args, cwd: rawCwd } as unknown as T };
   };
@@ -216,7 +316,7 @@ export function createAgyFastServer(
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative paths (defaults to the first workspace root).",
+            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
           },
           queries: {
             type: "array",
@@ -317,7 +417,7 @@ export function createAgyFastServer(
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative paths (defaults to the first workspace root).",
+            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
           },
           outlines: {
             type: "array",
@@ -379,7 +479,7 @@ export function createAgyFastServer(
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative paths (defaults to the first workspace root).",
+            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
           },
           paths: {
             type: "array",
@@ -415,7 +515,7 @@ export function createAgyFastServer(
         properties: {
           cwd: {
             type: "string",
-            description: "Base directory for relative paths (defaults to the first workspace root).",
+            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub).",
           },
           commands: {
             type: "array",

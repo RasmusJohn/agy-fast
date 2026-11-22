@@ -17,6 +17,8 @@ function buildCleanServerEnv(
   delete env.AGY_FAST_HOST;
   delete env.AGY_FAST_EDITS_FORMAT;
   delete env.AGY_FAST_CACHE_DIR;
+  delete env.PLUGIN_ROOT;
+  delete env.AGY_PLUGIN_ROOT;
   for (const [k, v] of Object.entries(extraEnv)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
@@ -873,5 +875,124 @@ describe("MCP Stdio Server end-to-end", () => {
     assert.equal(badFrameBodies.length, 3);
     assert.equal(badFrameBodies.filter((b) => b.id === 1).length, 1);
     assert.equal(badFrameBodies.filter((b) => b.error?.code === -32600).length, 2);
+  });
+
+  it("refuses to silently fall back to PLUGIN_ROOT when cwd is omitted or relative without MCP roots/list (Issue #22)", async () => {
+    const fakeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-hub-cwd-"));
+    const fakePluginDir = path.join(fakeRoot, ".gemini", "config", "plugins", "agy-fast");
+    const realWorkspace = path.join(fakeRoot, "real-workspace");
+    try {
+      await fs.mkdir(path.join(fakePluginDir, "dist"), { recursive: true });
+      await fs.mkdir(realWorkspace, { recursive: true });
+      await fs.copyFile(path.resolve(process.cwd(), "plugin.json"), path.join(fakePluginDir, "plugin.json"));
+      await fs.copyFile(MCP_SERVER_SCRIPT, path.join(fakePluginDir, "dist", "mcp-server.mjs"));
+      await fs.writeFile(path.join(realWorkspace, "app.ts"), "export function hubApp() { return 1; }\n", "utf8");
+
+      const runInPluginDir = (
+        msgs: unknown[],
+        extraEnv: Record<string, string | undefined> = {},
+      ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+        new Promise((resolve, reject) => {
+          const child = spawn(
+            process.execPath,
+            [path.join(fakePluginDir, "dist", "mcp-server.mjs")],
+            {
+              cwd: fakePluginDir,
+              stdio: ["pipe", "pipe", "pipe"],
+              windowsHide: true,
+              env: buildCleanServerEnv(extraEnv),
+            },
+          );
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+          child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+          child.on("error", reject);
+          child.on("close", (code) => resolve({ code, stdout, stderr }));
+          for (const m of msgs) {
+            child.stdin.write(`${JSON.stringify(m)}\n`);
+          }
+          child.stdin.end();
+        });
+
+      // 1. Desktop 2.0 Hub without capabilities.roots: omitted/relative cwd MUST fail fast across all 5 tools,
+      //    while explicit absolute cwd works normally (even when PLUGIN_ROOT env var is not set).
+      const noRootsRes = await runInPluginDir([
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "hub", version: "2.34.0" } },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "batch_search", arguments: { queries: [{ type: "glob", pattern: "**/*" }] } } },
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "run_checks", arguments: { commands: [{ command: "echo hi" }] } } },
+        { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["app.ts"] } } },
+        { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "read_slices", arguments: { cwd: "dist", outlines: ["mcp-server.mjs"] } } },
+        { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "apply_edits", arguments: { edits: [{ path: "rogue.txt", create: "nope" }] } } },
+        { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: realWorkspace, paths: ["app.ts"] } } },
+      ]);
+      assert.equal(noRootsRes.code, 0);
+      assert.equal(noRootsRes.stderr, "");
+      const noRootsLines = noRootsRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      for (const id of [2, 3, 4, 6]) {
+        const resp = noRootsLines.find((l) => l.id === id);
+        assert.equal(resp?.result?.isError, true, `Expected fail-fast error for call id=${id}`);
+        assert.match(resp?.result?.content?.[0]?.text ?? "", /'cwd' is required.*plugin directory/i);
+      }
+      const relResp = noRootsLines.find((l) => l.id === 5);
+      assert.equal(relResp?.result?.isError, true);
+      assert.match(relResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path/i);
+      // Confirm rogue.txt was never created inside the plugin directory
+      await assert.rejects(fs.access(path.join(fakePluginDir, "rogue.txt")));
+      // Explicit absolute cwd works cleanly
+      const explicitResp = noRootsLines.find((l) => l.id === 7);
+      assert.equal(explicitResp?.result?.isError, false);
+      assert.match(explicitResp?.result?.content?.[0]?.text ?? "", /hubApp/);
+
+      // 2. Host that DOES provide MCP roots/list resolves omitted cwd against realWorkspace normally
+      const withRootsRes = await runInPluginDir(
+        [
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: { roots: {} }, clientInfo: { name: "agy", version: "1.6.0" } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quick_outline", arguments: { paths: ["app.ts"] } } },
+          { jsonrpc: "2.0", id: "agy-fast-roots-1", result: { roots: [{ uri: pathToFileURL(realWorkspace).href }] } },
+        ],
+        { PLUGIN_ROOT: fakePluginDir },
+      );
+      assert.equal(withRootsRes.code, 0);
+      const withRootsLines = withRootsRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      const rootCall = withRootsLines.find((l) => l.id === 2);
+      assert.equal(rootCall?.result?.isError, false);
+      assert.match(rootCall?.result?.content?.[0]?.text ?? "", /hubApp/);
+
+      // 3. Host with PLUGIN_ROOT env var set and empty roots: [] still fails fast
+      const emptyRootsRes = await runInPluginDir(
+        [
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-11-25", capabilities: { roots: {} }, clientInfo: { name: "hub", version: "2.34.0" } },
+          },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "batch_search", arguments: { queries: [{ type: "glob", pattern: "**/*" }] } } },
+          { jsonrpc: "2.0", id: "agy-fast-roots-1", result: { roots: [] } },
+        ],
+        { PLUGIN_ROOT: fakePluginDir },
+      );
+      assert.equal(emptyRootsRes.code, 0);
+      const emptyRootsLines = emptyRootsRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      const emptyRootCall = emptyRootsLines.find((l) => l.id === 2);
+      assert.equal(emptyRootCall?.result?.isError, true);
+      assert.match(emptyRootCall?.result?.content?.[0]?.text ?? "", /'cwd' is required.*plugin directory/i);
+    } finally {
+      await fs.rm(fakeRoot, { recursive: true, force: true });
+    }
   });
 });
