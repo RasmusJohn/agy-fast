@@ -55,6 +55,14 @@ irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
 
 > [!TIP]
 > **Desktop 2.0 / IDE 启用提示：** 打开 Antigravity 侧边栏的 **Customizations → Installed**，确认 `agy-fast` 已处于开启状态，然后开启一个**新会话**即可激活启动快照钩子与 MCP 工具。
+>
+> **以无需审批模式启动 `agy` CLI（可选）：** 如果希望在 CLI 中连续调用 `agy-fast` 等工具而不必每次手动确认审批，可使用官方参数启动：
+>
+> ```bash
+> agy --dangerously-skip-permissions
+> ```
+>
+> *（该参数会自动批准所有工具权限请求且不再弹窗询问，建议仅在受信任的代码仓库中使用，或配合 `--sandbox` 一起启用。）*
 
 <details>
 <summary>更多安装方式（本地克隆、直接克隆至插件目录、<code>agy</code> 官方 CLI、按项目团队共享、让 Antigravity 自动安装）</summary>

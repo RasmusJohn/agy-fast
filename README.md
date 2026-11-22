@@ -55,6 +55,14 @@ irm https://raw.githubusercontent.com/INK-Q/agy-fast/main/install.ps1 | iex
 
 > [!TIP]
 > **Activating in Desktop 2.0 / IDE:** Open **Customizations → Installed** in Antigravity, confirm `agy-fast` is enabled, and start a **new session** to load the `SessionStart` hook and MCP tools.
+>
+> **Launching `agy` CLI without approval prompts (optional):** To auto-approve `agy-fast` MCP calls and tool permissions without prompting on every step, start the CLI with:
+>
+> ```bash
+> agy --dangerously-skip-permissions
+> ```
+>
+> *(Official `agy` flag that auto-approves all tool permission requests without prompting — use only in trusted repositories, or pair with `--sandbox`.)*
 
 <details>
 <summary>More installation options (local clone, direct git clone, <code>agy</code> CLI, per-repo team install, or ask Antigravity)</summary>
