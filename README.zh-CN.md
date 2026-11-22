@@ -11,10 +11,12 @@
 **面向 Google Antigravity 的合规延迟、Token 额度与工具调用加速插件**
 
 [![版本](https://img.shields.io/github/v/tag/INK-Q/agy-fast?label=version&sort=semver&style=flat-square&color=38BDF8&labelColor=0F172A)](CHANGELOG.md)
+[![GitHub Stars](https://img.shields.io/github/stars/INK-Q/agy-fast?style=flat-square&color=FACC15&labelColor=0F172A)](https://github.com/INK-Q/agy-fast/stargazers)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-22C55E?style=flat-square&logo=node.js&logoColor=white&labelColor=0F172A)](#快速开始)
 [![零运行期依赖](https://img.shields.io/badge/runtime%20deps-0-38BDF8?style=flat-square&labelColor=0F172A)](#工作原理)
 [![支持平台](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square&labelColor=0F172A)](#快速开始)
 [![MIT 协议](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square&labelColor=0F172A)](LICENSE)
+[![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 
 [English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
@@ -308,6 +310,12 @@ npm test            # 运行单元测试、MCP 协议测试、Hook 测试、基�
 npm run bench:stress # 运行 12 场景端到端压测与性能基准套件
 npm run validate    # 运行 `agy plugin validate --strict .`
 ```
+
+## MCP 目录收录
+
+<a href="https://glama.ai/mcp/servers/INK-Q/agy-fast">
+  <img width="380" src="https://glama.ai/mcp/servers/INK-Q/agy-fast/badge" alt="agy-fast MCP server on Glama" />
+</a>
 
 ## Star History
 

@@ -11,10 +11,12 @@
 **Latency, Token-Quota & Tool-Call Accelerator Plugin for Google Antigravity**
 
 [![Version](https://img.shields.io/github/v/tag/INK-Q/agy-fast?label=version&sort=semver&style=flat-square&color=38BDF8&labelColor=0F172A)](CHANGELOG.md)
+[![GitHub Stars](https://img.shields.io/github/stars/INK-Q/agy-fast?style=flat-square&color=FACC15&labelColor=0F172A)](https://github.com/INK-Q/agy-fast/stargazers)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-22C55E?style=flat-square&logo=node.js&logoColor=white&labelColor=0F172A)](#quick-start)
 [![Runtime Dependencies: 0](https://img.shields.io/badge/runtime%20deps-0-38BDF8?style=flat-square&labelColor=0F172A)](#how-it-works)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square&labelColor=0F172A)](#quick-start)
 [![MIT License](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square&labelColor=0F172A)](LICENSE)
+[![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
 
 English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-world-benchmarks) · [MCP Tools](#the-5-mcp-tools) · [Analysis Report](docs/ANALYSIS_REPORT.md) · [Changelog](CHANGELOG.md)
 
@@ -310,6 +312,12 @@ npm test            # Run unit, MCP protocol, hook, benchmark, and installer tes
 npm run bench:stress # Run 12-scenario end-to-end stress & performance benchmark
 npm run validate    # Run `agy plugin validate --strict .`
 ```
+
+## MCP Directory
+
+<a href="https://glama.ai/mcp/servers/INK-Q/agy-fast">
+  <img width="380" src="https://glama.ai/mcp/servers/INK-Q/agy-fast/badge" alt="agy-fast MCP server on Glama" />
+</a>
 
 ## Star History
 
