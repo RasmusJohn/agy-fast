@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { extractSymbols, runReadSlices } from "../src/tools/read-slices.js";
+import { extractSymbols, runQuickOutline, runReadSlices } from "../src/tools/read-slices.js";
 
 describe("read_slices", () => {
   let tmpDir: string;
@@ -848,5 +848,77 @@ describe("read_slices", () => {
       false,
       "read_slices output must not contain lone UTF-16 surrogates",
     );
+  });
+
+  it("supports quick_outline flat paths API, forgiving aliases, and corrupted-arg circuit-breaking", async () => {
+    const res = await runQuickOutline({
+      cwd: tmpDir,
+      paths: ["sample.ts"],
+    });
+    assert.equal(res.isError, false);
+    assert.match(res.text, /## Outline: sample\.ts/);
+    assert.match(res.text, /\[class\] Server/);
+
+    // Stringified JSON array compatibility
+    const strRes = await runQuickOutline({
+      cwd: tmpDir,
+      paths: '["sample.ts"]' as unknown as string[],
+    });
+    assert.equal(strRes.isError, false);
+    assert.match(strRes.text, /\[class\] Server/);
+
+    // Forgiving alias fallback (`outlines` / `files`) and `paths` precedence
+    const aliasRes = await runQuickOutline({
+      cwd: tmpDir,
+      outlines: ["sample.ts"],
+    } as unknown as Parameters<typeof runQuickOutline>[0]);
+    assert.equal(aliasRes.isError, false);
+    assert.match(aliasRes.text, /\[class\] Server/);
+
+    const filesAliasRes = await runQuickOutline({
+      cwd: tmpDir,
+      files: ["sample.ts"],
+    } as unknown as Parameters<typeof runQuickOutline>[0]);
+    assert.equal(filesAliasRes.isError, false);
+    assert.match(filesAliasRes.text, /\[class\] Server/);
+
+    const precedenceRes = await runQuickOutline({
+      cwd: tmpDir,
+      paths: ["sample.ts"],
+      outlines: ["nonexistent-ignored.ts"],
+    } as unknown as Parameters<typeof runQuickOutline>[0]);
+    assert.equal(precedenceRes.isError, false);
+    assert.match(precedenceRes.text, /\[class\] Server/);
+
+    // Corrupted payloads (including mixed invalid + corrupted arrays) ALWAYS trigger circuit-breaker advice
+    for (const bad of [false, null, "false", "null", [true], [null], [false, ""], ["", false], [123, true], [null, 123]]) {
+      const badRes = await runQuickOutline({
+        cwd: tmpDir,
+        paths: bad as unknown as string[],
+      });
+      assert.equal(badRes.isError, true);
+      assert.match(badRes.text, /serialization corruption detected/i);
+      assert.match(badRes.text, /quick_outline/);
+    }
+
+    // Empty / missing / non-array / blank / >40 paths return clean validation errors
+    for (const invalid of [[], "", "{}", {}, [123], ["   "]]) {
+      const invalidRes = await runQuickOutline({
+        cwd: tmpDir,
+        paths: invalid as unknown as string[],
+      });
+      assert.equal(invalidRes.isError, true);
+      assert.doesNotMatch(invalidRes.text, /serialization corruption detected/i);
+    }
+
+    const missingRes = await runQuickOutline({ cwd: tmpDir });
+    assert.equal(missingRes.isError, true);
+
+    const tooManyRes = await runQuickOutline({
+      cwd: tmpDir,
+      paths: Array.from({ length: 41 }, (_, i) => `f${i}.ts`),
+    });
+    assert.equal(tooManyRes.isError, true);
+    assert.match(tooManyRes.text, /max 40/);
   });
 });

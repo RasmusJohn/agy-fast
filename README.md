@@ -16,7 +16,7 @@
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square&labelColor=0F172A)](#quick-start)
 [![MIT License](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square&labelColor=0F172A)](LICENSE)
 
-English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-world-benchmarks) · [MCP Tools](#the-4-mcp-tools) · [Analysis Report](docs/ANALYSIS_REPORT.md) · [Changelog](CHANGELOG.md)
+English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Benchmarks](#real-world-benchmarks) · [MCP Tools](#the-5-mcp-tools) · [Analysis Report](docs/ANALYSIS_REPORT.md) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -120,10 +120,10 @@ Empirical analysis of **55 real Antigravity sessions** (**8,446 LLM turns**, **1
 | Component | Path | Role |
 | :--- | :--- | :--- |
 | **Plugin Manifest** | [`plugin.json`](plugin.json) | Standard Antigravity manifest; passes `agy plugin validate --strict` |
-| **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 4 eagerly loaded composite tools (`"eager": true`) under `agy-fast_fast` |
-| **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (`~35–50 ms`), emitting a `≤1.5 KB` workspace snapshot |
-| **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~2.2 KB`) routing guide with inlined schemas (zero schema-read turns) |
-| **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 12 h release checker with staged 4-tool MCP smoke verification |
+| **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 5 eagerly loaded composite tools (`"eager": true`) under `agy-fast_fast` |
+| **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (`~35–50 ms`, `250 ms` scan circuit-breaker + OS/home-dir skip list), emitting a `≤1.5 KB` workspace snapshot |
+| **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~6.5 KB`) routing guide with inlined schemas (supports user-owned `rules/AGENTS.local.md` with `trigger: always_on` frontmatter, preserved across updates) |
+| **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 12 h release checker with staged MCP smoke verification |
 | **Offline Benchmark CLI** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | Local `transcript.jsonl` analyzer and before/after A/B comparator |
 
 ## Real-World Benchmarks
@@ -173,15 +173,15 @@ node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --spli
 node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after ./run-after/transcript.jsonl
 ```
 
-## The 4 MCP Tools
+## The 5 MCP Tools
 
 | Scenario | Preferred Tool | Why |
 | :--- | :--- | :--- |
 | Run ≥2 text, regex, glob, fuzzy, or read-only git queries | **`batch_search`** | 1 call for up to 20 concurrent queries (`<70 ms` local) |
-| Map unknown large files (`>300` lines) | **`read_slices`** | Symbol outlines across up to 40 files without full-file dumps |
+| Map unknown large files (`>300` lines) | **`quick_outline`** *(or **`read_slices`**)* | Flat `paths`-only symbol outlines across up to 40 files without full-file dumps |
 | Read small files (`<300` lines) or known line ranges | Built-in `read_file` | Locally allowlisted (`~7 ms`, `46 KB/call`, 0 remote check) |
 | Edit ≥2 hunks/files in one turn, or edit + verify | **`apply_edits`** | Atomic or `bestEffort` multi-file edits + optional inline `verify` |
-| Run ≥2 independent build, lint, test, or diagnostic commands | **`run_checks`** | Concurrent execution with compact error-focused output |
+| Run ≥2 independent build, lint, test, or diagnostic commands | **`run_checks`** | Concurrent execution with head-tail folded error-focused output |
 
 ### 1. `batch_search` — Concurrent Code, Path & Read-Only Git Search
 - **Up to 20 mixed queries per call:** `text`, `regex`, `glob`, `fuzzy`, and read-only `git` (`status`, `diff`, `log`, `show`, `branch`, `rev-parse`, `ls-files`, `blame`, `shortlog`, `describe`, `tag --list`, `remote -v`), including cross-repo lookups via per-query `path`.
@@ -193,13 +193,15 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **Faithful file handling:** Preserves CRLF line endings, file permissions, and symlinks; supports `startLine`/`endLine`, `replaceAll`, `create`/`overwrite`, and `dryRun`.
 - **Inline `verify`:** Optionally runs a build/typecheck/test command right after writing, stripping noisy logs (e.g., Pino/Bunyan info JSON, Maven footers) so root causes stay within budget.
 
-### 3. `read_slices` — Multi-Language Symbol Outlines & Targeted Slices
-- **Up to 40 file outlines per call** *(10–20 recommended per batch)*: Extracts exact `[startLine, endLine]` symbol/section maps for **TypeScript / JavaScript** *(incl. Fastify/Express routes & test blocks)*, **Vue / Svelte SFC**, **CSS / SCSS / Less**, **Python**, **Godot GDScript (`.gd`)**, **Go**, **Rust**, **Java / Kotlin / C# / Swift / C / C++**, **Shell**, **Markdown**, and **JSON / YAML**.
-- **Targeted slices:** Optionally piggyback tiny `[startLine, endLine]` slices in the same call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
+### 3. `quick_outline` — Flat Multi-Language Symbol Outlines
+- **Up to 40 files per call** *(10–20 recommended per batch)*: Takes a flat `paths: string[]` array to extract exact `[startLine, endLine]` symbol/section maps for **TypeScript / JavaScript** *(incl. Fastify/Express routes & test blocks)*, **Vue / Svelte SFC**, **CSS / SCSS / Less**, **Python**, **Godot GDScript (`.gd`)**, **Go**, **Rust**, **Java / Kotlin / C# / Swift / C / C++**, **Shell**, **Markdown**, and **JSON / YAML**—making outline-first exploration effortless before parallel built-in `read_file`.
 
-### 4. `run_checks` — Concurrent Build, Lint, Test & Diagnostic Runner
-- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..170 s`, sharing a `170 s` call budget under Antigravity's `180 s` MCP limit) and ANSI escape stripping.
-- **Adaptive output modes:** `compact` (default) collapses passing commands to 1-line summaries and extracts focused failure traces; `full` preserves stdout for diagnostic or audit scripts within the `≤8.8 KB` inline cap.
+### 4. `read_slices` — Symbol Outlines + Targeted Line Slices
+- **Outlines + piggybacked slices:** Supports the same 14-format outlines plus optional tiny `[startLine, endLine]` slices in one call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
+
+### 5. `run_checks` — Concurrent Build, Lint, Test & Diagnostic Runner
+- **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..170 s`, sharing a `170 s` call budget under Antigravity's `180 s` MCP limit), ANSI escape stripping, and transparent Windows unwrapping of trivial `powershell -Command "..."` wrappers around allowlisted binaries (`git`, `npm`, `node`, `rg`, `pytest`, `cargo`, etc.) to skip PowerShell cold-start overhead while leaving PowerShell cmdlets/aliases untouched.
+- **Head-Tail adaptive output modes:** `compact` (default) collapses passing commands to 1-line summaries and uses **Head-Tail folding** on large failures so both initial root-cause errors and final summary/stack tails survive the `≤8.8 KB` inline cap; `full` preserves stdout for diagnostic or audit scripts with Head-Tail folding when capped.
 
 <details>
 <summary>Example batched MCP calls (JSON payloads)</summary>
@@ -246,7 +248,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 ### Zero-Latency Background Auto-Updater
 
 - **0 ms session startup cost:** Every **12 hours**, `SessionStart` spawns a detached background process (`dist/updater.mjs`) *after* emitting the workspace snapshot.
-- **Verified before swap:** Checks GitHub release tags (`git ls-remote --tags` with GitHub Releases API fallback), clones into an isolated staging directory, runs a **live 4-tool MCP smoke test**, and atomically replaces runtime files—automatically rejecting broken releases.
+- **Verified before swap:** Checks GitHub release tags (`git ls-remote --tags` with GitHub Releases API fallback), clones into an isolated staging directory, runs a **live MCP smoke test**, and atomically replaces runtime files—automatically rejecting broken releases while preserving any user-created `rules/AGENTS.local.md` (add `---\ntrigger: always_on\n---` YAML frontmatter so Antigravity loads it; gitignored for `git clone` installs).
 - **Safe by design:** Standard copied installs and clean direct `git clone` installs auto-update automatically; `--link` dev symlinks and dirty git repos are **never overwritten** (notify-only). A one-time notice appears in the next new session when an update is applied or available.
 
 <details>
@@ -272,7 +274,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **No safety or binary tampering:** Does not patch client binaries, alter authentication, or bypass Antigravity's built-in safety evaluations.
 - **Zero per-step blocking hooks:** Registers no `PreToolUse`, `PostToolUse`, `PreInvocation`, `PostInvocation`, or `Stop` hooks.
 - **Fail-open startup hook:** On unreadable directories or malformed stdin, `SessionStart` returns `{}` and exits cleanly—never blocking a session.
-- **Local-first & auditable:** All 4 MCP tools and the benchmark CLI run 100% locally with zero code or transcript uploads; shipped `dist/*.mjs` bundles are unminified ESM so every executed line is directly auditable.
+- **Local-first & auditable:** All 5 MCP tools and the benchmark CLI run 100% locally with zero code or transcript uploads; shipped `dist/*.mjs` bundles are unminified ESM so every executed line is directly auditable.
 
 ## FAQ
 

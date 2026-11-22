@@ -100,7 +100,7 @@
       <rect x="832" y="77" width="126" height="22" rx="11" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1" />
       <text x="895" y="91.7" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#1D4ED8">0 轮盲读 Schema</text>
     </g>
-    <text x="530" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#475569">内联 4 工具紧凑 Schema，直接发起 call_mcp_tool</text>
+    <text x="530" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#475569">内联 5 工具紧凑 Schema，急加载直调免盲读</text>
     <text x="530" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#64748B">智能合批分流 · &gt;150k 图像隔离 · 损坏参数自动熔断</text>
   </g>
 
@@ -146,13 +146,13 @@
       <rect x="326" y="262" width="3.2" height="68" rx="1.6" fill="#1A88FF" />
       <rect x="339" y="263" width="24" height="24" rx="6" fill="#EFF6FF" />
       <g transform="translate(344, 268)" stroke="#1A88FF" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M2 3h10M2 7h7M5 11h7"/><circle cx="2.5" cy="11" r="0.8" fill="#1A88FF" stroke="none"/></g>
-      <text x="370" y="279" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="13.2" font-weight="700" fill="#0F172A">read_slices</text>
+      <text x="370" y="279" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="13.2" font-weight="700" fill="#0F172A">quick_outline</text>
       
     <g>
       <rect x="493" y="264" width="88" height="21" rx="10.5" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1" />
       <text x="537" y="278.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#1D4ED8">≤40 份大纲</text>
     </g>
-      <text x="341" y="306" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.1" font-weight="500" fill="#475569">14 种格式符号大纲（TS/Py/Java/GD…）</text>
+      <text x="341" y="306" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.1" font-weight="500" fill="#475569">14 种格式符号大纲 + read_slices 精确切片</text>
       <text x="341" y="325" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.5" fill="#64748B">提取精确起止行号 · 杜绝盲读大文件</text>
     </g>
   

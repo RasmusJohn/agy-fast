@@ -23,6 +23,12 @@ export interface ReadSlicesInput {
   maxChars?: number;
 }
 
+export interface QuickOutlineInput {
+  cwd?: string;
+  paths?: string[];
+  maxChars?: number;
+}
+
 export interface SymbolEntry {
   kind: string;
   name: string;
@@ -2011,4 +2017,93 @@ export async function runReadSlices(
     text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
     isError: false,
   };
+}
+
+export async function runQuickOutline(
+  input: QuickOutlineInput,
+): Promise<{ text: string; isError: boolean }> {
+  const rawInput = input as Record<string, unknown> | undefined;
+  const rawPaths =
+    rawInput?.paths !== undefined
+      ? rawInput.paths
+      : rawInput?.outlines !== undefined
+        ? rawInput.outlines
+        : rawInput?.files;
+
+  if (rawPaths === undefined) {
+    return {
+      text: "Error: provide at least one file path in 'paths'.",
+      isError: true,
+    };
+  }
+
+  const parsedPaths = parseMaybeJsonArray(rawPaths);
+  const corruptedItems: CorruptedItem[] = [];
+  let firstInvalidError: string | null = null;
+  if (!parsedPaths.ok) {
+    if (
+      parsedPaths.kind === "corrupted_literal" ||
+      rawPaths === null ||
+      typeof rawPaths === "boolean"
+    ) {
+      corruptedItems.push({
+        label: "paths",
+        value: parsedPaths.kind === "corrupted_literal" ? parsedPaths.value : rawPaths,
+        expected: "an array of file path strings",
+      });
+    } else {
+      firstInvalidError = `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`;
+    }
+  } else {
+    for (let i = 0; i < parsedPaths.value.length; i++) {
+      const item = parsedPaths.value[i];
+      if (item === null || typeof item === "boolean") {
+        corruptedItems.push({
+          label: `paths[${i}]`,
+          value: item,
+          expected: "a non-empty file path string",
+        });
+      } else if (typeof item !== "string" || !item.trim()) {
+        if (firstInvalidError === null) {
+          firstInvalidError = `Error: paths[${i}] must be a non-empty file path string.`;
+        }
+      }
+    }
+  }
+
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "quick_outline",
+        items: corruptedItems,
+        fallbackAdvice:
+          "immediately fall back to parallel built-in read_file(StartLine, EndLine) calls.",
+      }),
+      isError: true,
+    };
+  }
+  if (firstInvalidError !== null) {
+    return { text: firstInvalidError, isError: true };
+  }
+
+  const paths = (parsedPaths as { ok: true; value: string[] }).value;
+  if (paths.length === 0) {
+    return {
+      text: "Error: provide at least one file path in 'paths'.",
+      isError: true,
+    };
+  }
+  if (paths.length > MAX_OUTLINES) {
+    return {
+      text: `Error: limit exceeded (max ${MAX_OUTLINES} paths per call).`,
+      isError: true,
+    };
+  }
+
+  return runReadSlices({
+    cwd: input?.cwd,
+    outlines: paths,
+    maxChars: input?.maxChars,
+  });
 }

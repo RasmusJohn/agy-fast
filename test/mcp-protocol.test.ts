@@ -89,7 +89,7 @@ describe("MCP Stdio Server end-to-end", () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("handles initialize, notifications, ping, tools/list, and all 4 tools over stdio", async () => {
+  it("handles initialize, notifications, ping, tools/list, and all 5 tools over stdio", async () => {
     const msgs = [
       {
         jsonrpc: "2.0",
@@ -163,6 +163,18 @@ describe("MCP Stdio Server end-to-end", () => {
           },
         },
       },
+      {
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: {
+          name: "quick_outline",
+          arguments: {
+            cwd: tmpDir,
+            paths: ["demo.ts"],
+          },
+        },
+      },
     ];
 
     const res = await sendMessagesToServer(
@@ -176,8 +188,8 @@ describe("MCP Stdio Server end-to-end", () => {
       .trim()
       .split("\n")
       .map((l) => JSON.parse(l));
-    // Notification must not emit a response -> 7 responses for ids 1..7
-    assert.equal(responses.length, 7);
+    // Notification must not emit a response -> 8 responses for ids 1..8
+    assert.equal(responses.length, 8);
 
     const byId = new Map<number, Record<string, unknown>>(
       responses.map((r) => [r.id as number, r]),
@@ -199,7 +211,7 @@ describe("MCP Stdio Server end-to-end", () => {
     ).tools;
     assert.deepEqual(
       toolList.map((t) => t.name),
-      ["batch_search", "apply_edits", "read_slices", "run_checks"],
+      ["batch_search", "apply_edits", "read_slices", "quick_outline", "run_checks"],
     );
     // Default (unknown/third-party host) uses token-saving native array schema
     const applySchema = toolList.find((t) => t.name === "apply_edits")?.inputSchema as {
@@ -235,6 +247,12 @@ describe("MCP Stdio Server end-to-end", () => {
       byId.get(7)?.result as { content: Array<{ text: string }> }
     ).content[0]?.text;
     assert.match(checkText ?? "", /Checks: 1\/1 passed/);
+
+    const outlineText = (
+      byId.get(8)?.result as { content: Array<{ text: string }> }
+    ).content[0]?.text;
+    assert.match(outlineText ?? "", /## Outline: demo\.ts/);
+    assert.match(outlineText ?? "", /\[function\] greet/);
   });
 
   it("adapts apply_edits inputSchema dynamically by Antigravity surface/version and honors overrides", async () => {
@@ -395,6 +413,12 @@ describe("MCP Stdio Server end-to-end", () => {
           method: "tools/call",
           params: { name: "read_slices", arguments: { cwd: "sub-root-check", outlines: ["nested.ts"] } },
         },
+        {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: { name: "quick_outline", arguments: { cwd: "sub-root-check", paths: ["nested.ts"] } },
+        },
       ].map((m) => `${JSON.stringify(m)}\n`),
     );
     assert.equal(relRes.code, 0);
@@ -403,6 +427,9 @@ describe("MCP Stdio Server end-to-end", () => {
     const relCall = relLines.find((l) => l.id === 2);
     assert.equal(relCall.result.isError, false);
     assert.match(relCall.result.content[0].text, /nestedFn/);
+    const relQuickCall = relLines.find((l) => l.id === 3);
+    assert.equal(relQuickCall.result.isError, false);
+    assert.match(relQuickCall.result.content[0].text, /nestedFn/);
 
     // Overlapped list_changed + out-of-order replies + malformed roots + unanswered roots must never deadlock or crash
     const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-root2-"));

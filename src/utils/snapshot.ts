@@ -1,13 +1,18 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, type Dirent } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { execBinaryAsync } from "./exec-utils.js";
 import { DEFAULT_IGNORE_DIRS } from "./fs-utils.js";
 import { sliceSafeChars, sliceUtf8Bytes, truncateWithByteNotice } from "./output-filter.js";
+
+export const DEFAULT_SCAN_TIMEOUT_MS = 250;
 
 export interface SnapshotOptions {
   maxChars?: number;
   maxBytes?: number;
   gitTimeoutMs?: number;
+  scanTimeoutMs?: number;
 }
 
 const HARDENED_GIT_BASE_ARGS = [
@@ -153,56 +158,284 @@ const SNAPSHOT_PRIORITY_SUBDIRS = new Set([
   "scripts",
 ]);
 
+const SNAPSHOT_ALWAYS_SKIP_DIRS = new Set([
+  "appdata",
+  "application data",
+  "application support",
+  "local settings",
+  "program files",
+  "program files (x86)",
+  "programdata",
+  "$recycle.bin",
+  "system volume information",
+  "onedrive",
+  "icloud drive",
+  "mobile documents",
+  "creative cloud files",
+  "msocache",
+  "perflogs",
+  "system32",
+  "syswow64",
+  "winsxs",
+]);
+
+const SNAPSHOT_HOME_ROOT_SKIP_DIRS = new Set([
+  "desktop",
+  "documents",
+  "downloads",
+  "pictures",
+  "photos",
+  "movies",
+  "videos",
+  "music",
+  "library",
+  "applications",
+  "public",
+  "favorites",
+  "contacts",
+  "links",
+  "saved games",
+  "searches",
+  "3d objects",
+  "my documents",
+  "my music",
+  "my pictures",
+  "my videos",
+  "nethood",
+  "printhood",
+  "recent",
+  "sendto",
+  "start menu",
+  "templates",
+  "cookies",
+  "documents and settings",
+  "all users",
+  "default user",
+  "recovery",
+  "windows",
+  "users",
+  "intel",
+  "dropbox",
+  "google drive",
+  "parallels",
+  "virtualbox vms",
+  "trash",
+  "proc",
+  "sys",
+  "dev",
+  "mnt",
+  "media",
+  "run",
+  "volumes",
+  "private",
+  "system",
+]);
+
+const DEFAULT_IGNORE_DIRS_LOWER = new Set(
+  [...DEFAULT_IGNORE_DIRS].map((d) => d.toLowerCase()),
+);
+
+const SNAPSHOT_COLLAPSE_DIRS_LOWER = new Set(
+  [...SNAPSHOT_COLLAPSE_DIRS].map((d) => d.toLowerCase()),
+);
+
+const SNAPSHOT_SKIP_FILES = new Set([
+  ".ds_store",
+  "thumbs.db",
+  "desktop.ini",
+  "ntuser.dat",
+  "ntuser.ini",
+]);
+
+function isSystemUserParentPath(p: string): boolean {
+  const lowerPosix = p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return (
+    lowerPosix === "/users" ||
+    lowerPosix === "/home" ||
+    /^[a-z]:\/users$/i.test(lowerPosix) ||
+    /^[a-z]:\/documents and settings$/i.test(lowerPosix)
+  );
+}
+
+function normalizePathForCompare(p: string): string {
+  const resolved = path.resolve(p);
+  const root = path.parse(resolved).root;
+  const trimmed =
+    resolved.length > root.length ? resolved.replace(/[\\/]+$/, "") : resolved;
+  return process.platform === "win32" || process.platform === "darwin"
+    ? trimmed.toLowerCase()
+    : trimmed;
+}
+
+async function boundedRealpath(p: string, deadlineMs?: number): Promise<string> {
+  if (deadlineMs === undefined) {
+    return fs.realpath(p).catch(() => p);
+  }
+  const res = await raceWithDeadline(fs.realpath(p), deadlineMs);
+  return res.ok ? res.value : p;
+}
+
+export async function isHomeOrSystemRoot(
+  workspaceDir: string,
+  deadlineMs?: number,
+): Promise<boolean> {
+  const resolved = path.resolve(workspaceDir);
+  if (path.parse(resolved).root === resolved) return true;
+  if (isSystemUserParentPath(resolved)) return true;
+
+  const homeCandidates = new Set<string>();
+  for (const cand of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+    if (cand && cand.trim()) {
+      homeCandidates.add(path.resolve(cand.trim()));
+    }
+  }
+  const resolvedKey = normalizePathForCompare(resolved);
+  for (const cand of homeCandidates) {
+    if (normalizePathForCompare(cand) === resolvedKey) return true;
+  }
+
+  const candList = [...homeCandidates];
+  const [realWorkspace, ...realCands] = await Promise.all([
+    boundedRealpath(resolved, deadlineMs),
+    ...candList.map((cand) => boundedRealpath(cand, deadlineMs)),
+  ]);
+  if (path.parse(realWorkspace).root === realWorkspace) return true;
+  if (isSystemUserParentPath(realWorkspace)) return true;
+
+  const wsKeys = new Set([resolvedKey, normalizePathForCompare(realWorkspace)]);
+  for (const realCand of realCands) {
+    if (wsKeys.has(normalizePathForCompare(realCand))) return true;
+  }
+  return false;
+}
+
+function isAlwaysSkippedDirName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    SNAPSHOT_ALWAYS_SKIP_DIRS.has(lower) ||
+    lower.startsWith("onedrive - ") ||
+    lower.startsWith("$recycle")
+  );
+}
+
+function isSkippedMetadataFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  return SNAPSHOT_SKIP_FILES.has(lower) || lower.startsWith("ntuser.dat");
+}
+
+function shouldSkipSnapshotEntry(
+  name: string,
+  isDir: boolean,
+  isSymlink: boolean,
+  isHomeRoot: boolean,
+): boolean {
+  const lower = name.toLowerCase();
+  if (isSkippedMetadataFile(name)) {
+    return true;
+  }
+  if (isDir || isSymlink) {
+    if (isAlwaysSkippedDirName(name)) return true;
+    if (isHomeRoot && SNAPSHOT_HOME_ROOT_SKIP_DIRS.has(lower)) return true;
+  }
+  if (isDir) {
+    if (name.startsWith(".")) return true;
+    if (DEFAULT_IGNORE_DIRS_LOWER.has(lower)) return true;
+  }
+  return false;
+}
+
+const TIMEOUT_SENTINEL = Symbol("snapshot-timeout");
+
+async function raceWithDeadline<T>(
+  promise: Promise<T>,
+  deadlineMs: number,
+): Promise<{ ok: true; value: T } | { ok: false; timedOut: boolean }> {
+  const remaining = deadlineMs - performance.now();
+  if (remaining <= 0) {
+    void promise.catch(() => {});
+    return { ok: false, timedOut: true };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+    timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), remaining);
+    timer.unref();
+  });
+  try {
+    const res = await Promise.race([promise, timeoutPromise]);
+    if (res === TIMEOUT_SENTINEL) {
+      void promise.catch(() => {});
+      return { ok: false, timedOut: true };
+    }
+    return { ok: true, value: res };
+  } catch {
+    return { ok: false, timedOut: false };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function isIgnoredSnapshotSubdir(name: string): boolean {
-  if (name.startsWith(".") || DEFAULT_IGNORE_DIRS.has(name)) return true;
+  const lower = name.toLowerCase();
+  if (name.startsWith(".") || DEFAULT_IGNORE_DIRS_LOWER.has(lower)) return true;
+  if (isAlwaysSkippedDirName(name)) return true;
   if (
-    name === "playwright-report" ||
-    name === "test-results" ||
-    name.startsWith("dist-") ||
-    name.startsWith("build-")
+    lower === "playwright-report" ||
+    lower === "test-results" ||
+    lower.startsWith("dist-") ||
+    lower.startsWith("build-")
   ) {
     return true;
   }
   return false;
 }
 
-const MANIFEST_SKIP_SUBDIRS = new Set([
-  "docs",
-  "doc",
-  "assets",
-  "scripts",
-  "test",
-  "tests",
-  "fixtures",
-  "examples",
-  ...SNAPSHOT_COLLAPSE_DIRS,
-]);
+const MANIFEST_SKIP_SUBDIRS_LOWER = new Set(
+  [
+    "docs",
+    "doc",
+    "assets",
+    "scripts",
+    "test",
+    "tests",
+    "fixtures",
+    "examples",
+    ...SNAPSHOT_COLLAPSE_DIRS,
+  ].map((d) => d.toLowerCase()),
+);
 
 function shortEntryName(name: string, maxLen = 28): string {
   return name.length > maxLen ? `${sliceSafeChars(name, maxLen - 3)}...` : name;
 }
 
-async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
-  let topEntries;
-  try {
-    topEntries = await fs.readdir(workspaceDir, { withFileTypes: true });
-  } catch {
-    return null;
+async function getTwoLevelTree(
+  workspaceDir: string,
+  topRes: { ok: true; value: Dirent[] } | { ok: false; timedOut: boolean },
+  isHomeRoot: boolean,
+  deadlineMs: number,
+): Promise<string | null> {
+  if (!topRes.ok) {
+    return topRes.timedOut
+      ? "Layout (2 levels):\n  ... (scan timed out)"
+      : null;
   }
+  const topEntries = topRes.value;
 
   const filteredTop = topEntries
-    .filter((e) => {
-      if (e.name === ".DS_Store") return false;
-      if (e.isDirectory()) {
-        if (e.name.startsWith(".")) return false;
-        if (DEFAULT_IGNORE_DIRS.has(e.name)) return false;
-      }
-      return true;
-    })
+    .filter(
+      (e) =>
+        !shouldSkipSnapshotEntry(
+          e.name,
+          e.isDirectory(),
+          e.isSymbolicLink(),
+          isHomeRoot,
+        ),
+    )
     .sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
-      const aCollapse = a.isDirectory() && SNAPSHOT_COLLAPSE_DIRS.has(a.name);
-      const bCollapse = b.isDirectory() && SNAPSHOT_COLLAPSE_DIRS.has(b.name);
+      const aCollapse =
+        a.isDirectory() && SNAPSHOT_COLLAPSE_DIRS_LOWER.has(a.name.toLowerCase());
+      const bCollapse =
+        b.isDirectory() && SNAPSHOT_COLLAPSE_DIRS_LOWER.has(b.name.toLowerCase());
       if (aCollapse !== bCollapse) return aCollapse ? 1 : -1;
       return a.name.localeCompare(b.name);
     });
@@ -213,26 +446,68 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
 
-  const subResults = await Promise.all(
-    shownTop.map(async (entry) => {
-      if (!entry.isDirectory()) {
-        return {
-          name: shortEntryName(entry.name),
-          isDir: false,
-          collapsedCount: null as number | null,
-          children: [] as string[],
-          more: 0,
-        };
-      }
-      try {
-        const sub = await fs.readdir(path.join(workspaceDir, entry.name), {
-          withFileTypes: true,
-        });
-        const valid = sub
+  const subResults = new Array<{
+    name: string;
+    isDir: boolean;
+    collapsedCount: number | null;
+    children: string[];
+    more: number;
+    timedOut: boolean;
+  }>(shownTop.length);
+
+  let nextIdx = 0;
+  const workerCount = Math.min(4, shownTop.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const idx = nextIdx++;
+        if (idx >= shownTop.length) break;
+        const entry = shownTop[idx]!;
+        if (!entry.isDirectory()) {
+          subResults[idx] = {
+            name: shortEntryName(entry.name),
+            isDir: false,
+            collapsedCount: null,
+            children: [],
+            more: 0,
+            timedOut: false,
+          };
+          continue;
+        }
+        if (performance.now() >= deadlineMs) {
+          subResults[idx] = {
+            name: `${entry.name}/`,
+            isDir: true,
+            collapsedCount: null,
+            children: [],
+            more: 0,
+            timedOut: true,
+          };
+          continue;
+        }
+        const subRes = await raceWithDeadline(
+          fs.readdir(path.join(workspaceDir, entry.name), {
+            withFileTypes: true,
+          }),
+          deadlineMs,
+        );
+        if (!subRes.ok) {
+          subResults[idx] = {
+            name: `${entry.name}/`,
+            isDir: true,
+            collapsedCount: null,
+            children: [],
+            more: 0,
+            timedOut: subRes.timedOut,
+          };
+          continue;
+        }
+        const valid = subRes.value
           .filter(
             (s) =>
-              s.name !== ".DS_Store" &&
-              !(s.isDirectory() && isIgnoredSnapshotSubdir(s.name)),
+              !isSkippedMetadataFile(s.name) &&
+              !(s.isDirectory() && isIgnoredSnapshotSubdir(s.name)) &&
+              !(s.isSymbolicLink() && isAlwaysSkippedDirName(s.name)),
           )
           .sort((a, b) => {
             if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
@@ -243,40 +518,37 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
             }
             return a.name.localeCompare(b.name);
           });
-        if (SNAPSHOT_COLLAPSE_DIRS.has(entry.name)) {
-          return {
+        if (SNAPSHOT_COLLAPSE_DIRS_LOWER.has(entry.name.toLowerCase())) {
+          subResults[idx] = {
             name: `${entry.name}/`,
             isDir: true,
             collapsedCount: valid.length,
-            children: [] as string[],
+            children: [],
             more: 0,
+            timedOut: false,
           };
+          continue;
         }
         const maxSub = 6;
         const children = valid.slice(0, maxSub).map((s) => {
           const base = shortEntryName(s.name);
           return s.isDirectory() ? `${base}/` : base;
         });
-        return {
+        subResults[idx] = {
           name: `${entry.name}/`,
           isDir: true,
-          collapsedCount: null as number | null,
+          collapsedCount: null,
           children,
           more: Math.max(0, valid.length - maxSub),
-        };
-      } catch {
-        return {
-          name: `${entry.name}/`,
-          isDir: true,
-          collapsedCount: null as number | null,
-          children: [],
-          more: 0,
+          timedOut: false,
         };
       }
     }),
   );
 
+  let timedOutDirs = 0;
   for (const item of subResults) {
+    if (item.timedOut) timedOutDirs++;
     if (!item.isDir) {
       lines.push(`  ${item.name}`);
     } else if (item.collapsedCount !== null) {
@@ -291,6 +563,11 @@ async function getTwoLevelTree(workspaceDir: string): Promise<string | null> {
 
   if (filteredTop.length > maxTop) {
     lines.push(`  ... (+${filteredTop.length - maxTop} more top-level entries)`);
+  }
+  if (timedOutDirs > 0) {
+    lines.push(
+      `  ... (${timedOutDirs} dir${timedOutDirs === 1 ? "" : "s"} skipped; scan timed out)`,
+    );
   }
 
   return `Layout (2 levels):\n${lines.join("\n")}`;
@@ -426,34 +703,48 @@ async function detectManifestsInDir(
   return hints;
 }
 
-async function getProjectManifestSummary(workspaceDir: string): Promise<string | null> {
-  const rootHints = await detectManifestsInDir(workspaceDir, "");
-  const allHints = [...rootHints];
+async function getProjectManifestSummary(
+  workspaceDir: string,
+  topRes: { ok: true; value: Dirent[] } | { ok: false; timedOut: boolean },
+  isHomeRoot: boolean,
+  deadlineMs: number,
+): Promise<string | null> {
+  const rootRes = await raceWithDeadline(
+    detectManifestsInDir(workspaceDir, ""),
+    deadlineMs,
+  );
+  const allHints = rootRes.ok ? [...rootRes.value] : [];
 
   // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/)
-  try {
-    const entries = await fs.readdir(workspaceDir, { withFileTypes: true });
-    const subdirs = entries
+  if (performance.now() < deadlineMs && topRes.ok) {
+    const subdirs = topRes.value
       .filter(
         (e) =>
           e.isDirectory() &&
-          !e.name.startsWith(".") &&
-          !DEFAULT_IGNORE_DIRS.has(e.name) &&
-          !MANIFEST_SKIP_SUBDIRS.has(e.name),
+          !shouldSkipSnapshotEntry(e.name, true, false, isHomeRoot) &&
+          !MANIFEST_SKIP_SUBDIRS_LOWER.has(e.name.toLowerCase()),
       )
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, 8);
 
-    const nested = await Promise.all(
-      subdirs.map((d) =>
-        detectManifestsInDir(path.join(workspaceDir, d.name), `${d.name}/`),
-      ),
+    let nextIdx = 0;
+    const workerCount = Math.min(4, subdirs.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const idx = nextIdx++;
+          if (idx >= subdirs.length || performance.now() >= deadlineMs) break;
+          const d = subdirs[idx]!;
+          const res = await raceWithDeadline(
+            detectManifestsInDir(path.join(workspaceDir, d.name), `${d.name}/`),
+            deadlineMs,
+          );
+          if (res.ok) {
+            allHints.push(...res.value);
+          }
+        }
+      }),
     );
-    for (const list of nested) {
-      allHints.push(...list);
-    }
-  } catch {
-    // ignore
   }
 
   if (allHints.length === 0) return null;
@@ -520,18 +811,29 @@ export async function buildWorkspaceSnapshot(
       ? Math.max(0, Math.trunc(options.maxBytes))
       : maxChars;
   const gitTimeoutMs = options.gitTimeoutMs ?? 800;
+  const scanTimeoutMs =
+    typeof options.scanTimeoutMs === "number" && Number.isFinite(options.scanTimeoutMs)
+      ? Math.max(1, Math.trunc(options.scanTimeoutMs))
+      : DEFAULT_SCAN_TIMEOUT_MS;
+  const scanDeadline = performance.now() + scanTimeoutMs;
 
-  try {
-    const stat = await fs.stat(workspaceDir);
-    if (!stat.isDirectory()) return null;
-  } catch {
-    return null;
-  }
+  const statRes = await raceWithDeadline(fs.stat(workspaceDir), scanDeadline);
+  if (!statRes.ok || !statRes.value.isDirectory()) return null;
+
+  // Start git summary in parallel with home-root detection and shared root readdir
+  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs);
+  const [isHomeRoot, topRes] = await Promise.all([
+    isHomeOrSystemRoot(workspaceDir, scanDeadline),
+    raceWithDeadline(
+      fs.readdir(workspaceDir, { withFileTypes: true }),
+      scanDeadline,
+    ),
+  ]);
 
   const [gitSummary, treeSummary, projectSummary] = await Promise.all([
-    getGitSummary(workspaceDir, gitTimeoutMs),
-    getTwoLevelTree(workspaceDir),
-    getProjectManifestSummary(workspaceDir),
+    gitPromise,
+    getTwoLevelTree(workspaceDir, topRes, isHomeRoot, scanDeadline),
+    getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, scanDeadline),
   ]);
 
   const header = `[agy-fast startup snapshot] Workspace: ${workspaceDir}`;

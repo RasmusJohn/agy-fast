@@ -12,7 +12,17 @@ import {
   parseWindowsCodePage,
   resetWindowsShellCache,
   resolveWindowsPowerShell,
+  unwrapTrivialWindowsPowerShellCommand,
 } from "../src/utils/exec-utils.js";
+import {
+  fitSectionsToByteBudget,
+  sliceSafeCharsTail,
+  sliceUtf8BytesTail,
+  truncateHeadTailWithByteNotice,
+  truncateHeadTailWithNotice,
+  truncateWithByteNotice,
+  truncateWithNotice,
+} from "../src/utils/output-filter.js";
 
 describe("run_checks", () => {
   const nodeBin = JSON.stringify(process.execPath);
@@ -322,6 +332,172 @@ describe("run_checks", () => {
     // GBK bytes for "'x' 不是"
     const gbk = Buffer.from("27782720b2bbcac7", "hex");
     assert.equal(decodeProcessOutput(gbk, false, "gb18030"), "'x' 不是");
+  });
+
+  it("folds oversized command output with Head-Tail preservation and UTF-8/surrogate safety", async () => {
+    const loneSurrogateRe =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+    // Direct unit checks on Head-Tail helpers (ASCII, CJK, 4-byte emoji)
+    const lines = [
+      "HEAD_ROOT_CAUSE: TypeError at src/app.ts:12",
+      ...Array.from({ length: 80 }, (_, i) => `middle noise line ${i}: ${"x".repeat(40)}`),
+      "TAIL_FINAL_SUMMARY: 1 failed, 42 passed (1.2s)",
+    ];
+    const bigText = lines.join("\n");
+    const folded = truncateHeadTailWithNotice(bigText, 420);
+    assert.ok(folded.length <= 420, `expected <=420 chars, got ${folded.length}`);
+    assert.match(folded, /HEAD_ROOT_CAUSE/);
+    assert.match(folded, /\[truncated: folded \d+ middle chars; total \d+ chars\]/);
+    assert.match(folded, /TAIL_FINAL_SUMMARY/);
+
+    const emojiText = "头部日志🚀\n" + "中间数据🔥测试".repeat(200) + "\n尾部汇总✅完成";
+    const foldedBytes = truncateHeadTailWithByteNotice(emojiText, 260);
+    assert.ok(
+      Buffer.byteLength(foldedBytes, "utf8") <= 260,
+      `expected <=260 UTF-8 bytes, got ${Buffer.byteLength(foldedBytes, "utf8")}`,
+    );
+    assert.match(foldedBytes, /头部日志/);
+    assert.match(foldedBytes, /\[truncated: folded \d+ middle bytes; total \d+ bytes\]/);
+    assert.match(foldedBytes, /尾部汇总✅完成/);
+    assert.equal(loneSurrogateRe.test(foldedBytes), false);
+
+    // Tail slicers never create lone UTF-16 surrogates
+    assert.equal(loneSurrogateRe.test(sliceSafeCharsTail("a" + "🚀".repeat(20), 5)), false);
+    assert.equal(loneSurrogateRe.test(sliceUtf8BytesTail("a" + "🚀".repeat(20), 6)), false);
+    assert.ok(Buffer.byteLength(sliceUtf8BytesTail("中文🚀测试", 7), "utf8") <= 7);
+
+    // fitSectionsToByteBudget in head-tail mode preserves head + tail under tight byte cap
+    const fitted = fitSectionsToByteBudget([emojiText], 500, 260, "\n\n", "head-tail");
+    assert.ok(Buffer.byteLength(fitted, "utf8") <= 260);
+    assert.match(fitted, /头部日志/);
+    assert.match(fitted, /尾部汇总✅完成/);
+
+    // Multi-section fitSectionsToByteBudget where BOTH maxChars and maxBytes bind must preserve all section headers
+    const multiMixed = fitSectionsToByteBudget(
+      [
+        "## [FAIL] check-1\n" + "a".repeat(4500),
+        "## [FAIL] check-2\n" + "b".repeat(4500),
+        "## [FAIL] check-3\n" + "中".repeat(450) + "c".repeat(6000),
+      ],
+      8000,
+      8800,
+      "\n\n",
+      "head-tail",
+    );
+    assert.ok(multiMixed.length <= 8000);
+    assert.ok(Buffer.byteLength(multiMixed, "utf8") <= 8800);
+    assert.match(multiMixed, /## \[FAIL\] check-1/);
+    assert.match(multiMixed, /## \[FAIL\] check-2/);
+    assert.match(multiMixed, /## \[FAIL\] check-3/);
+
+    // Tight budgets on huge inputs never produce 0-content notices
+    const tinyCharTrunc = truncateWithNotice("a".repeat(1_000_000), 49);
+    assert.ok(tinyCharTrunc.length <= 49);
+    assert.ok(!tinyCharTrunc.startsWith("\n... [truncated: showed 0"));
+    const tinyByteTrunc = truncateWithByteNotice("a".repeat(1_000_000), 56);
+    assert.ok(Buffer.byteLength(tinyByteTrunc, "utf8") <= 56);
+    assert.ok(!tinyByteTrunc.startsWith("\n... [truncated: showed 0"));
+
+    // End-to-end run_checks compact + full modes preserve actual stdout/stderr head AND tail
+    // (dynamic token construction ensures tokens never appear in the echoed `$ node -e ...` line)
+    const script = [
+      "const h = String.fromCharCode(70,73,82,83,84) + '_OUT_HEAD';",
+      "const t = String.fromCharCode(84,65,73,76) + '_OUT_END';",
+      "console.error(h + ': Error in module A');",
+      "for (let i = 0; i < 60; i++) console.error('Error: duplicate noisy failure line ' + i + ' ' + 'z'.repeat(60));",
+      "console.error(t + ': 61 errors found in suite');",
+      "process.exit(1);",
+    ].join(" ");
+    const compactRes = await runChecks({
+      outputMode: "compact",
+      maxChars: 900,
+      commands: [{ name: "head-tail-compact", command: `${nodeBin} -e ${JSON.stringify(script)}` }],
+    });
+    assert.equal(compactRes.isError, false);
+    assert.ok(compactRes.text.length <= 900);
+    assert.match(compactRes.text, /FIRST_OUT_HEAD: Error in module A/);
+    assert.match(compactRes.text, /\[truncated: folded \d+ middle chars; total [3-9]\d{3,} chars\]/);
+    assert.match(compactRes.text, /TAIL_OUT_END: 61 errors found in suite/);
+
+    const fullRes = await runChecks({
+      outputMode: "full",
+      maxChars: 900,
+      commands: [{ name: "head-tail-full", command: `${nodeBin} -e ${JSON.stringify(script)}` }],
+    });
+    assert.equal(fullRes.isError, false);
+    assert.ok(fullRes.text.length <= 900);
+    assert.match(fullRes.text, /FIRST_OUT_HEAD: Error in module A/);
+    assert.match(fullRes.text, /\[truncated: folded \d+ middle chars; total [3-9]\d{3,} chars\]/);
+    assert.match(fullRes.text, /TAIL_OUT_END: 61 errors found in suite/);
+  });
+
+  it("transparently unwraps only safe Windows powershell -Command wrappers around allowlisted CLI binaries", () => {
+    // Safe allowlisted single-command wrappers -> unwrapped
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand('powershell -Command "git status --short"'),
+      "git status --short",
+    );
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand('powershell.exe -NoProfile -NonInteractive -NoLogo -c "npm test"'),
+      "npm test",
+    );
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand("pwsh -NoP -Command 'rg \"foo bar\" src'"),
+      'rg "foo bar" src',
+    );
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand("powershell -NoProfile -Command git log -n 5 --oneline"),
+      "git log -n 5 --oneline",
+    );
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand('pwsh.exe -c "pytest -q tests/test_auth.py"'),
+      "pytest -q tests/test_auth.py",
+    );
+    assert.equal(
+      unwrapTrivialWindowsPowerShellCommand('powershell -Command "go test ./..."'),
+      "go test ./...",
+    );
+
+    // Unsafe aliases, cmdlets, pipes, env vars, quoting edge cases, or extra flags -> NEVER unwrapped
+    const mustKeepOriginal = [
+      'powershell -Command "del temp.txt"',
+      'powershell -Command "rm -Recurse -Force build"',
+      'powershell -Command "ls -la"',
+      'powershell -Command "dir"',
+      'powershell -Command "echo hello"',
+      'powershell -Command "curl https://example.com"',
+      'powershell -Command "Get-ChildItem | Select-Object -First 5"',
+      'powershell -Command "git status | findstr M"',
+      'powershell -Command "git status && npm test"',
+      'powershell -Command "git status; npm test"',
+      'powershell -Command "git status > out.txt"',
+      'powershell -Command "git log -n 5 --format=%H"',
+      `powershell -Command "git log -n 5 --format='%h %s'"`,
+      'powershell -Command "node -e $env:FOO"',
+      'powershell -Command "git status" && echo done',
+      'powershell -ExecutionPolicy Bypass -Command "git status"',
+      'powershell -File build.ps1',
+      'powershell -EncodedCommand Z2l0IHN0YXR1cw==',
+      'powershell -WorkingDirectory C:\\repo -Command "git status"',
+      'powershell -Command "git.ps1 status"',
+      'powershell -Command "./git status"',
+      'powershell -Command "node -e \\"console.log(1)\\""',
+      "powershell -Command 'rg \"foo\\\\\" src'",
+      'powershell -Command "rg foo\\\\"',
+      'powershell -Command "rg foo\\\\\\\\"',
+      'powershell -Command "rg \u2018foo bar\u2019 src"',
+      'powershell -Command "git log \u2013oneline"',
+      'powershell -Command "git\u00a0status"',
+      "git status --short",
+    ];
+    for (const cmd of mustKeepOriginal) {
+      assert.equal(
+        unwrapTrivialWindowsPowerShellCommand(cmd),
+        cmd,
+        `Must NOT unwrap: ${cmd}`,
+      );
+    }
   });
 
   if (process.platform === "win32") {

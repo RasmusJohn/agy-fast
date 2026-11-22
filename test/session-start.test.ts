@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
+import { buildWorkspaceSnapshot, isHomeOrSystemRoot } from "../src/utils/snapshot.js";
 
 const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
 
@@ -422,5 +423,96 @@ describe("session-start hook", () => {
     );
     const overrideStrMsg: string = JSON.parse(overrideStrRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
     assert.match(overrideStrMsg, /\[agy-fast compat\] host=cli@1\.5\.13/);
+  });
+
+  it("skips OS/cloud blacklist dirs always, protects home-root dirs only on $HOME, and trips scan timeout cleanly", async () => {
+    // 1. Normal project repo: OS blacklist (AppData, OneDrive) skipped, but legitimate public/ & documents/ preserved
+    const projDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-proj-bl-"));
+    const fakeHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-fake-home-"));
+    try {
+      for (const d of ["src", "public", "documents", "recovery", "AppData", "OneDrive", "OneDrive - Acme", "$RECYCLE.BIN"]) {
+        await fs.mkdir(path.join(projDir, d), { recursive: true });
+      }
+      await fs.writeFile(path.join(projDir, "public", "index.html"), "<html/>", "utf8");
+      await fs.writeFile(path.join(projDir, "src", "app.ts"), "export const x = 1;\n", "utf8");
+      const projSnap = await buildWorkspaceSnapshot(projDir);
+      assert.ok(projSnap);
+      assert.match(projSnap, /public\//);
+      assert.match(projSnap, /documents\//);
+      assert.match(projSnap, /recovery\//);
+      assert.match(projSnap, /src\//);
+      assert.doesNotMatch(projSnap, /AppData/);
+      assert.doesNotMatch(projSnap, /OneDrive/);
+      assert.doesNotMatch(projSnap, /\$RECYCLE\.BIN/);
+
+      // 2. When workspaceDir IS $HOME: Desktop/Documents/Downloads/Library/Public/Recovery/AppData/NTUSER.DAT* are skipped
+      for (const d of ["Desktop", "Documents", "Downloads", "Library", "Pictures", "Public", "Recovery", "AppData", "OneDrive", "my-app"]) {
+        await fs.mkdir(path.join(fakeHomeDir, d), { recursive: true });
+      }
+      await fs.writeFile(path.join(fakeHomeDir, "NTUSER.DAT"), "reg", "utf8");
+      await fs.writeFile(path.join(fakeHomeDir, "NTUSER.DAT{016888bd-6c6f-11de-8d1d-001e0bcde3ec}.TM.blf"), "reg", "utf8");
+      await fs.writeFile(path.join(fakeHomeDir, "my-app", "package.json"), '{"name":"my-app"}', "utf8");
+      // Also test symlinked Application Data junction-like entry
+      await fs.symlink(
+        path.join(fakeHomeDir, "AppData"),
+        path.join(fakeHomeDir, "Application Data"),
+        process.platform === "win32" ? "junction" : "dir",
+      ).catch(() => {});
+
+      const homeHookRes = await runHook(JSON.stringify({ cwd: fakeHomeDir }), {
+        HOME: fakeHomeDir,
+        USERPROFILE: fakeHomeDir,
+      });
+      assert.equal(homeHookRes.code, 0);
+      const homeMsg: string = JSON.parse(homeHookRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.ok(homeMsg);
+      assert.match(homeMsg, /my-app\//);
+      assert.doesNotMatch(homeMsg, /Desktop\//);
+      assert.doesNotMatch(homeMsg, /Documents\//);
+      assert.doesNotMatch(homeMsg, /Downloads\//);
+      assert.doesNotMatch(homeMsg, /Library\//);
+      assert.doesNotMatch(homeMsg, /Pictures\//);
+      assert.doesNotMatch(homeMsg, /Public\//);
+      assert.doesNotMatch(homeMsg, /Recovery\//);
+      assert.doesNotMatch(homeMsg, /AppData/);
+      assert.doesNotMatch(homeMsg, /Application Data/);
+      assert.doesNotMatch(homeMsg, /OneDrive/);
+      assert.doesNotMatch(homeMsg, /NTUSER\.DAT/);
+
+      // Verify isHomeOrSystemRoot directly on filesystem root
+      assert.equal(await isHomeOrSystemRoot(path.parse(projDir).root), true);
+      assert.equal(await isHomeOrSystemRoot(projDir), false);
+
+      // 3. Scan timeout circuit-breaker bounds latency cleanly on slow directories
+      const origReaddir = fs.readdir as (...args: unknown[]) => Promise<unknown>;
+      const slowChildPath = path.join(projDir, "src");
+      (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = (
+        p: unknown,
+        ...rest: unknown[]
+      ) => {
+        if (String(p) === slowChildPath) {
+          return new Promise<unknown>((resolve, reject) => {
+            const t = setTimeout(() => {
+              origReaddir(p, ...rest).then(resolve, reject);
+            }, 300);
+            t.unref();
+          });
+        }
+        return origReaddir(p, ...rest);
+      };
+      try {
+        const start = Date.now();
+        const timedSnap = await buildWorkspaceSnapshot(projDir, { scanTimeoutMs: 30 });
+        const elapsed = Date.now() - start;
+        assert.ok(timedSnap);
+        assert.ok(elapsed < 220, `Expected timeout circuit-breaker <220ms, got ${elapsed}ms`);
+        assert.match(timedSnap, /scan timed out/);
+      } finally {
+        (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddir;
+      }
+    } finally {
+      await fs.rm(projDir, { recursive: true, force: true });
+      await fs.rm(fakeHomeDir, { recursive: true, force: true });
+    }
   });
 });

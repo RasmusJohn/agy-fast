@@ -47,7 +47,7 @@ describe("installer", () => {
       { env, encoding: "utf8" },
     );
     assert.match(out1, /Installed agy-fast/);
-    assert.match(out1, /MCP server\s+: OK \(4 tools:/);
+    assert.match(out1, /MCP server\s+: OK \(5 tools:/);
     assert.match(out1, /SessionStart: OK/);
 
     // Verify all runtime files (including installer for self-doctor) are present and no node_modules copied
@@ -68,13 +68,13 @@ describe("installer", () => {
     }
     await assert.rejects(fs.stat(path.join(expectedDir, "node_modules")));
 
-    // Verify installed mcp_config.json enables eager tool loading for all 4 tools
+    // Verify installed mcp_config.json enables eager tool loading for all 5 tools
     const installedMcpCfg = JSON.parse(
       await fs.readFile(path.join(expectedDir, "mcp_config.json"), "utf8"),
     ) as {
       mcpServers?: { fast?: { tools?: Record<string, { eager?: boolean }> } };
     };
-    for (const toolName of ["batch_search", "apply_edits", "read_slices", "run_checks"]) {
+    for (const toolName of ["batch_search", "apply_edits", "read_slices", "quick_outline", "run_checks"]) {
       assert.equal(
         installedMcpCfg.mcpServers?.fast?.tools?.[toolName]?.eager,
         true,
@@ -510,6 +510,108 @@ describe("installer", () => {
     } finally {
       await fs.unlink(linkHome).catch(() => {});
       await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves user-authored rules/*.local.md across re-installs while skipping symlinks and oversized files", async () => {
+    const localRulesHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-local-rules-"));
+    const externalSecret = path.join(localRulesHome, "outside-secret.txt");
+    try {
+      const env = makeIsolatedEnv(localRulesHome);
+      const pluginDir = path.join(localRulesHome, ".gemini", "config", "plugins", "agy-fast");
+      await fs.writeFile(externalSecret, "do-not-copy", "utf8");
+
+      // Initial install
+      execFileSync(process.execPath, [INSTALL_SCRIPT, "install", "--no-enable"], {
+        env,
+        encoding: "utf8",
+      });
+
+      // Create user-authored local rules (ASCII + Unicode), plus unsafe symlink & >256KB file
+      const localRulePath = path.join(pluginDir, "rules", "AGENTS.local.md");
+      const unicodeRulePath = path.join(pluginDir, "rules", "团队规范.local.md");
+      const symlinkRulePath = path.join(pluginDir, "rules", "evil.local.md");
+      const hugeRulePath = path.join(pluginDir, "rules", "huge.local.md");
+      await fs.writeFile(
+        localRulePath,
+        "---\ntrigger: always_on\n---\n# My Local Rules\nAlways run pytest.\n",
+        "utf8",
+      );
+      await fs.writeFile(
+        unicodeRulePath,
+        "---\ntrigger: always_on\n---\n# 团队规则\n",
+        "utf8",
+      );
+      await fs.writeFile(hugeRulePath, "x".repeat(300 * 1024), "utf8");
+      await fs.symlink(externalSecret, symlinkRulePath).catch(() => {});
+
+      // Re-install over existing directory
+      const reinstallOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable"],
+        { env, encoding: "utf8" },
+      );
+      assert.match(reinstallOut, /Preserved local rule file\(s\):/);
+      assert.match(reinstallOut, /Skipped unsafe\/oversized local rule file\(s\):/);
+      assert.equal(
+        await fs.readFile(localRulePath, "utf8"),
+        "---\ntrigger: always_on\n---\n# My Local Rules\nAlways run pytest.\n",
+      );
+      assert.equal(
+        await fs.readFile(unicodeRulePath, "utf8"),
+        "---\ntrigger: always_on\n---\n# 团队规则\n",
+      );
+      await assert.rejects(fs.lstat(symlinkRulePath));
+      await assert.rejects(fs.lstat(hugeRulePath));
+
+      // Migrating an existing copied isolated GEMINI_HOME profile to symlink preserves its unique rules/*.local.md into primary
+      const isoGemini = path.join(localRulesHome, "custom-gemini");
+      const isoPluginDir = path.join(isoGemini, "config", "plugins", "agy-fast");
+      await fs.mkdir(path.join(isoPluginDir, "rules"), { recursive: true });
+      await fs.writeFile(path.join(isoPluginDir, "plugin.json"), '{"name":"agy-fast","version":"0.2.8"}\n', "utf8");
+      await fs.writeFile(
+        path.join(isoPluginDir, "rules", "iso-extra.local.md"),
+        "---\ntrigger: always_on\n---\n# Isolated rule\n",
+        "utf8",
+      );
+      const isoSyncOut = execFileSync(
+        process.execPath,
+        [INSTALL_SCRIPT, "install", "--no-enable"],
+        { env: makeIsolatedEnv(localRulesHome, { GEMINI_HOME: isoGemini }), encoding: "utf8" },
+      );
+      assert.match(isoSyncOut, /Migrated isolated local rule file\(s\) to primary plugin dir: rules\/iso-extra\.local\.md/);
+      assert.equal(
+        await fs.readFile(path.join(pluginDir, "rules", "iso-extra.local.md"), "utf8"),
+        "---\ntrigger: always_on\n---\n# Isolated rule\n",
+      );
+
+      // When rules/*.local.md lacks YAML frontmatter, doctor surfaces agy validate output + actionable frontmatter hint
+      let hasAgy = false;
+      try {
+        execFileSync("agy", ["--version"], { stdio: "ignore" });
+        hasAgy = true;
+      } catch {
+        hasAgy = false;
+      }
+      if (hasAgy) {
+        await fs.writeFile(localRulePath, "# Missing frontmatter\n", "utf8");
+        let doctorErrOut = "";
+        try {
+          execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
+            env,
+            encoding: "utf8",
+            stdio: "pipe",
+          });
+          assert.fail("Expected doctor to fail when local rule lacks frontmatter");
+        } catch (err) {
+          const e = err as { stdout?: string; stderr?: string };
+          doctorErrOut = `${e.stdout ?? ""}\n${e.stderr ?? ""}`;
+        }
+        assert.match(doctorErrOut, /agy validate: FAILED/);
+        assert.match(doctorErrOut, /trigger: always_on/);
+      }
+    } finally {
+      await fs.rm(localRulesHome, { recursive: true, force: true });
     }
   });
 });

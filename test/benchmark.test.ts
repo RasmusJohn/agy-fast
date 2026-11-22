@@ -10,6 +10,7 @@ import {
   analyzeTranscriptSessions,
   collectTranscriptFiles,
   filterStepsByTime,
+  formatMetricsMarkdown,
   parseTranscriptJsonl,
 } from "../src/benchmark-core.js";
 
@@ -1100,5 +1101,30 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(directWorkerMetrics.sessions, 1);
     assert.equal(directWorkerMetrics.swarmWorkerSessions, 1);
     assert.equal(directWorkerMetrics.sessionsWithSnapshot, 1);
+
+    // 4. quick_outline accounting (eager + lazy + corrupted) and Head-Tail folded truncation detection
+    const outlineSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-20T11:00:00Z",
+          output_tokens: 120,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_quick_outline", args: { paths: ["src/a.ts", "src/b.ts"] } },
+            { name: "call_mcp_tool", args: { ServerName: '"agy-fast_fast"', ToolName: '"quick_outline"', Arguments: '{"paths":false}' } },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-20T11:00:02Z",
+          content: "HEAD\n... [truncated: folded 1200 middle chars; total 2000 chars] ...\nTAIL",
+        }),
+      ].join("\n"),
+    );
+    const outlineMetrics = analyzeTranscriptSessions([outlineSteps]);
+    assert.equal(outlineMetrics.agyFastToolCalls.quick_outline, 2);
+    assert.equal(outlineMetrics.agyCorruptedArgCalls, 1);
+    assert.equal(outlineMetrics.agyTruncatedCalls, 1);
+    assert.match(formatMetricsMarkdown(outlineMetrics), /outline:2/);
   });
 });

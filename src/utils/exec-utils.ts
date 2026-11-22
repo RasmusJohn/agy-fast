@@ -220,6 +220,158 @@ const PS_NON_INVOCATION_TAIL_RE =
 const PS_UTF8_PREFIX =
   "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
 
+const WINDOWS_PS_WRAPPER_BIN_RE =
+  /^(?:"(?:pwsh|powershell)(?:\.exe)?"|'(?:pwsh|powershell)(?:\.exe)?'|(?:pwsh|powershell)(?:\.exe)?)(?=\s)/i;
+
+const WINDOWS_PS_BENIGN_FLAGS = new Set([
+  "-noprofile",
+  "-nop",
+  "-noninteractive",
+  "-noni",
+  "-nologo",
+  "-nol",
+]);
+
+const WINDOWS_UNWRAP_SAFE_BINS = new Set([
+  "git",
+  "rg",
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "bun",
+  "deno",
+  "python",
+  "python3",
+  "py",
+  "pip",
+  "pip3",
+  "pytest",
+  "uv",
+  "ruff",
+  "mypy",
+  "flake8",
+  "black",
+  "go",
+  "cargo",
+  "rustc",
+  "rustup",
+  "java",
+  "javac",
+  "mvn",
+  "gradle",
+  "tsc",
+  "tsx",
+  "eslint",
+  "prettier",
+  "vitest",
+  "jest",
+  "biome",
+  "dotnet",
+  "cmake",
+  "make",
+  "ninja",
+  "gcc",
+  "g++",
+  "clang",
+  "gh",
+  "docker",
+  "kubectl",
+  "terraform",
+  "agy",
+]);
+
+const WINDOWS_UNWRAP_FORBIDDEN_META_RE =
+  /[|;&><`$(){}@%!^*\r\n'#,?\[\]~\x00-\x08\x0b\x0c\x0e-\x1f\u0085\u00a0\u2013-\u2015\u2018-\u201f\u2028\u2029\u3000]/;
+
+function hasSafeBalancedDoubleQuotes(text: string): boolean {
+  if (/\\+"/.test(text)) return false;
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"') count++;
+  }
+  return count % 2 === 0;
+}
+
+/**
+ * Unwraps trivial `powershell -Command "..."` / `pwsh -c "..."` wrappers around
+ * single allowlisted cross-platform CLI binaries (e.g. `git`, `npm`, `node`,
+ * `rg`, `pytest`, `cargo`) so Windows avoids paying PowerShell startup latency.
+ *
+ * PowerShell cmdlets, aliases (`del`, `rm`, `ls`, `echo`, `curl`, etc.), pipes,
+ * redirections, variables, quoting edge cases, or non-benign PowerShell flags
+ * are NEVER unwrapped so shell semantics remain 100% faithful.
+ */
+export function unwrapTrivialWindowsPowerShellCommand(command: string): string {
+  const trimmed = command.trim();
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return command;
+
+  let rest = trimmed.slice(binMatch[0].length);
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return command;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return command;
+    const tok = tokMatch[1]!;
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return command;
+      sawCommandFlag = true;
+      break;
+    }
+    if (!WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      return command;
+    }
+  }
+  if (!sawCommandFlag) return command;
+
+  const payload = rest.trim();
+  if (!payload) return command;
+
+  let inner: string;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    if (payload.length < 2 || payload.indexOf(quote, 1) !== payload.length - 1) {
+      return command;
+    }
+    const rawInner = payload.slice(1, -1);
+    if (quote === '"' && rawInner.endsWith("\\")) {
+      return command;
+    }
+    inner = rawInner.trim();
+    if (quote === "'" && inner.includes('"') && !hasSafeBalancedDoubleQuotes(inner)) {
+      return command;
+    }
+  } else {
+    if (/^[-&./\\]/.test(payload)) return command;
+    if (payload.includes('"') && !hasSafeBalancedDoubleQuotes(payload)) {
+      return command;
+    }
+    inner = payload;
+  }
+
+  if (!inner || WINDOWS_UNWRAP_FORBIDDEN_META_RE.test(inner)) {
+    return command;
+  }
+
+  const firstTok = /^(\S+)/.exec(inner)?.[1];
+  if (!firstTok || !/^[A-Za-z0-9_+.-]+$/.test(firstTok)) {
+    return command;
+  }
+  const baseBin = firstTok.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, "");
+  if (!WINDOWS_UNWRAP_SAFE_BINS.has(baseBin)) {
+    return command;
+  }
+  if (needsPowerShellOnWindows(inner)) {
+    return command;
+  }
+  return inner;
+}
+
 function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
   let out = "";
   let quote: '"' | "'" | null = null;
@@ -420,17 +572,21 @@ export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
-  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
-    const psBin = await resolveWindowsPowerShell();
-    if (psBin) {
-      const utf8Command = buildPowerShellUtf8Command(command);
-      return spawnAndCollect(
-        cachedWindowsPowerShellExecPath ?? psBin,
-        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
-        false,
-        options,
-      );
+  if (process.platform === "win32") {
+    const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    if (needsPowerShellOnWindows(effectiveCommand)) {
+      const psBin = await resolveWindowsPowerShell();
+      if (psBin) {
+        const utf8Command = buildPowerShellUtf8Command(effectiveCommand);
+        return spawnAndCollect(
+          cachedWindowsPowerShellExecPath ?? psBin,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          options,
+        );
+      }
     }
+    return spawnAndCollect(effectiveCommand, [], true, options);
   }
   return spawnAndCollect(command, [], true, options);
 }

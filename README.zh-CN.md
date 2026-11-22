@@ -16,7 +16,7 @@
 [![支持平台](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square&labelColor=0F172A)](#快速开始)
 [![MIT 协议](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square&labelColor=0F172A)](LICENSE)
 
-[English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#4-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
+[English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -120,10 +120,10 @@ node scripts/install.mjs install --project /path/to/your-repo
 | 模块 | 文件路径 | 作用 |
 | :--- | :--- | :--- |
 | **原生插件清单** | [`plugin.json`](plugin.json) | 符合官方规范的元数据，通过 `agy plugin validate --strict` 零警告校验 |
-| **本地常驻 MCP 服务** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 常驻本地进程，在 `agy-fast_fast` 下以急加载（`"eager": true`）暴露 4 个强类型合并工具 |
-| **会话启动快照钩子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 仅在 `SessionStart` 运行一次（`~35–50 ms`），注入 `≤1.5 KB` 项目/Git/目录快照 |
-| **工具路由与卫生规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 `2.2 KB` 精简路由规则，内联 4 工具参数签名，免去懒加载盲读 Schema 轮次 |
-| **后台自动更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 12 小时分离式后台检查，先暂存执行 4 工具 MCP 冒烟校验再原子替换 |
+| **本地常驻 MCP 服务** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 常驻本地进程，在 `agy-fast_fast` 下以急加载（`"eager": true`）暴露 5 个强类型合并工具 |
+| **会话启动快照钩子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 仅在 `SessionStart` 运行一次（`~35–50 ms`，内置 `250 ms` 扫描熔断与系统/用户目录黑名单），注入 `≤1.5 KB` 项目/Git/目录快照 |
+| **工具路由与卫生规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 `6.5 KB` 精简路由规则，内联参数签名（支持自定义 `rules/AGENTS.local.md`，需带 `trigger: always_on` frontmatter，更新与重装自动保留） |
+| **后台自动更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 12 小时分离式后台检查，先暂存执行 MCP 冒烟校验再原子替换 |
 | **离线基准测试工具** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | 本地解析 `transcript.jsonl` 并输出单次指标或前后 A/B 对比 |
 
 ## 实测数据
@@ -171,15 +171,15 @@ node dist/benchmark.mjs analyze --local --since 2026-11-19T12:51:00+08:00 --spli
 node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./after/transcript.jsonl
 ```
 
-## 4 个核心 MCP 工具
+## 5 个核心 MCP 工具
 
 | 任务场景 | 推荐工具 | 核心原因 |
 | :--- | :--- | :--- |
 | 执行 ≥2 条文本、正则、Glob、模糊路径或只读 Git 查询 | **`batch_search`** | 1 次调用并发跑最多 20 条查询（本地 `<70 ms`） |
-| 摸清未知大文件结构（`>300` 行） | **`read_slices`** | 单次提取最多 40 个文件符号大纲，避免盲读整文件 |
+| 摸清未知大文件结构（`>300` 行） | **`quick_outline`** *（或 **`read_slices`**）* | 扁平 `paths` 参数一次提取最多 40 个文件符号大纲，避免盲读整文件 |
 | 读取小文件（`<300` 行）或已知行号区间 | 内置 `read_file` | 本地白名单直放（`~7 ms`、单次 `46 KB`、零远端校验） |
 | 同轮多处/跨文件编辑，或“编辑 + 校验” | **`apply_edits`** | 原子或 `bestEffort` 落盘 + 可选内联 `verify` |
-| 执行 ≥2 条独立构建、检查、测试或诊断命令 | **`run_checks`** | 受控并发执行，紧凑提取核心报错 |
+| 执行 ≥2 条独立构建、检查、测试或诊断命令 | **`run_checks`** | 受控并发执行，头尾折叠提取核心报错与测试汇总 |
 
 ### 1. `batch_search` — 并发代码检索、模糊路径与只读 Git 查询
 - **单次最多 20 条混合查询**：支持 `text`、`regex`、`glob`、`fuzzy` 与只读 `git`（`status`、`diff`、`log`、`show`、`branch`、`rev-parse`、`ls-files`、`blame`、`shortlog`、`describe`、`tag --list`、`remote -v`），并支持按条传入 `path` 跨目录/跨仓库查询。
@@ -191,13 +191,15 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **无损保留文件属性**：保留 CRLF 换行符、文件权限与软链接；支持 `startLine`/`endLine`、`replaceAll`、`create`/`overwrite` 与 `dryRun`。
 - **可选内联 `verify`**：落盘后直接执行构建/类型检查/测试命令，自动过滤 Pino/Bunyan info JSON 与 Maven 尾注噪声，保留核心报错根因。
 
-### 3. `read_slices` — 多语言符号大纲与精确切片读取
-- **单次最多 40 个文件大纲** *（推荐 10–20 个/批）*：精准提取起止行号，覆盖 **TypeScript / JavaScript** *（含 Fastify/Express 路由与测试块）*、**Vue / Svelte SFC**、**CSS / SCSS / Less**、**Python**、**Godot GDScript（`.gd`）**、**Go**、**Rust**、**Java / Kotlin / C# / Swift / C / C++**、**Shell**、**Markdown** 与 **JSON / YAML**。
-- **精确行段切片**：可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
+### 3. `quick_outline` — 极简多语言符号大纲提取
+- **扁平参数，单次最多 40 个文件** *（推荐 10–20 个/批）*：仅需传入扁平 `paths: string[]` 即可提取起止行号，覆盖 **TypeScript / JavaScript** *（含 Fastify/Express 路由与测试块）*、**Vue / Svelte SFC**、**CSS / SCSS / Less**、**Python**、**Godot GDScript（`.gd`）**、**Go**、**Rust**、**Java / Kotlin / C# / Swift / C / C++**、**Shell**、**Markdown** 与 **JSON / YAML**，配合并行内置 `read_file` 极简顺手。
 
-### 4. `run_checks` — 并发构建、规范检查、测试与诊断执行器
-- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）与 ANSI 转义符清理。
-- **双输出模式**：默认 `compact` 模式将通过项折叠为 1 行摘要、失败时聚焦根因堆栈；`full` 模式在 `≤8.8 KB` 预算内保留完整标准输出，适合诊断与巡检脚本。
+### 4. `read_slices` — 符号大纲 + 精确行段切片
+- **大纲与小切片合一**：支持同等 14 种格式符号大纲，并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
+
+### 5. `run_checks` — 并发构建、规范检查、测试与诊断执行器
+- **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。
+- **头尾折叠（Head-Tail）双输出模式**：默认 `compact` 模式将通过项折叠为 1 行摘要、超长失败日志采用**头尾折叠**（同时保留首条根因报错与末尾测试汇总/堆栈尾部）；`full` 模式在 `≤8.8 KB` 预算内保留标准输出，超限时同样采用头尾折叠。
 
 <details>
 <summary>批量 MCP 调用示例（JSON 参数）</summary>
@@ -244,7 +246,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 ### 零启动延迟的后台自动更新
 
 - **0 ms 启动阻塞**：每 **12 小时**在 `SessionStart` 吐出快照*之后*，异步拉起完全分离的后台更新进程（`dist/updater.mjs`）。
-- **先验证、再原子替换**：优先通过 `git ls-remote --tags`（无 `git` 时回退 GitHub Releases API）检测新版本，克隆至隔离暂存目录并完成 **4 工具实时 MCP 冒烟校验**后，再按文件原子替换；损坏版本会被自动拦截。
+- **先验证、再原子替换**：优先通过 `git ls-remote --tags`（无 `git` 时回退 GitHub Releases API）检测新版本，克隆至隔离暂存目录并完成 **MCP 实时冒烟校验**后，再按文件原子替换；损坏版本会被自动拦截，且用户自定义的 `rules/AGENTS.local.md`（需带 `---\ntrigger: always_on\n---` YAML frontmatter 以便 Antigravity 加载，已加入 `.gitignore`）在自动更新与手动重装时均会被完整保留。
 - **安全保护**：常规复制安装与干净的直接 `git clone` 安装会自动更新；`--link` 开发软链接与有未提交改动的仓库**绝不覆盖**（仅提示有新版本）。更新完成后将在下一次新会话开头展示一次性提示。
 
 <details>
@@ -287,7 +289,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 同时支持 **Antigravity CLI（`agy`）**、**Antigravity Desktop 2.0** 与 **Antigravity IDE**，兼容 **macOS、Linux 与 Windows**。仅需 **Node.js >= 20** 且零运行期依赖（可选安装 `ripgrep`/`rg`，缺失时自动回退纯 Node.js）。
 
 ### `agy-fast` 会向外部上传代码或会话日志吗？
-不会。全部 4 个 MCP 工具、`SessionStart` 快照以及离线基准测试均 100% 在本机运行。唯一的可选外网动作是每 12 小时检查一次 GitHub 公开 Release 标签以支持自动更新，可随时通过 `config --auto-update off` 或 `AGY_FAST_AUTO_UPDATE=off` 完全关闭。
+不会。全部 5 个 MCP 工具、`SessionStart` 快照以及离线基准测试均 100% 在本机运行。唯一的可选外网动作是每 12 小时检查一次 GitHub 公开 Release 标签以支持自动更新，可随时通过 `config --auto-update off` 或 `AGY_FAST_AUTO_UPDATE=off` 完全关闭。
 
 ### 如何验证本机加速效果或彻底卸载？
 运行 `node dist/benchmark.mjs analyze --local --split-usage` 即可纯离线统计本机日志的前后对比。随时可执行 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` 一键干净卸载。

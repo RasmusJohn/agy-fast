@@ -13,6 +13,8 @@ import {
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
   normalizeTerminalOutput,
+  sliceSafeChars,
+  truncateHeadTailWithNotice,
   truncateWithByteNotice,
   truncateWithNotice,
 } from "../utils/output-filter.js";
@@ -241,31 +243,53 @@ export async function runChecks(
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
 
-  // Allocate larger output share to failing checks than passing checks
-  const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget =
-    failedCount > 0
-      ? Math.max(
-          160,
-          Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount),
-        )
-      : 320;
-  const fullPerCmdBudget = Math.max(
-    160,
-    Math.floor(usableChars / outcomes.length),
-  );
+  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
+  const bodyByteBudget =
+    maxBytes !== undefined
+      ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2)
+      : undefined;
+  const sepOverhead = Math.max(0, (outcomes.length - 1) * 2);
+  const effectiveBlocksBudget = Math.max(0, bodyBudget - sepOverhead);
 
-  const blocks = outcomes.map(({ spec, result, passed }) => {
-    if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
-    const badge = result.error
-      ? "ERROR"
-      : result.timedOut
-        ? "TIMEOUT"
-        : passed
-          ? "PASS"
-          : `FAIL (exit ${result.exitCode ?? "err"})`;
+  const formatCmdHeaderPrefix = (
+    headerLine: string,
+    cmd: string,
+    blockShare: number,
+  ): string => {
+    const fullPrefix = `${headerLine}\n$ ${cmd}\n`;
+    const maxPrefixLen = Math.max(
+      headerLine.length + 24,
+      Math.floor(blockShare * 0.35),
+    );
+    if (fullPrefix.length <= maxPrefixLen) {
+      return fullPrefix;
+    }
+    const maxCmdChars = Math.max(20, maxPrefixLen - headerLine.length - 4);
+    const displayCmd =
+      cmd.length <= maxCmdChars
+        ? cmd
+        : `${sliceSafeChars(cmd, Math.max(8, maxCmdChars - 3))}...`;
+    return `${headerLine}\n$ ${displayCmd}\n`;
+  };
 
-    if (outputMode === "full") {
+  let blocks: string[];
+  if (outputMode === "full") {
+    const perFullShare = Math.max(
+      120,
+      Math.floor(effectiveBlocksBudget / outcomes.length),
+    );
+    blocks = outcomes.map(({ spec, result, passed }) => {
+      if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
+      const badge = result.error
+        ? "ERROR"
+        : result.timedOut
+          ? "TIMEOUT"
+          : passed
+            ? "PASS"
+            : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
+      const prefix = formatCmdHeaderPrefix(headerLine, spec.command, perFullShare);
+      const bodyLimit = Math.max(60, perFullShare - prefix.length);
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr),
@@ -274,35 +298,73 @@ export async function runChecks(
         .join("\n");
       const body = result.error
         ? `spawn error: ${result.error}`
-        : truncateWithNotice(combined || "(no output)", fullPerCmdBudget);
-      return `## [${badge}] ${spec.name} (${result.durationMs}ms)\n$ ${spec.command}\n${body}`;
-    }
-
-    const body = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: passed ? 300 : failedBudget,
+        : truncateHeadTailWithNotice(combined || "(no output)", bodyLimit);
+      return `${prefix}${body}`;
     });
-
-    if (passed) {
-      return `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+  } else {
+    // Format passing & not-run blocks first so failing checks get exact remaining space
+    // after subtracting headers and separators (preventing double head-tail truncation).
+    const preformatted = new Array<string | null>(outcomes.length).fill(null);
+    let fixedChars = 0;
+    for (let i = 0; i < outcomes.length; i++) {
+      const { spec, result, passed } = outcomes[i]!;
+      if (!result) {
+        const block = `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
+        preformatted[i] = block;
+        fixedChars += block.length;
+      } else if (passed) {
+        const body = formatCompactCommandOutput({
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          error: result.error,
+          maxChars: 300,
+        });
+        const block = `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+        preformatted[i] = block;
+        fixedChars += block.length;
+      }
     }
-    return `## [${badge} ${result.durationMs}ms] ${spec.name}\n$ ${spec.command}\n${body}`;
-  });
 
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget =
-    maxBytes !== undefined
-      ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2)
-      : undefined;
+    const perFailShare =
+      failedCount > 0
+        ? Math.max(
+            120,
+            Math.floor((effectiveBlocksBudget - fixedChars) / failedCount),
+          )
+        : 320;
+
+    blocks = outcomes.map(({ spec, result }, idx) => {
+      const existing = preformatted[idx];
+      if (existing != null) return existing;
+      const res = result!;
+      const badge = res.error
+        ? "ERROR"
+        : res.timedOut
+          ? "TIMEOUT"
+          : `FAIL (exit ${res.exitCode ?? "err"})`;
+      const headerLine = `## [${badge} ${res.durationMs}ms] ${spec.name}`;
+      const prefix = formatCmdHeaderPrefix(headerLine, spec.command, perFailShare);
+      const failBodyLimit = Math.max(60, perFailShare - prefix.length);
+      const body = formatCompactCommandOutput({
+        stdout: res.stdout,
+        stderr: res.stderr,
+        exitCode: res.exitCode,
+        timedOut: res.timedOut,
+        error: res.error,
+        maxChars: failBodyLimit,
+      });
+      return `${prefix}${body}`;
+    });
+  }
+
   const fittedBlocks = fitSectionsToByteBudget(
     blocks,
     bodyBudget,
     bodyByteBudget,
     "\n\n",
+    "head-tail",
   );
   let text = truncateWithNotice(
     `${summaryHeader}\n\n${fittedBlocks}`,

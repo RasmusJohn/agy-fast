@@ -689,6 +689,136 @@ var WINDOWS_PS_CMDLET_RE = /(?:^|[;|&({\r\n]\s*)(?:Get|Set|New|Remove|Test|Selec
 var EXPLICIT_POWERSHELL_INVOCATION_RE = /^\s*(?:["']?)(?:pwsh|powershell)(?:\.exe)?(?:["']?)(?:\s|$)/i;
 var PS_NON_INVOCATION_TAIL_RE = /^(?:[|;&+}=),*?]|(?:[1-6*])?>|-(?:c|i)?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|replace|split|join|in|notin|contains|notcontains|is|isnot|as|and|or|xor|shl|shr|band|bor|bxor)\b|-f\b|$)/i;
 var PS_UTF8_PREFIX = "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false);";
+var WINDOWS_PS_WRAPPER_BIN_RE = /^(?:"(?:pwsh|powershell)(?:\.exe)?"|'(?:pwsh|powershell)(?:\.exe)?'|(?:pwsh|powershell)(?:\.exe)?)(?=\s)/i;
+var WINDOWS_PS_BENIGN_FLAGS = /* @__PURE__ */ new Set([
+  "-noprofile",
+  "-nop",
+  "-noninteractive",
+  "-noni",
+  "-nologo",
+  "-nol"
+]);
+var WINDOWS_UNWRAP_SAFE_BINS = /* @__PURE__ */ new Set([
+  "git",
+  "rg",
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "bun",
+  "deno",
+  "python",
+  "python3",
+  "py",
+  "pip",
+  "pip3",
+  "pytest",
+  "uv",
+  "ruff",
+  "mypy",
+  "flake8",
+  "black",
+  "go",
+  "cargo",
+  "rustc",
+  "rustup",
+  "java",
+  "javac",
+  "mvn",
+  "gradle",
+  "tsc",
+  "tsx",
+  "eslint",
+  "prettier",
+  "vitest",
+  "jest",
+  "biome",
+  "dotnet",
+  "cmake",
+  "make",
+  "ninja",
+  "gcc",
+  "g++",
+  "clang",
+  "gh",
+  "docker",
+  "kubectl",
+  "terraform",
+  "agy"
+]);
+var WINDOWS_UNWRAP_FORBIDDEN_META_RE = /[|;&><`$(){}@%!^*\r\n'#,?\[\]~\x00-\x08\x0b\x0c\x0e-\x1f\u0085\u00a0\u2013-\u2015\u2018-\u201f\u2028\u2029\u3000]/;
+function hasSafeBalancedDoubleQuotes(text) {
+  if (/\\+"/.test(text)) return false;
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"') count++;
+  }
+  return count % 2 === 0;
+}
+function unwrapTrivialWindowsPowerShellCommand(command) {
+  const trimmed = command.trim();
+  const binMatch = WINDOWS_PS_WRAPPER_BIN_RE.exec(trimmed);
+  if (!binMatch) return command;
+  let rest = trimmed.slice(binMatch[0].length);
+  let sawCommandFlag = false;
+  while (true) {
+    rest = rest.trimStart();
+    if (!rest) return command;
+    const tokMatch = /^(\S+)/.exec(rest);
+    if (!tokMatch) return command;
+    const tok = tokMatch[1];
+    const lower = tok.toLowerCase();
+    rest = rest.slice(tok.length);
+    if (lower === "-command" || lower === "-c") {
+      if (!/^\s/.test(rest)) return command;
+      sawCommandFlag = true;
+      break;
+    }
+    if (!WINDOWS_PS_BENIGN_FLAGS.has(lower)) {
+      return command;
+    }
+  }
+  if (!sawCommandFlag) return command;
+  const payload = rest.trim();
+  if (!payload) return command;
+  let inner;
+  if (payload[0] === '"' || payload[0] === "'") {
+    const quote = payload[0];
+    if (payload.length < 2 || payload.indexOf(quote, 1) !== payload.length - 1) {
+      return command;
+    }
+    const rawInner = payload.slice(1, -1);
+    if (quote === '"' && rawInner.endsWith("\\")) {
+      return command;
+    }
+    inner = rawInner.trim();
+    if (quote === "'" && inner.includes('"') && !hasSafeBalancedDoubleQuotes(inner)) {
+      return command;
+    }
+  } else {
+    if (/^[-&./\\]/.test(payload)) return command;
+    if (payload.includes('"') && !hasSafeBalancedDoubleQuotes(payload)) {
+      return command;
+    }
+    inner = payload;
+  }
+  if (!inner || WINDOWS_UNWRAP_FORBIDDEN_META_RE.test(inner)) {
+    return command;
+  }
+  const firstTok = /^(\S+)/.exec(inner)?.[1];
+  if (!firstTok || !/^[A-Za-z0-9_+.-]+$/.test(firstTok)) {
+    return command;
+  }
+  const baseBin = firstTok.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, "");
+  if (!WINDOWS_UNWRAP_SAFE_BINS.has(baseBin)) {
+    return command;
+  }
+  if (needsPowerShellOnWindows(inner)) {
+    return command;
+  }
+  return inner;
+}
 function stripQuotedSpans(command, stripDoubleQuotes) {
   let out = "";
   let quote = null;
@@ -846,17 +976,21 @@ async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   return pendingWindowsPowerShellProbe;
 }
 async function runShellCommandAsync(command, options) {
-  if (process.platform === "win32" && needsPowerShellOnWindows(command)) {
-    const psBin = await resolveWindowsPowerShell();
-    if (psBin) {
-      const utf8Command = buildPowerShellUtf8Command(command);
-      return spawnAndCollect(
-        cachedWindowsPowerShellExecPath ?? psBin,
-        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
-        false,
-        options
-      );
+  if (process.platform === "win32") {
+    const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
+    if (needsPowerShellOnWindows(effectiveCommand)) {
+      const psBin = await resolveWindowsPowerShell();
+      if (psBin) {
+        const utf8Command = buildPowerShellUtf8Command(effectiveCommand);
+        return spawnAndCollect(
+          cachedWindowsPowerShellExecPath ?? psBin,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
+          false,
+          options
+        );
+      }
     }
+    return spawnAndCollect(effectiveCommand, [], true, options);
   }
   return spawnAndCollect(command, [], true, options);
 }
@@ -1014,6 +1148,71 @@ function sliceUtf8Bytes(text, maxBytes) {
   }
   return text.slice(0, endIndex);
 }
+function sliceUtf8BytesTail(text, maxBytes) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
+  let bytes = 0;
+  let startIndex = text.length;
+  for (let i = text.length; i > 0; ) {
+    let unitLen = 1;
+    let cp;
+    const code = text.charCodeAt(i - 1);
+    if (i >= 2 && code >= 56320 && code <= 57343 && text.charCodeAt(i - 2) >= 55296 && text.charCodeAt(i - 2) <= 56319) {
+      unitLen = 2;
+      cp = text.codePointAt(i - 2);
+    } else {
+      cp = code;
+    }
+    const chBytes = cp <= 127 ? 1 : cp <= 2047 ? 2 : cp <= 65535 ? 3 : 4;
+    if (bytes + chBytes > limit) break;
+    bytes += chBytes;
+    i -= unitLen;
+    startIndex = i;
+  }
+  return text.slice(startIndex);
+}
+function truncateHeadTailWithByteNotice(text, maxBytes) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= limit) return text;
+  if (limit < 120) {
+    return truncateWithByteNotice(text, limit);
+  }
+  const maxMarkerBytes = Buffer.byteLength(
+    `
+... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes] ...
+`,
+    "utf8"
+  );
+  const contentBytes = limit - maxMarkerBytes;
+  if (contentBytes < 40) {
+    return truncateWithByteNotice(text, limit);
+  }
+  const headBudget = Math.max(16, Math.floor(contentBytes * 0.38));
+  const tailBudget = Math.max(24, contentBytes - headBudget);
+  let head = sliceUtf8Bytes(text, headBudget);
+  const lastNewline = head.lastIndexOf("\n");
+  if (lastNewline > 0 && Buffer.byteLength(head.slice(0, lastNewline), "utf8") > headBudget * 0.5) {
+    head = head.slice(0, lastNewline);
+  }
+  let tail = sliceUtf8BytesTail(text, tailBudget);
+  const firstNewline = tail.indexOf("\n");
+  if (firstNewline !== -1 && Buffer.byteLength(tail.slice(firstNewline + 1), "utf8") > tailBudget * 0.5) {
+    tail = tail.slice(firstNewline + 1);
+  }
+  const headBytes = Buffer.byteLength(head, "utf8");
+  const tailBytes = Buffer.byteLength(tail, "utf8");
+  const omittedBytes = Math.max(1, totalBytes - headBytes - tailBytes);
+  const marker = `
+... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes] ...
+`;
+  const result = `${head}${marker}${tail}`;
+  return Buffer.byteLength(result, "utf8") <= limit ? result : truncateWithByteNotice(result, limit);
+}
 function truncateWithByteNotice(text, maxBytes) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
@@ -1030,6 +1229,9 @@ function truncateWithByteNotice(text, maxBytes) {
     "utf8"
   );
   const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
+  if (cutoffBytes < 8) {
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
+  }
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -1052,6 +1254,54 @@ function sliceSafeChars(text, maxChars) {
   }
   return text.slice(0, end);
 }
+function sliceSafeCharsTail(text, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  let start = text.length - limit;
+  if (start < text.length) {
+    const firstCode = text.charCodeAt(start);
+    if (firstCode >= 56320 && firstCode <= 57343) {
+      start += 1;
+    }
+  }
+  return text.slice(start);
+}
+function truncateHeadTailWithNotice(text, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  if (limit < 120) {
+    return truncateWithNotice(text, limit);
+  }
+  const maxMarkerLen = `
+... [truncated: folded ${text.length} middle chars; total ${text.length} chars] ...
+`.length;
+  const contentBudget = limit - maxMarkerLen;
+  if (contentBudget < 40) {
+    return truncateWithNotice(text, limit);
+  }
+  const headBudget = Math.max(16, Math.floor(contentBudget * 0.38));
+  const tailBudget = Math.max(24, contentBudget - headBudget);
+  let head = sliceSafeChars(text, headBudget);
+  const lastNewline = head.lastIndexOf("\n");
+  if (lastNewline > headBudget * 0.5) {
+    head = head.slice(0, lastNewline);
+  }
+  let tail = sliceSafeCharsTail(text, tailBudget);
+  const firstNewline = tail.indexOf("\n");
+  if (firstNewline !== -1 && tail.length - (firstNewline + 1) > tailBudget * 0.5) {
+    tail = tail.slice(firstNewline + 1);
+  }
+  const omittedChars = Math.max(1, text.length - head.length - tail.length);
+  const marker = `
+... [truncated: folded ${omittedChars} middle chars; total ${text.length} chars] ...
+`;
+  const result = `${head}${marker}${tail}`;
+  return result.length <= limit ? result : truncateWithNotice(result, limit);
+}
 function truncateWithNotice(text, maxChars) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
@@ -1064,6 +1314,9 @@ function truncateWithNotice(text, maxChars) {
   const maxNoticeLen = `
 ... [truncated: showed ${text.length} of ${text.length} chars]`.length;
   const cutoff = Math.max(0, limit - maxNoticeLen);
+  if (cutoff < 8) {
+    return `${sliceSafeChars(text, limit - 3)}...`;
+  }
   let slice = sliceSafeChars(text, cutoff);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > cutoff * 0.6) {
@@ -1073,13 +1326,14 @@ function truncateWithNotice(text, maxChars) {
 ... [truncated: showed ${slice.length} of ${text.length} chars]`;
   return result.length <= limit ? result : sliceSafeChars(result, limit);
 }
-function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
+function fitSectionsToBudget(sections, maxChars, separator = "\n\n", truncateMode = "head") {
   if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const truncateChar = truncateMode === "head-tail" ? truncateHeadTailWithNotice : truncateWithNotice;
   const joined = sections.join(separator);
   if (joined.length <= maxChars) return joined;
   const sepTotal = separator.length * (sections.length - 1);
   if (sepTotal >= maxChars) {
-    return truncateWithNotice(joined, maxChars);
+    return truncateChar(joined, maxChars);
   }
   let remainingBudget = maxChars - sepTotal;
   const budgets = new Array(sections.length).fill(0);
@@ -1101,11 +1355,12 @@ function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
       break;
     }
   }
-  const fitted = sections.map((sec, idx) => truncateWithNotice(sec, budgets[idx] ?? 0)).join(separator);
-  return fitted.length <= maxChars ? fitted : truncateWithNotice(fitted, maxChars);
+  const fitted = sections.map((sec, idx) => truncateChar(sec, budgets[idx] ?? 0)).join(separator);
+  return fitted.length <= maxChars ? fitted : truncateChar(fitted, maxChars);
 }
-function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n") {
-  const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n", truncateMode = "head") {
+  const truncateBytes = truncateMode === "head-tail" ? truncateHeadTailWithByteNotice : truncateWithByteNotice;
+  const charFitted = fitSectionsToBudget(sections, maxChars, separator, truncateMode);
   if (maxBytes === void 0) {
     return charFitted;
   }
@@ -1115,7 +1370,7 @@ function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n
   }
   const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
   if (sepBytes >= maxBytes) {
-    return truncateWithByteNotice(charFitted, maxBytes);
+    return truncateBytes(charFitted, maxBytes);
   }
   let remainingBytes = maxBytes - sepBytes;
   const byteBudgets = new Array(sections.length).fill(0);
@@ -1137,11 +1392,19 @@ function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n
       break;
     }
   }
-  let fitted = sections.map((sec, idx) => truncateWithByteNotice(sec, byteBudgets[idx] ?? 0)).join(separator);
+  const byteFittedSections = sections.map(
+    (sec, idx) => truncateBytes(sec, byteBudgets[idx] ?? 0)
+  );
+  let fitted = byteFittedSections.join(separator);
   if (fitted.length > maxChars) {
-    fitted = truncateWithNotice(fitted, maxChars);
+    fitted = fitSectionsToBudget(
+      byteFittedSections,
+      maxChars,
+      separator,
+      truncateMode
+    );
   }
-  return Buffer.byteLength(fitted, "utf8") <= maxBytes ? fitted : truncateWithByteNotice(fitted, maxBytes);
+  return Buffer.byteLength(fitted, "utf8") <= maxBytes ? fitted : truncateBytes(fitted, maxBytes);
 }
 var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
 var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯+\s*failed tests|compilation error)/i;
@@ -1171,14 +1434,14 @@ function formatCompactCommandOutput(params) {
   }
   if (params.timedOut) {
     const tail = getTailLines(combined, 20);
-    return truncateWithNotice(
+    return truncateHeadTailWithNotice(
       tail ? `TIMED OUT
 ${tail}` : "TIMED OUT (no output)",
       params.maxChars
     );
   }
   if (params.exitCode === 0) {
-    if (!combined) return "OK";
+    if (!combined) return truncateWithNotice("OK", params.maxChars);
     const lines2 = combined.split("\n").map((l) => l.trim()).filter(Boolean);
     const summaryLines = lines2.filter((l) => SUMMARY_LINE_PATTERN.test(l));
     const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines2.length <= 2 ? lines2 : [lines2[lines2.length - 1]];
@@ -1189,7 +1452,10 @@ ${tail}` : "TIMED OUT (no output)",
   const lines = filteredLines.length > 0 ? filteredLines : rawLines;
   const cleanedCombined = lines.join("\n");
   if (cleanedCombined.length <= params.maxChars) {
-    return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
+    return cleanedCombined || truncateWithNotice(
+      `Exited with code ${params.exitCode ?? "unknown"}`,
+      params.maxChars
+    );
   }
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
@@ -1218,7 +1484,7 @@ ${tail}` : "TIMED OUT (no output)",
     outLines.push(lines[idx]);
     prev = idx;
   }
-  return truncateWithNotice(outLines.join("\n"), params.maxChars);
+  return truncateHeadTailWithNotice(outLines.join("\n"), params.maxChars);
 }
 function getTailLines(text, count) {
   if (!text) return "";
@@ -5592,6 +5858,77 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`;
     isError: false
   };
 }
+async function runQuickOutline(input) {
+  const rawInput = input;
+  const rawPaths = rawInput?.paths !== void 0 ? rawInput.paths : rawInput?.outlines !== void 0 ? rawInput.outlines : rawInput?.files;
+  if (rawPaths === void 0) {
+    return {
+      text: "Error: provide at least one file path in 'paths'.",
+      isError: true
+    };
+  }
+  const parsedPaths = parseMaybeJsonArray(rawPaths);
+  const corruptedItems = [];
+  let firstInvalidError = null;
+  if (!parsedPaths.ok) {
+    if (parsedPaths.kind === "corrupted_literal" || rawPaths === null || typeof rawPaths === "boolean") {
+      corruptedItems.push({
+        label: "paths",
+        value: parsedPaths.kind === "corrupted_literal" ? parsedPaths.value : rawPaths,
+        expected: "an array of file path strings"
+      });
+    } else {
+      firstInvalidError = `Error: 'paths' must be an array of non-empty file path strings (${parsedPaths.detail}).`;
+    }
+  } else {
+    for (let i = 0; i < parsedPaths.value.length; i++) {
+      const item = parsedPaths.value[i];
+      if (item === null || typeof item === "boolean") {
+        corruptedItems.push({
+          label: `paths[${i}]`,
+          value: item,
+          expected: "a non-empty file path string"
+        });
+      } else if (typeof item !== "string" || !item.trim()) {
+        if (firstInvalidError === null) {
+          firstInvalidError = `Error: paths[${i}] must be a non-empty file path string.`;
+        }
+      }
+    }
+  }
+  if (corruptedItems.length > 0) {
+    return {
+      text: formatCorruptedArrayError({
+        header: "Validation failed",
+        toolName: "quick_outline",
+        items: corruptedItems,
+        fallbackAdvice: "immediately fall back to parallel built-in read_file(StartLine, EndLine) calls."
+      }),
+      isError: true
+    };
+  }
+  if (firstInvalidError !== null) {
+    return { text: firstInvalidError, isError: true };
+  }
+  const paths = parsedPaths.value;
+  if (paths.length === 0) {
+    return {
+      text: "Error: provide at least one file path in 'paths'.",
+      isError: true
+    };
+  }
+  if (paths.length > MAX_OUTLINES) {
+    return {
+      text: `Error: limit exceeded (max ${MAX_OUTLINES} paths per call).`,
+      isError: true
+    };
+  }
+  return runReadSlices({
+    cwd: input?.cwd,
+    outlines: paths,
+    maxChars: input?.maxChars
+  });
+}
 
 // src/tools/run-checks.ts
 import { promises as fs5 } from "node:fs";
@@ -5761,51 +6098,100 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     );
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
-  const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget = failedCount > 0 ? Math.max(
-    160,
-    Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount)
-  ) : 320;
-  const fullPerCmdBudget = Math.max(
-    160,
-    Math.floor(usableChars / outcomes.length)
-  );
-  const blocks = outcomes.map(({ spec, result, passed }) => {
-    if (!result) return `## [NOT RUN] ${spec.name}
+  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
+  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
+  const sepOverhead = Math.max(0, (outcomes.length - 1) * 2);
+  const effectiveBlocksBudget = Math.max(0, bodyBudget - sepOverhead);
+  const formatCmdHeaderPrefix = (headerLine, cmd, blockShare) => {
+    const fullPrefix = `${headerLine}
+$ ${cmd}
+`;
+    const maxPrefixLen = Math.max(
+      headerLine.length + 24,
+      Math.floor(blockShare * 0.35)
+    );
+    if (fullPrefix.length <= maxPrefixLen) {
+      return fullPrefix;
+    }
+    const maxCmdChars = Math.max(20, maxPrefixLen - headerLine.length - 4);
+    const displayCmd = cmd.length <= maxCmdChars ? cmd : `${sliceSafeChars(cmd, Math.max(8, maxCmdChars - 3))}...`;
+    return `${headerLine}
+$ ${displayCmd}
+`;
+  };
+  let blocks;
+  if (outputMode === "full") {
+    const perFullShare = Math.max(
+      120,
+      Math.floor(effectiveBlocksBudget / outcomes.length)
+    );
+    blocks = outcomes.map(({ spec, result, passed }) => {
+      if (!result) return `## [NOT RUN] ${spec.name}
 $ ${spec.command}`;
-    const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
-    if (outputMode === "full") {
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
+      const prefix = formatCmdHeaderPrefix(headerLine, spec.command, perFullShare);
+      const bodyLimit = Math.max(60, perFullShare - prefix.length);
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr)
       ].filter(Boolean).join("\n");
-      const body2 = result.error ? `spawn error: ${result.error}` : truncateWithNotice(combined || "(no output)", fullPerCmdBudget);
-      return `## [${badge}] ${spec.name} (${result.durationMs}ms)
-$ ${spec.command}
-${body2}`;
-    }
-    const body = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: passed ? 300 : failedBudget
+      const body = result.error ? `spawn error: ${result.error}` : truncateHeadTailWithNotice(combined || "(no output)", bodyLimit);
+      return `${prefix}${body}`;
     });
-    if (passed) {
-      return `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+  } else {
+    const preformatted = new Array(outcomes.length).fill(null);
+    let fixedChars = 0;
+    for (let i = 0; i < outcomes.length; i++) {
+      const { spec, result, passed } = outcomes[i];
+      if (!result) {
+        const block = `## [NOT RUN] ${spec.name}
+$ ${spec.command}`;
+        preformatted[i] = block;
+        fixedChars += block.length;
+      } else if (passed) {
+        const body = formatCompactCommandOutput({
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          error: result.error,
+          maxChars: 300
+        });
+        const block = `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+        preformatted[i] = block;
+        fixedChars += block.length;
+      }
     }
-    return `## [${badge} ${result.durationMs}ms] ${spec.name}
-$ ${spec.command}
-${body}`;
-  });
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
+    const perFailShare = failedCount > 0 ? Math.max(
+      120,
+      Math.floor((effectiveBlocksBudget - fixedChars) / failedCount)
+    ) : 320;
+    blocks = outcomes.map(({ spec, result }, idx) => {
+      const existing = preformatted[idx];
+      if (existing != null) return existing;
+      const res = result;
+      const badge = res.error ? "ERROR" : res.timedOut ? "TIMEOUT" : `FAIL (exit ${res.exitCode ?? "err"})`;
+      const headerLine = `## [${badge} ${res.durationMs}ms] ${spec.name}`;
+      const prefix = formatCmdHeaderPrefix(headerLine, spec.command, perFailShare);
+      const failBodyLimit = Math.max(60, perFailShare - prefix.length);
+      const body = formatCompactCommandOutput({
+        stdout: res.stdout,
+        stderr: res.stderr,
+        exitCode: res.exitCode,
+        timedOut: res.timedOut,
+        error: res.error,
+        maxChars: failBodyLimit
+      });
+      return `${prefix}${body}`;
+    });
+  }
   const fittedBlocks = fitSectionsToByteBudget(
     blocks,
     bodyBudget,
     bodyByteBudget,
-    "\n\n"
+    "\n\n",
+    "head-tail"
   );
   let text = truncateWithNotice(
     `${summaryHeader}
@@ -6121,6 +6507,40 @@ function createAgyFastServer(options = {}) {
       const resolved = resolveToolArgs(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runReadSlices(resolved.value);
+    }
+  );
+  server.registerTool(
+    {
+      name: "quick_outline",
+      description: "Fast symbol/section outline extractor for unknown large files (TS/JS/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20 files/batch, max 40). Flat paths-only schema for mapping line ranges before parallel built-in read_file(StartLine, EndLine).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root)."
+          },
+          paths: {
+            type: "array",
+            minItems: 1,
+            maxItems: 40,
+            items: { type: "string" },
+            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch; max 40)."
+          },
+          maxChars: {
+            type: "integer",
+            minimum: 1e3,
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes)."
+          }
+        },
+        required: ["paths"]
+      }
+    },
+    async (args) => {
+      const resolved = resolveToolArgs(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runQuickOutline(resolved.value);
     }
   );
   server.registerTool(

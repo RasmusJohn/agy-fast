@@ -10,7 +10,12 @@ import {
 } from "./utils/host-compat.js";
 import { runApplyEdits, type ApplyEditsInput } from "./tools/apply-edits.js";
 import { runBatchSearch, type BatchSearchInput } from "./tools/batch-search.js";
-import { runReadSlices, type ReadSlicesInput } from "./tools/read-slices.js";
+import {
+  runQuickOutline,
+  runReadSlices,
+  type QuickOutlineInput,
+  type ReadSlicesInput,
+} from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
 const SERVER_VERSION = "0.2.8";
@@ -344,6 +349,42 @@ export function createAgyFastServer(
       const resolved = resolveToolArgs<ReadSlicesInput>(args);
       if (!resolved.ok) return { text: resolved.error, isError: true };
       return runReadSlices(resolved.value);
+    },
+  );
+
+  server.registerTool(
+    {
+      name: "quick_outline",
+      description:
+        "Fast symbol/section outline extractor for unknown large files (TS/JS/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20 files/batch, max 40). Flat paths-only schema for mapping line ranges before parallel built-in read_file(StartLine, EndLine).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cwd: {
+            type: "string",
+            description: "Base directory for relative paths (defaults to the first workspace root).",
+          },
+          paths: {
+            type: "array",
+            minItems: 1,
+            maxItems: 40,
+            items: { type: "string" },
+            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch; max 40).",
+          },
+          maxChars: {
+            type: "integer",
+            minimum: 1000,
+            maximum: 8800,
+            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes).",
+          },
+        },
+        required: ["paths"],
+      },
+    },
+    async (args) => {
+      const resolved = resolveToolArgs<QuickOutlineInput>(args);
+      if (!resolved.ok) return { text: resolved.error, isError: true };
+      return runQuickOutline(resolved.value);
     },
   );
 

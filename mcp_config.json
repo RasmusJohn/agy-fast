@@ -15,6 +15,9 @@
         "read_slices": {
           "eager": true
         },
+        "quick_outline": {
+          "eager": true
+        },
         "run_checks": {
           "eager": true
         }

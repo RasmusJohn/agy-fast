@@ -28,7 +28,7 @@ function git(cwd: string, args: string[]): string {
 
 async function copyRuntimeFixture(dstDir: string, version: string, marker: string): Promise<void> {
   await fs.mkdir(dstDir, { recursive: true });
-  for (const rel of UPDATER_RUNTIME_FILES) {
+  for (const rel of [...UPDATER_RUNTIME_FILES, ".gitignore"]) {
     const src = path.join(REPO_ROOT, rel);
     const dst = path.join(dstDir, rel);
     await fs.mkdir(path.dirname(dst), { recursive: true });
@@ -481,5 +481,44 @@ describe("auto-updater", () => {
       env: { ...process.env, AGY_FAST_CACHE_DIR: deadLockCache },
     });
     assert.equal(reclaimedRes.status, "up-to-date");
+
+    // 6. User-authored rules/AGENTS.local.md survives BOTH copied auto-updates AND git-clone updates (no git-dirty!)
+    const localCopiedDir = path.join(rootTmp, "local-copied-plugin");
+    await copyRuntimeFixture(localCopiedDir, "0.2.0", "release-0.2.0");
+    await fs.writeFile(
+      path.join(localCopiedDir, "rules", "AGENTS.local.md"),
+      "---\ntrigger: always_on\n---\n# Personal local rule\n",
+      "utf8",
+    );
+    const copiedLocalRes = await runPluginUpdate({
+      pluginDir: localCopiedDir,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "local-copied-cache") },
+    });
+    assert.equal(copiedLocalRes.status, "updated");
+    assert.equal(
+      await fs.readFile(path.join(localCopiedDir, "rules", "AGENTS.local.md"), "utf8"),
+      "---\ntrigger: always_on\n---\n# Personal local rule\n",
+    );
+
+    const localGitDir = path.join(rootTmp, "local-git-home", ".gemini", "config", "plugins", "agy-fast");
+    await fs.mkdir(path.dirname(localGitDir), { recursive: true });
+    git(path.dirname(localGitDir), ["clone", "--branch", "v0.2.0", originRepoUrl, localGitDir]);
+    await fs.writeFile(
+      path.join(localGitDir, "rules", "AGENTS.local.md"),
+      "---\ntrigger: always_on\n---\n# Git clone local rule\n",
+      "utf8",
+    );
+    const gitLocalRes = await runPluginUpdate({
+      pluginDir: localGitDir,
+      repoUrl: originRepoUrl,
+      env: { ...process.env, AGY_FAST_CACHE_DIR: path.join(rootTmp, "local-git-cache") },
+    });
+    assert.equal(gitLocalRes.status, "updated");
+    assert.equal(gitLocalRes.installKind, "git-clone");
+    assert.equal(
+      await fs.readFile(path.join(localGitDir, "rules", "AGENTS.local.md"), "utf8"),
+      "---\ntrigger: always_on\n---\n# Git clone local rule\n",
+    );
   });
 });

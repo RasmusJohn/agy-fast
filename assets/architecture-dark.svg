@@ -100,7 +100,7 @@
       <rect x="842" y="77" width="116" height="22" rx="11" fill="#0C2847" stroke="#256396" stroke-width="1" />
       <text x="900" y="91.7" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#7DD3FC">0 schema turns</text>
     </g>
-    <text x="530" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#CBD5E1">Inlined compact schemas for direct call_mcp_tool dispatch</text>
+    <text x="530" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#CBD5E1">Inlined 5-tool schemas · eager direct MCP dispatch</text>
     <text x="530" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#94A3B8">Smart batching · &gt;150k image isolation · corrupt-arg fallback</text>
   </g>
 
@@ -146,13 +146,13 @@
       <rect x="326" y="262" width="3.2" height="68" rx="1.6" fill="#38BDF8" />
       <rect x="339" y="263" width="24" height="24" rx="6" fill="#0D2B4C" />
       <g transform="translate(344, 268)" stroke="#38BDF8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M2 3h10M2 7h7M5 11h7"/><circle cx="2.5" cy="11" r="0.8" fill="#38BDF8" stroke="none"/></g>
-      <text x="370" y="279" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="13.2" font-weight="700" fill="#F1F5F9">read_slices</text>
+      <text x="370" y="279" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="13.2" font-weight="700" fill="#F1F5F9">quick_outline</text>
       
     <g>
       <rect x="481" y="264" width="100" height="21" rx="10.5" fill="#0C2847" stroke="#256396" stroke-width="1" />
       <text x="531" y="278.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#7DD3FC">≤40 outlines</text>
     </g>
-      <text x="341" y="306" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.1" font-weight="500" fill="#CBD5E1">14-format symbol maps (TS/Py/Java/GD…)</text>
+      <text x="341" y="306" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.1" font-weight="500" fill="#CBD5E1">14-format maps + read_slices (TS/Py/GD…)</text>
       <text x="341" y="325" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.5" fill="#94A3B8">Exact line spans · avoids blind full reads</text>
     </g>
   

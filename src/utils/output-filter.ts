@@ -32,6 +32,8 @@ export function normalizeTerminalOutput(raw: string): string {
  */
 export const DEFAULT_INLINE_MAX_BYTES = 8_800;
 
+export type TruncateMode = "head" | "head-tail";
+
 export function sliceUtf8Bytes(text: string, maxBytes: number): string {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
@@ -51,6 +53,92 @@ export function sliceUtf8Bytes(text: string, maxBytes: number): string {
   return text.slice(0, endIndex);
 }
 
+export function sliceUtf8BytesTail(text: string, maxBytes: number): string {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
+  let bytes = 0;
+  let startIndex = text.length;
+  for (let i = text.length; i > 0; ) {
+    let unitLen = 1;
+    let cp: number;
+    const code = text.charCodeAt(i - 1);
+    if (
+      i >= 2 &&
+      code >= 0xdc00 &&
+      code <= 0xdfff &&
+      text.charCodeAt(i - 2) >= 0xd800 &&
+      text.charCodeAt(i - 2) <= 0xdbff
+    ) {
+      unitLen = 2;
+      cp = text.codePointAt(i - 2)!;
+    } else {
+      cp = code;
+    }
+    const chBytes = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+    if (bytes + chBytes > limit) break;
+    bytes += chBytes;
+    i -= unitLen;
+    startIndex = i;
+  }
+  return text.slice(startIndex);
+}
+
+export function truncateHeadTailWithByteNotice(
+  text: string,
+  maxBytes: number,
+): string {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
+  const limit = Math.trunc(maxBytes);
+  if (limit <= 0) return "";
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= limit) return text;
+
+  if (limit < 120) {
+    return truncateWithByteNotice(text, limit);
+  }
+
+  const maxMarkerBytes = Buffer.byteLength(
+    `\n... [truncated: folded ${totalBytes} middle bytes; total ${totalBytes} bytes] ...\n`,
+    "utf8",
+  );
+  const contentBytes = limit - maxMarkerBytes;
+  if (contentBytes < 40) {
+    return truncateWithByteNotice(text, limit);
+  }
+
+  const headBudget = Math.max(16, Math.floor(contentBytes * 0.38));
+  const tailBudget = Math.max(24, contentBytes - headBudget);
+
+  let head = sliceUtf8Bytes(text, headBudget);
+  const lastNewline = head.lastIndexOf("\n");
+  if (
+    lastNewline > 0 &&
+    Buffer.byteLength(head.slice(0, lastNewline), "utf8") > headBudget * 0.5
+  ) {
+    head = head.slice(0, lastNewline);
+  }
+
+  let tail = sliceUtf8BytesTail(text, tailBudget);
+  const firstNewline = tail.indexOf("\n");
+  if (
+    firstNewline !== -1 &&
+    Buffer.byteLength(tail.slice(firstNewline + 1), "utf8") > tailBudget * 0.5
+  ) {
+    tail = tail.slice(firstNewline + 1);
+  }
+
+  const headBytes = Buffer.byteLength(head, "utf8");
+  const tailBytes = Buffer.byteLength(tail, "utf8");
+  const omittedBytes = Math.max(1, totalBytes - headBytes - tailBytes);
+  const marker = `\n... [truncated: folded ${omittedBytes} middle bytes; total ${totalBytes} bytes] ...\n`;
+  const result = `${head}${marker}${tail}`;
+  return Buffer.byteLength(result, "utf8") <= limit
+    ? result
+    : truncateWithByteNotice(result, limit);
+}
+
 export function truncateWithByteNotice(text: string, maxBytes: number): string {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0) return "";
   const limit = Math.trunc(maxBytes);
@@ -68,6 +156,9 @@ export function truncateWithByteNotice(text: string, maxBytes: number): string {
     "utf8",
   );
   const cutoffBytes = Math.max(0, limit - maxNoticeBytes);
+  if (cutoffBytes < 8) {
+    return `${sliceUtf8Bytes(text, limit - 3)}...`;
+  }
   let slice = sliceUtf8Bytes(text, cutoffBytes);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > 0 && Buffer.byteLength(slice.slice(0, lastNewline), "utf8") > cutoffBytes * 0.6) {
@@ -93,6 +184,63 @@ export function sliceSafeChars(text: string, maxChars: number): string {
   return text.slice(0, end);
 }
 
+export function sliceSafeCharsTail(text: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  let start = text.length - limit;
+  if (start < text.length) {
+    const firstCode = text.charCodeAt(start);
+    if (firstCode >= 0xdc00 && firstCode <= 0xdfff) {
+      start += 1;
+    }
+  }
+  return text.slice(start);
+}
+
+export function truncateHeadTailWithNotice(
+  text: string,
+  maxChars: number,
+): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+
+  if (limit < 120) {
+    return truncateWithNotice(text, limit);
+  }
+
+  const maxMarkerLen =
+    `\n... [truncated: folded ${text.length} middle chars; total ${text.length} chars] ...\n`
+      .length;
+  const contentBudget = limit - maxMarkerLen;
+  if (contentBudget < 40) {
+    return truncateWithNotice(text, limit);
+  }
+
+  const headBudget = Math.max(16, Math.floor(contentBudget * 0.38));
+  const tailBudget = Math.max(24, contentBudget - headBudget);
+
+  let head = sliceSafeChars(text, headBudget);
+  const lastNewline = head.lastIndexOf("\n");
+  if (lastNewline > headBudget * 0.5) {
+    head = head.slice(0, lastNewline);
+  }
+
+  let tail = sliceSafeCharsTail(text, tailBudget);
+  const firstNewline = tail.indexOf("\n");
+  if (firstNewline !== -1 && tail.length - (firstNewline + 1) > tailBudget * 0.5) {
+    tail = tail.slice(firstNewline + 1);
+  }
+
+  const omittedChars = Math.max(1, text.length - head.length - tail.length);
+  const marker = `\n... [truncated: folded ${omittedChars} middle chars; total ${text.length} chars] ...\n`;
+  const result = `${head}${marker}${tail}`;
+  return result.length <= limit ? result : truncateWithNotice(result, limit);
+}
+
 export function truncateWithNotice(text: string, maxChars: number): string {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
   const limit = Math.trunc(maxChars);
@@ -106,6 +254,9 @@ export function truncateWithNotice(text: string, maxChars: number): string {
 
   const maxNoticeLen = `\n... [truncated: showed ${text.length} of ${text.length} chars]`.length;
   const cutoff = Math.max(0, limit - maxNoticeLen);
+  if (cutoff < 8) {
+    return `${sliceSafeChars(text, limit - 3)}...`;
+  }
   let slice = sliceSafeChars(text, cutoff);
   const lastNewline = slice.lastIndexOf("\n");
   if (lastNewline > cutoff * 0.6) {
@@ -124,14 +275,17 @@ export function fitSectionsToBudget(
   sections: string[],
   maxChars: number,
   separator = "\n\n",
+  truncateMode: TruncateMode = "head",
 ): string {
   if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const truncateChar =
+    truncateMode === "head-tail" ? truncateHeadTailWithNotice : truncateWithNotice;
   const joined = sections.join(separator);
   if (joined.length <= maxChars) return joined;
 
   const sepTotal = separator.length * (sections.length - 1);
   if (sepTotal >= maxChars) {
-    return truncateWithNotice(joined, maxChars);
+    return truncateChar(joined, maxChars);
   }
 
   let remainingBudget = maxChars - sepTotal;
@@ -159,9 +313,9 @@ export function fitSectionsToBudget(
   }
 
   const fitted = sections
-    .map((sec, idx) => truncateWithNotice(sec, budgets[idx] ?? 0))
+    .map((sec, idx) => truncateChar(sec, budgets[idx] ?? 0))
     .join(separator);
-  return fitted.length <= maxChars ? fitted : truncateWithNotice(fitted, maxChars);
+  return fitted.length <= maxChars ? fitted : truncateChar(fitted, maxChars);
 }
 
 /**
@@ -174,8 +328,13 @@ export function fitSectionsToByteBudget(
   maxChars: number,
   maxBytes?: number,
   separator = "\n\n",
+  truncateMode: TruncateMode = "head",
 ): string {
-  const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+  const truncateBytes =
+    truncateMode === "head-tail"
+      ? truncateHeadTailWithByteNotice
+      : truncateWithByteNotice;
+  const charFitted = fitSectionsToBudget(sections, maxChars, separator, truncateMode);
   if (maxBytes === undefined) {
     return charFitted;
   }
@@ -186,7 +345,7 @@ export function fitSectionsToByteBudget(
 
   const sepBytes = Buffer.byteLength(separator, "utf8") * (sections.length - 1);
   if (sepBytes >= maxBytes) {
-    return truncateWithByteNotice(charFitted, maxBytes);
+    return truncateBytes(charFitted, maxBytes);
   }
 
   let remainingBytes = maxBytes - sepBytes;
@@ -213,15 +372,21 @@ export function fitSectionsToByteBudget(
     }
   }
 
-  let fitted = sections
-    .map((sec, idx) => truncateWithByteNotice(sec, byteBudgets[idx] ?? 0))
-    .join(separator);
+  const byteFittedSections = sections.map((sec, idx) =>
+    truncateBytes(sec, byteBudgets[idx] ?? 0),
+  );
+  let fitted = byteFittedSections.join(separator);
   if (fitted.length > maxChars) {
-    fitted = truncateWithNotice(fitted, maxChars);
+    fitted = fitSectionsToBudget(
+      byteFittedSections,
+      maxChars,
+      separator,
+      truncateMode,
+    );
   }
   return Buffer.byteLength(fitted, "utf8") <= maxBytes
     ? fitted
-    : truncateWithByteNotice(fitted, maxBytes);
+    : truncateBytes(fitted, maxBytes);
 }
 
 const ERROR_LINE_PATTERN =
@@ -271,14 +436,14 @@ export function formatCompactCommandOutput(params: {
 
   if (params.timedOut) {
     const tail = getTailLines(combined, 20);
-    return truncateWithNotice(
+    return truncateHeadTailWithNotice(
       tail ? `TIMED OUT\n${tail}` : "TIMED OUT (no output)",
       params.maxChars,
     );
   }
 
   if (params.exitCode === 0) {
-    if (!combined) return "OK";
+    if (!combined) return truncateWithNotice("OK", params.maxChars);
     const lines = combined
       .split("\n")
       .map((l) => l.trim())
@@ -301,7 +466,13 @@ export function formatCompactCommandOutput(params: {
   const cleanedCombined = lines.join("\n");
 
   if (cleanedCombined.length <= params.maxChars) {
-    return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
+    return (
+      cleanedCombined ||
+      truncateWithNotice(
+        `Exited with code ${params.exitCode ?? "unknown"}`,
+        params.maxChars,
+      )
+    );
   }
 
   const keepIndices = new Set<number>();
@@ -335,7 +506,7 @@ export function formatCompactCommandOutput(params: {
     prev = idx;
   }
 
-  return truncateWithNotice(outLines.join("\n"), params.maxChars);
+  return truncateHeadTailWithNotice(outLines.join("\n"), params.maxChars);
 }
 
 function getTailLines(text: string, count: number): string {

@@ -101,11 +101,22 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
   });
 }
 
+function writeAndExit(payload: string): void {
+  // Explicitly exit after stdout flushes so any abandoned libuv fs.readdir/fs.readFile
+  // threadpool call after scanTimeoutMs cannot keep the SessionStart subprocess alive.
+  process.stdout.on("error", () => {
+    process.exit(0);
+  });
+  process.stdout.write(payload, () => {
+    process.exit(0);
+  });
+}
+
 async function main(): Promise<void> {
   try {
     const raw = (await readStdin()).trim();
     if (!raw) {
-      process.stdout.write("{}\n");
+      writeAndExit("{}\n");
       return;
     }
 
@@ -113,7 +124,7 @@ async function main(): Promise<void> {
     try {
       payload = JSON.parse(raw) as SessionStartPayload;
     } catch {
-      process.stdout.write("{}\n");
+      writeAndExit("{}\n");
       return;
     }
 
@@ -125,7 +136,7 @@ async function main(): Promise<void> {
       firstNonEmptyPath(payload.workspace_roots);
 
     if (!workspaceDir) {
-      process.stdout.write("{}\n");
+      writeAndExit("{}\n");
       return;
     }
 
@@ -136,7 +147,7 @@ async function main(): Promise<void> {
     });
 
     if (!snapshot) {
-      process.stdout.write("{}\n");
+      writeAndExit("{}\n");
       return;
     }
 
@@ -232,10 +243,10 @@ async function main(): Promise<void> {
         },
       ],
     };
-    process.stdout.write(`${JSON.stringify(response)}\n`);
+    writeAndExit(`${JSON.stringify(response)}\n`);
   } catch {
     // Always fail open so session startup is never blocked
-    process.stdout.write("{}\n");
+    writeAndExit("{}\n");
   }
 }
 

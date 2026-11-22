@@ -8,6 +8,14 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-fast";
+const EXPECTED_MCP_TOOLS = [
+  "batch_search",
+  "apply_edits",
+  "read_slices",
+  "quick_outline",
+  "run_checks",
+];
+const MAX_LOCAL_RULE_BYTES = 256 * 1024;
 
 const RUNTIME_FILES = [
   "plugin.json",
@@ -559,6 +567,96 @@ async function copyRuntimeFiles(srcRoot, dstRoot) {
   }
 }
 
+async function snapshotLocalRuleFiles(pluginDir) {
+  const preserved = [];
+  const skipped = [];
+  const dirStat = await lstatSafe(pluginDir);
+  if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    return { preserved, skipped };
+  }
+  const rulesDir = path.join(pluginDir, "rules");
+  const rulesStat = await lstatSafe(rulesDir);
+  if (!rulesStat || rulesStat.isSymbolicLink() || !rulesStat.isDirectory()) {
+    return { preserved, skipped };
+  }
+  let entries;
+  try {
+    entries = await fs.readdir(rulesDir, { withFileTypes: true });
+  } catch {
+    return { preserved, skipped };
+  }
+  for (const entry of entries) {
+    const name = entry.name;
+    if (
+      !name ||
+      name.startsWith(".") ||
+      !name.toLowerCase().endsWith(".local.md") ||
+      name.length <= ".local.md".length ||
+      name.includes("/") ||
+      name.includes("\\") ||
+      name.includes("\0") ||
+      path.basename(name) !== name
+    ) {
+      continue;
+    }
+    const fullPath = path.join(rulesDir, name);
+    const st = await lstatSafe(fullPath);
+    if (!st) continue;
+    if (st.isSymbolicLink()) {
+      skipped.push({ name, reason: "symlink" });
+      continue;
+    }
+    if (!st.isFile()) continue;
+    if (st.size > MAX_LOCAL_RULE_BYTES) {
+      skipped.push({ name, reason: `exceeds ${Math.round(MAX_LOCAL_RULE_BYTES / 1024)}KB limit` });
+      continue;
+    }
+    try {
+      const content = await fs.readFile(fullPath);
+      if (content.length > MAX_LOCAL_RULE_BYTES) {
+        skipped.push({ name, reason: `exceeds ${Math.round(MAX_LOCAL_RULE_BYTES / 1024)}KB limit` });
+        continue;
+      }
+      preserved.push({ name, content, mode: (st.mode & 0o777) | 0o600 });
+    } catch {
+      skipped.push({ name, reason: "unreadable" });
+    }
+  }
+  preserved.sort((a, b) => a.name.localeCompare(b.name));
+  skipped.sort((a, b) => a.name.localeCompare(b.name));
+  return { preserved, skipped };
+}
+
+async function restoreLocalRuleFiles(pluginDir, preserved) {
+  const restored = [];
+  const keptExisting = [];
+  if (!preserved || preserved.length === 0) {
+    return { restored, keptExisting };
+  }
+  const rulesDir = path.join(pluginDir, "rules");
+  await fs.mkdir(rulesDir, { recursive: true });
+  for (const file of preserved) {
+    const dst = path.join(rulesDir, file.name);
+    if (await lstatSafe(dst)) {
+      keptExisting.push(file.name);
+      continue;
+    }
+    await fs.writeFile(dst, file.content, { mode: file.mode || 0o644 });
+    restored.push(file.name);
+  }
+  return { restored, keptExisting };
+}
+
+async function hasLocalRuleFiles(pluginDir) {
+  const rulesDir = path.join(pluginDir, "rules");
+  try {
+    const entries = await fs.readdir(rulesDir);
+    return entries.some((n) => n.toLowerCase().endsWith(".local.md"));
+  } catch {
+    return false;
+  }
+}
+
 async function isDirSafe(p) {
   try {
     return (await fs.stat(p)).isDirectory();
@@ -697,6 +795,8 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   }
 
   await assertRemovableTarget(isolated.pluginDir, isoStat);
+  const { preserved: preservedIsoLocalRules, skipped: skippedIsoLocalRules } =
+    await snapshotLocalRuleFiles(isolated.pluginDir);
   await fs.mkdir(path.dirname(isolated.pluginDir), { recursive: true });
   await removeTargetPath(isolated.pluginDir, isoStat);
 
@@ -706,23 +806,51 @@ async function syncIsolatedPluginDir(resolvedSrc, primaryGlobalDir, isolated, op
   const linkSource = opts.useLink ? resolvedSrc : primaryRealPath;
   const linkType = process.platform === "win32" ? "junction" : "dir";
   let mode = "symlink";
+  let migratedToPrimary = { restored: [], keptExisting: [] };
   try {
     await fs.symlink(linkSource, isolated.pluginDir, linkType);
   } catch (err) {
     const code = err?.code;
     if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
       await copyRuntimeFiles(resolvedSrc, isolated.pluginDir);
+      await restoreLocalRuleFiles(isolated.pluginDir, preservedIsoLocalRules);
       mode = "copied";
     } else {
       throw err;
     }
   }
+  if (mode === "symlink" && !opts.useLink && preservedIsoLocalRules.length > 0) {
+    migratedToPrimary = await restoreLocalRuleFiles(
+      primaryRealPath,
+      preservedIsoLocalRules,
+    );
+  }
 
   if (!opts.quiet) {
     if (mode === "symlink") {
       console.log(`Synced ${isolated.label}: ${isolated.pluginDir} -> ${linkSource}`);
+      if (migratedToPrimary.restored.length > 0) {
+        console.log(
+          `Migrated isolated local rule file(s) to primary plugin dir: ${migratedToPrimary.restored.map((n) => `rules/${n}`).join(", ")}`,
+        );
+      }
+      if (migratedToPrimary.keptExisting.length > 0) {
+        console.log(
+          `Kept existing primary local rule file(s) on symlink sync: ${migratedToPrimary.keptExisting.map((n) => `rules/${n}`).join(", ")}`,
+        );
+      }
+      if (opts.useLink && preservedIsoLocalRules.length > 0) {
+        console.log(
+          `Note: --link replaced ${isolated.pluginDir}; local rule file(s) were not copied into dev checkout: ${preservedIsoLocalRules.map((f) => `rules/${f.name}`).join(", ")}`,
+        );
+      }
     } else {
       console.log(`Synced ${isolated.label} (copied): ${isolated.pluginDir}`);
+    }
+    if (skippedIsoLocalRules.length > 0) {
+      console.log(
+        `Skipped unsafe/oversized local rule file(s) in ${isolated.label}: ${skippedIsoLocalRules.map((s) => `rules/${s.name} (${s.reason})`).join(", ")}`,
+      );
     }
     const configJson = await readJsonSafe(path.join(isolated.geminiRoot, "config", "config.json"));
     if (configJson?.plugins?.[PLUGIN_NAME]?.enabled === false) {
@@ -774,6 +902,10 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       timeout: 10_000,
     });
     report.agyValidated = !valRes.error && valRes.status === 0;
+    report.agyValidateOutput = [valRes.error?.message, valRes.stdout, valRes.stderr]
+      .filter((s) => typeof s === "string" && s.trim())
+      .join("\n")
+      .trim();
   }
 
   const manifest = await readJsonSafe(path.join(targetDir, "plugin.json"));
@@ -823,6 +955,11 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
     : [];
   report.isolatedProfiles = isolatedProfiles;
 
+  const missingTools = EXPECTED_MCP_TOOLS.filter((t) => !mcpCheck.tools.includes(t));
+  const hasAllExpectedTools = missingTools.length === 0;
+  const hasLocalRules =
+    report.agyValidated === false ? await hasLocalRuleFiles(targetDir) : false;
+
   if (!quiet) {
     console.log("agy-fast health check:");
     console.log(`  - Plugin path : ${targetDir}`);
@@ -832,7 +969,11 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       `  - ripgrep (rg): ${hasRg ? "available (fast search active)" : "not found (automatic Node.js fallback active)"}`,
     );
     console.log(
-      `  - MCP server  : OK (${mcpCheck.tools.length} tools: ${mcpCheck.tools.join(", ")})`,
+      `  - MCP server  : ${
+        hasAllExpectedTools
+          ? `OK (${mcpCheck.tools.length} tools: ${mcpCheck.tools.join(", ")})`
+          : `FAILED (missing: ${missingTools.join(", ")}; found: ${mcpCheck.tools.join(", ") || "none"})`
+      }`,
     );
     console.log(
       `  - Host compat : editsFormat=${effectiveEditsFormat} (active edits schema: ${mcpCheck.applyEditsSchemaType}; host=${hostEnvLabel})`,
@@ -852,6 +993,16 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       console.log(
         `  - agy validate: ${report.agyValidated ? "PASSED (--strict)" : "FAILED"}`,
       );
+      if (!report.agyValidated && report.agyValidateOutput) {
+        for (const line of report.agyValidateOutput.split(/\r?\n/).slice(0, 12)) {
+          if (line.trim()) console.log(`      ${line.trim()}`);
+        }
+      }
+      if (!report.agyValidated && hasLocalRules) {
+        console.log(
+          "      Hint: custom rules/*.local.md files require YAML frontmatter (`---\\ntrigger: always_on\\n---`) for Antigravity to load and validate them.",
+        );
+      }
     }
     for (const iso of isolatedProfiles) {
       const desc =
@@ -870,7 +1021,7 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
 
   const hasBrokenIsolated = isolatedProfiles.some((iso) => iso.status === "broken");
   const ok =
-    mcpCheck.tools.length === 4 &&
+    hasAllExpectedTools &&
     hookCheck.bytes > 0 &&
     !hasBrokenIsolated &&
     (report.agyValidated === null || report.agyValidated === true);
@@ -904,20 +1055,39 @@ async function runInstall(opts) {
     }
   } else if (opts.useLink) {
     await assertRemovableTarget(resolvedDst, dstStat);
+    const { preserved: replacedLocalRules } = await snapshotLocalRuleFiles(resolvedDst);
     await fs.mkdir(path.dirname(resolvedDst), { recursive: true });
     await removeTargetPath(resolvedDst, dstStat);
     const linkType = process.platform === "win32" ? "junction" : "dir";
     await fs.symlink(resolvedSrc, resolvedDst, linkType);
     if (!opts.quiet) {
       console.log(`Linked ${resolvedDst} -> ${resolvedSrc}`);
+      if (replacedLocalRules.length > 0) {
+        console.log(
+          `Note: --link replaced ${resolvedDst}; local rule file(s) were not copied into dev checkout: ${replacedLocalRules.map((f) => `rules/${f.name}`).join(", ")}`,
+        );
+      }
     }
   } else {
-    // Preserve clean target directory when re-installing / upgrading
+    // Preserve clean target directory and any user-authored rules/*.local.md when re-installing / upgrading
     await assertRemovableTarget(resolvedDst, dstStat);
+    const { preserved: preservedLocalRules, skipped: skippedLocalRules } =
+      await snapshotLocalRuleFiles(resolvedDst);
     await removeTargetPath(resolvedDst, dstStat);
     await copyRuntimeFiles(resolvedSrc, resolvedDst);
+    const { restored } = await restoreLocalRuleFiles(resolvedDst, preservedLocalRules);
     if (!opts.quiet) {
       console.log(`Installed agy-fast to ${resolvedDst}`);
+      if (restored.length > 0) {
+        console.log(
+          `Preserved local rule file(s): ${restored.map((n) => `rules/${n}`).join(", ")}`,
+        );
+      }
+      if (skippedLocalRules.length > 0) {
+        console.log(
+          `Skipped unsafe/oversized local rule file(s): ${skippedLocalRules.map((s) => `rules/${s.name} (${s.reason})`).join(", ")}`,
+        );
+      }
     }
   }
 

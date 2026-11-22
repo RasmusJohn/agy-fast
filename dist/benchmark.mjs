@@ -121,7 +121,7 @@ var KNOWN_SYSTEM_BIN_PREFIXES = [
   "/usr/local/bin/",
   "/opt/homebrew/bin/"
 ];
-var AGY_FAST_TOOL_RE = /(?:^|[_:./-])(batch_search|apply_edits|read_slices|run_checks)$/;
+var AGY_FAST_TOOL_RE = /(?:^|[_:./-])(batch_search|apply_edits|read_slices|quick_outline|run_checks)$/;
 function parseTimeMs(iso) {
   if (!iso) return null;
   const ms = Date.parse(iso);
@@ -754,6 +754,12 @@ function hasCorruptedAgyFastArgs(call, fastTool) {
     }
     return false;
   }
+  if (fastTool === "quick_outline") {
+    const raw = inner.paths !== void 0 ? inner.paths : inner.outlines !== void 0 ? inner.outlines : inner.files;
+    const paths = maybeParseJsonValue(raw);
+    if (typeof paths === "boolean" || paths === null) return true;
+    return Array.isArray(paths) && paths.some((p) => typeof p !== "string");
+  }
   if (fastTool === "run_checks") {
     const cmds = maybeParseJsonValue(inner.commands);
     if (typeof cmds === "boolean" || cmds === null) return true;
@@ -830,6 +836,7 @@ function analyzeTranscriptSessions(sessions) {
     batch_search: 0,
     apply_edits: 0,
     read_slices: 0,
+    quick_outline: 0,
     run_checks: 0
   };
   let mcpSpillCalls = 0;
@@ -1324,7 +1331,7 @@ function formatMetricsMarkdown(m) {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, check:${m.agyFastToolCalls.run_checks}) |`,
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}) |`,
     `| agy-fast health (spills / truncs / errs) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyErrorCalls} |`,
     ...m.agyCorruptedArgCalls > 0 ? [
       `| agy-fast corrupted-arg calls | ${m.agyCorruptedArgCalls} (wasted ${m.agyCorruptedArgWastedSec.toFixed(1)}s, ${m.agyCorruptedArgWastedOutTokens.toLocaleString("en-US")} out tok) |`
@@ -1385,7 +1392,7 @@ function formatUsageSplitMarkdown(split) {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
+    `| agy-fast tool calls | ${fastSum(overall)} | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}) | - |`,
     `| agy-fast health (spills / truncs / errs) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyErrorCalls} | 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyErrorCalls} | - |`,
     ...overall.agyCorruptedArgCalls > 0 ? [
       `| agy-fast corrupted-arg calls | ${overall.agyCorruptedArgCalls} (${overall.agyCorruptedArgWastedSec.toFixed(1)}s) | 0 | ${wf.agyCorruptedArgCalls} (${wf.agyCorruptedArgWastedSec.toFixed(1)}s) | - |`
