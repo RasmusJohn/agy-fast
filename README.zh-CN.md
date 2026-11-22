@@ -17,6 +17,7 @@
 [![支持平台](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-64748B?style=flat-square&labelColor=0F172A)](#快速开始)
 [![MIT 协议](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square&labelColor=0F172A)](LICENSE)
 [![Glama MCP Server](https://glama.ai/mcp/servers/INK-Q/agy-fast/badges/score.svg)](https://glama.ai/mcp/servers/INK-Q/agy-fast)
+[![HOL Guard Verified](https://img.shields.io/endpoint?url=https%3A%2F%2Fhol.org%2Fapi%2Fregistry%2Fbadges%2Fplugin%3Fslug%3Dink-q%252Fagy-fast%26metric%3Dscore&style=flat-square&labelColor=0F172A)](https://hol.org/registry/plugins/ink-q%2Fagy-fast?utm_source=hol_marketplace&utm_medium=plugins_badge&utm_campaign=plugins&utm_content=ink-q%2Fagy-fast&ref=plugin-author-5dc88d78)
 
 [English](README.md) · 简体中文 · [快速开始](#快速开始) · [实测数据](#实测数据) · [MCP 工具](#5-个核心-mcp-工具) · [性能分析报告](docs/ANALYSIS_REPORT.zh-CN.md) · [更新日志](CHANGELOG.md)
 
