@@ -28,6 +28,10 @@
 | :---: | :---: | :---: | :---: |
 | **-33.7%**<br><sub>`≥150k` 长上下文 `-38.2%` · 子代理 `-58.8%`</sub> | **-31.5%**<br><sub>`≥150k` 长上下文 `-36.5%` · 子代理 `-54.0%`</sub> | **-39.7%**<br><sub>未命中缓存新增输入 `-53.7%`</sub> | **0**<br><sub>`≤8.8 KB` 硬上限 · 原生 Diff 与 UI 零影响</sub> |
 
+<p align="center">
+  <img src="assets/demo-before-after-zh.gif" alt="agy-fast 加速前后多文件任务实测对比：6 轮 48.2s 降至 2 轮 14.1s，零溢盘" width="100%" />
+</p>
+
 ## 快速开始
 
 **环境要求：Node.js >= 20**（无需执行 `npm install`，仓库已附带未混淆的零依赖单文件 ESM 产物 `dist/*.mjs`）。可选安装 [`ripgrep` (`rg`)](https://github.com/BurntSushi/ripgrep) 进一步加速代码搜索（未安装时自动回退至纯 Node.js 并发遍历）。

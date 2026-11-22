@@ -28,6 +28,10 @@ English · [简体中文](README.zh-CN.md) · [Quick Start](#quick-start) · [Be
 | :---: | :---: | :---: | :---: |
 | **-33.7%**<br><sub>`-38.2%` ≥150k ctx · `-58.8%` subagents</sub> | **-31.5%**<br><sub>`-36.5%` ≥150k ctx · `-54.0%` subagents</sub> | **-39.7%**<br><sub>`-53.7%` uncached fresh input</sub> | **0**<br><sub>`≤8.8 KB` inline cap · Native diff & UI untouched</sub> |
 
+<p align="center">
+  <img src="assets/demo-before-after.gif" alt="agy-fast Before vs. After multi-file workflow comparison: 6 turns (48.2s) reduced to 2 turns (14.1s) with 0 disk spills" width="100%" />
+</p>
+
 ## Quick Start
 
 **Requirements:** **Node.js >= 20** (no `npm install` needed — pre-built, unminified zero-dependency ESM bundles are included in `dist/`). Optional: [`ripgrep` (`rg`)](https://github.com/BurntSushi/ripgrep) for faster code search (automatically falls back to pure Node.js when absent).
