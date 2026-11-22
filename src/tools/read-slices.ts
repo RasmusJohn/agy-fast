@@ -21,7 +21,8 @@ export interface SliceRequest {
 export interface ReadSlicesInput {
   cwd?: string;
   outlines?: string[];
-  slices?: SliceRequest[];
+  slices?: Array<SliceRequest | string>;
+  lineRanges?: string[];
   maxChars?: number;
 }
 
@@ -2827,22 +2828,59 @@ export async function runReadSlices(
   }
 
   let slices: SliceRequest[] = [];
+  let sliceFormatError: string | null = null;
+  const parseSliceShorthand = (
+    raw: string,
+    label: string,
+  ): SliceRequest | null => {
+    const trimmed = raw.trim();
+    const match = /^(.+):(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)$/.exec(trimmed);
+    if (!match || !match[1]!.trim()) {
+      if (sliceFormatError === null) {
+        sliceFormatError = `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`;
+      }
+      return null;
+    }
+    const filePath = match[1]!.trim();
+    const ranges: Array<[number, number]> = match[2]!
+      .split(",")
+      .map((part) => {
+        const seg = part.trim();
+        const dash = seg.indexOf("-");
+        if (dash === -1) {
+          const n = Number(seg);
+          return [n, n] as [number, number];
+        }
+        return [Number(seg.slice(0, dash)), Number(seg.slice(dash + 1))] as [
+          number,
+          number,
+        ];
+      });
+    return { path: filePath, ranges };
+  };
+
   if (input?.slices !== undefined) {
     const parsedSlices = parseMaybeJsonArray(input.slices);
     if (!parsedSlices.ok) {
       corruptedItems.push({
         label: "slices",
         value: input.slices,
-        expected: "an array of slice objects ({ path, ranges })",
+        expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings",
       });
     } else {
+      const normalizedSlices: SliceRequest[] = [];
       for (let i = 0; i < parsedSlices.value.length; i++) {
         const item = parsedSlices.value[i];
+        if (typeof item === "string") {
+          const parsed = parseSliceShorthand(item, `slices[${i}]`);
+          if (parsed) normalizedSlices.push(parsed);
+          continue;
+        }
         if (!isPlainObject(item)) {
           corruptedItems.push({
             label: `slices[${i}]`,
             value: item,
-            expected: "a slice object ({ path, ranges })",
+            expected: "a slice object ({ path, ranges }) or 'path:start-end' string",
           });
           continue;
         }
@@ -2864,9 +2902,43 @@ export async function runReadSlices(
             }
           }
         }
+        normalizedSlices.push(item as unknown as SliceRequest);
       }
       if (corruptedItems.length === 0) {
-        slices = parsedSlices.value as unknown as SliceRequest[];
+        slices.push(...normalizedSlices);
+      }
+    }
+  }
+
+  if (input?.lineRanges !== undefined) {
+    const parsedSpecs = parseMaybeJsonArray(input.lineRanges);
+    if (!parsedSpecs.ok) {
+      corruptedItems.push({
+        label: "lineRanges",
+        value: input.lineRanges,
+        expected: "an array of 'path:start-end' strings",
+      });
+    } else {
+      const normalizedSpecs: SliceRequest[] = [];
+      for (let i = 0; i < parsedSpecs.value.length; i++) {
+        const item = parsedSpecs.value[i];
+        if (item === null || typeof item === "boolean") {
+          corruptedItems.push({
+            label: `lineRanges[${i}]`,
+            value: item,
+            expected: "a 'path:start-end' string",
+          });
+        } else if (typeof item !== "string" || !item.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`;
+          }
+        } else {
+          const parsed = parseSliceShorthand(item, `lineRanges[${i}]`);
+          if (parsed) normalizedSpecs.push(parsed);
+        }
+      }
+      if (corruptedItems.length === 0) {
+        slices.push(...normalizedSpecs);
       }
     }
   }
@@ -2883,10 +2955,13 @@ export async function runReadSlices(
       isError: true,
     };
   }
+  if (sliceFormatError !== null) {
+    return { text: sliceFormatError, isError: true };
+  }
 
   if (outlines.length === 0 && slices.length === 0) {
     return {
-      text: "Error: provide at least one entry in 'outlines' or 'slices'.",
+      text: "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
       isError: true,
     };
   }

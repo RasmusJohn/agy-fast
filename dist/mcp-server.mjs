@@ -14,7 +14,7 @@ var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
   "2024-11-05"
 ]);
 var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
-var ROOTS_REQUEST_TIMEOUT_MS = 1500;
+var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
 var MAX_KNOWN_ROOTS_IDS = 64;
 var McpStdioServer = class {
   tools = /* @__PURE__ */ new Map();
@@ -24,20 +24,24 @@ var McpStdioServer = class {
   stdinEnded = false;
   onDrainExit;
   onWorkspaceRoots;
+  shouldRequestRoots;
   onInitialize;
   sendToClient;
   clientSupportsRoots = false;
+  rootsDirty = false;
   rootsRequestCount = 0;
   lastAppliedRootsSeq = 0;
   pendingRoots = /* @__PURE__ */ new Map();
   knownRootsIds = /* @__PURE__ */ new Map();
   rootsWaiters = /* @__PURE__ */ new Set();
   activeOutgoingQueue = null;
+  pendingInitFlush = Promise.resolve();
   rootsTimeoutMs;
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
     this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.shouldRequestRoots = options.shouldRequestRoots;
     this.onInitialize = options.onInitialize;
     this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
   }
@@ -72,9 +76,15 @@ var McpStdioServer = class {
     }
     if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
       const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      for (const task of tasks) {
-        task();
-      }
+      void this.pendingInitFlush.then(() => {
+        for (const task of tasks) {
+          try {
+            task();
+          } catch {
+          }
+        }
+      }).catch(() => {
+      });
     }
     const minSeq = this.rootsRequestCount;
     return new Promise((resolve) => {
@@ -111,6 +121,7 @@ var McpStdioServer = class {
     this.pruneKnownRootsIds();
     const send = this.sendToClient;
     const sendTask = () => {
+      if (this.stdinEnded) return;
       send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
     };
     if (this.activeOutgoingQueue) {
@@ -192,7 +203,9 @@ var McpStdioServer = class {
     }
     if (!hasId) {
       if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
-        this.requestRoots(useContentLength);
+        if (this.clientSupportsRoots) {
+          this.rootsDirty = true;
+        }
       }
       return null;
     }
@@ -201,6 +214,7 @@ var McpStdioServer = class {
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : DEFAULT_PROTOCOL_VERSION;
       const capabilities = msg.params?.capabilities;
       this.clientSupportsRoots = capabilities?.roots !== null && typeof capabilities?.roots === "object" && !Array.isArray(capabilities?.roots);
+      this.rootsDirty = this.clientSupportsRoots;
       const rawClientInfo = msg.params?.clientInfo;
       let clientInfo;
       if (rawClientInfo !== null && typeof rawClientInfo === "object" && !Array.isArray(rawClientInfo)) {
@@ -299,7 +313,14 @@ var McpStdioServer = class {
         };
       }
       try {
-        await this.waitForRoots();
+        const needRoots = this.clientSupportsRoots && Boolean(this.onWorkspaceRoots) && (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
+        if (needRoots) {
+          if (this.rootsDirty && !this.stdinEnded) {
+            this.rootsDirty = false;
+            this.requestRoots(useContentLength);
+          }
+          await this.waitForRoots();
+        }
         const res = await tool.handler(args);
         return {
           jsonrpc: "2.0",
@@ -398,7 +419,12 @@ ${serialized}`);
         } finally {
           this.activeOutgoingQueue = prevQueue2;
         }
-        Promise.all(promises).then((responses) => {
+        const isInitOnlyBatch = parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "initialize"
+        ) && !parsed.some(
+          (item) => item !== null && typeof item === "object" && item.method === "tools/call"
+        );
+        const batchDone = Promise.all(promises).then((responses) => {
           const nonNull = responses.filter(
             (r) => r !== null
           );
@@ -408,8 +434,12 @@ ${serialized}`);
           flushOutgoingForCall();
         }).catch(() => {
         }).finally(finish);
+        if (isInitOnlyBatch) {
+          this.pendingInitFlush = batchDone;
+        }
         return;
       }
+      const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
       const prevQueue = this.activeOutgoingQueue;
       this.activeOutgoingQueue = outgoingForCall;
       let promise;
@@ -418,13 +448,16 @@ ${serialized}`);
       } finally {
         this.activeOutgoingQueue = prevQueue;
       }
-      promise.then((response) => {
+      const singleDone = promise.then((response) => {
         if (response !== null) {
           writeResponse(response, useContentLength);
         }
         flushOutgoingForCall();
       }).catch(() => {
       }).finally(finish);
+      if (isSingleInit) {
+        this.pendingInitFlush = singleDone;
+      }
     };
     const drainBuffer = () => {
       while (buffer.length > 0) {
@@ -508,26 +541,25 @@ ${serialized}`);
       buffer = buffer.length === 0 ? buf : Buffer.concat([buffer, buf]);
       drainBuffer();
     });
-    input.on("end", () => {
-      const remaining = buffer.toString("utf8").trim();
+    const handleInputClosed = (flushTrailing) => {
+      if (this.stdinEnded) return;
+      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
       buffer = Buffer.alloc(0);
       this.stdinEnded = true;
-      const lowerRem = remaining.toLowerCase();
-      if (remaining.length > 0 && !lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
-        dispatchRawJson(remaining, false);
+      if (flushTrailing && remaining.length > 0) {
+        const lowerRem = remaining.toLowerCase();
+        if (!lowerRem.startsWith("content-length:") && !lowerRem.startsWith("content-type:")) {
+          dispatchRawJson(remaining, false);
+        }
       }
       this.settleAllPendingRoots();
       if (this.inFlight === 0) {
         triggerDrainExit();
       }
-    });
-    input.on("error", () => {
-      this.stdinEnded = true;
-      this.settleAllPendingRoots();
-      if (this.inFlight === 0) {
-        triggerDrainExit();
-      }
-    });
+    };
+    input.on("end", () => handleInputClosed(true));
+    input.on("close", () => handleInputClosed(false));
+    input.on("error", () => handleInputClosed(false));
   }
 };
 
@@ -6951,22 +6983,50 @@ async function runReadSlices(input) {
     }
   }
   let slices = [];
+  let sliceFormatError = null;
+  const parseSliceShorthand = (raw, label) => {
+    const trimmed = raw.trim();
+    const match = /^(.+):(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)$/.exec(trimmed);
+    if (!match || !match[1].trim()) {
+      if (sliceFormatError === null) {
+        sliceFormatError = `Error: ${label} must use 'path:start-end' or 'path:start1-end1,start2-end2' format (got ${JSON.stringify(raw)}).`;
+      }
+      return null;
+    }
+    const filePath = match[1].trim();
+    const ranges = match[2].split(",").map((part) => {
+      const seg = part.trim();
+      const dash = seg.indexOf("-");
+      if (dash === -1) {
+        const n = Number(seg);
+        return [n, n];
+      }
+      return [Number(seg.slice(0, dash)), Number(seg.slice(dash + 1))];
+    });
+    return { path: filePath, ranges };
+  };
   if (input?.slices !== void 0) {
     const parsedSlices = parseMaybeJsonArray(input.slices);
     if (!parsedSlices.ok) {
       corruptedItems.push({
         label: "slices",
         value: input.slices,
-        expected: "an array of slice objects ({ path, ranges })"
+        expected: "an array of slice objects ({ path, ranges }) or 'path:start-end' strings"
       });
     } else {
+      const normalizedSlices = [];
       for (let i = 0; i < parsedSlices.value.length; i++) {
         const item = parsedSlices.value[i];
+        if (typeof item === "string") {
+          const parsed = parseSliceShorthand(item, `slices[${i}]`);
+          if (parsed) normalizedSlices.push(parsed);
+          continue;
+        }
         if (!isPlainObject(item)) {
           corruptedItems.push({
             label: `slices[${i}]`,
             value: item,
-            expected: "a slice object ({ path, ranges })"
+            expected: "a slice object ({ path, ranges }) or 'path:start-end' string"
           });
           continue;
         }
@@ -6988,9 +7048,42 @@ async function runReadSlices(input) {
             }
           }
         }
+        normalizedSlices.push(item);
       }
       if (corruptedItems.length === 0) {
-        slices = parsedSlices.value;
+        slices.push(...normalizedSlices);
+      }
+    }
+  }
+  if (input?.lineRanges !== void 0) {
+    const parsedSpecs = parseMaybeJsonArray(input.lineRanges);
+    if (!parsedSpecs.ok) {
+      corruptedItems.push({
+        label: "lineRanges",
+        value: input.lineRanges,
+        expected: "an array of 'path:start-end' strings"
+      });
+    } else {
+      const normalizedSpecs = [];
+      for (let i = 0; i < parsedSpecs.value.length; i++) {
+        const item = parsedSpecs.value[i];
+        if (item === null || typeof item === "boolean") {
+          corruptedItems.push({
+            label: `lineRanges[${i}]`,
+            value: item,
+            expected: "a 'path:start-end' string"
+          });
+        } else if (typeof item !== "string" || !item.trim()) {
+          if (sliceFormatError === null) {
+            sliceFormatError = `Error: lineRanges[${i}] must be a non-empty 'path:start-end' string.`;
+          }
+        } else {
+          const parsed = parseSliceShorthand(item, `lineRanges[${i}]`);
+          if (parsed) normalizedSpecs.push(parsed);
+        }
+      }
+      if (corruptedItems.length === 0) {
+        slices.push(...normalizedSpecs);
       }
     }
   }
@@ -7005,9 +7098,12 @@ async function runReadSlices(input) {
       isError: true
     };
   }
+  if (sliceFormatError !== null) {
+    return { text: sliceFormatError, isError: true };
+  }
   if (outlines.length === 0 && slices.length === 0) {
     return {
-      text: "Error: provide at least one entry in 'outlines' or 'slices'.",
+      text: "Error: provide at least one entry in 'outlines', 'slices', or 'lineRanges'.",
       isError: true
     };
   }
@@ -7800,7 +7896,7 @@ function clampInt2(val, min, max, fallback) {
 }
 
 // src/mcp-server.ts
-var SERVER_VERSION = "0.2.8";
+var SERVER_VERSION = "0.2.9";
 function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
   const editsSchema = preferStringEdits ? {
@@ -7933,6 +8029,16 @@ function createAgyFastServer(options = {}) {
         configEditsFormat: savedEditsFormat
       });
     },
+    shouldRequestRoots: (_toolName, args) => {
+      const rawCwd = args.cwd;
+      if (rawCwd !== void 0 && rawCwd !== null && typeof rawCwd !== "string") {
+        return false;
+      }
+      if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
+      const trimmed = rawCwd.trim();
+      const isHome = trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
+      return !path7.isAbsolute(trimmed) && !isHome;
+    },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
@@ -8062,7 +8168,7 @@ function createAgyFastServer(options = {}) {
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes).",
+            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes). For flat shorthand, you may also pass 'lineRanges'.",
             items: {
               type: "object",
               properties: {
@@ -8080,6 +8186,12 @@ function createAgyFastServer(options = {}) {
               },
               required: ["path", "ranges"]
             }
+          },
+          lineRanges: {
+            type: "array",
+            maxItems: 30,
+            items: { type: "string" },
+            description: "Flat shorthand for tiny slices: 'path:start-end' or 'path:start1-end1,start2-end2' (e.g. 'src/server.ts:1-50,120-160')."
           },
           maxChars: {
             type: "integer",
@@ -8194,21 +8306,35 @@ function createAgyFastServer(options = {}) {
 }
 function main() {
   const server = createAgyFastServer();
+  let flushing = false;
   const exitImmediately = () => {
     process.exit(0);
   };
   const flushAndExit = () => {
-    process.stdout.end(() => {
+    if (flushing) return;
+    flushing = true;
+    const failsafe = setTimeout(() => {
       process.exit(0);
-    });
+    }, 150);
+    failsafe.unref();
+    try {
+      process.stdout.end(() => {
+        process.exit(0);
+      });
+    } catch {
+      process.exit(0);
+    }
   };
   process.stdout.on("error", (err) => {
-    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
-      process.exit(0);
+    if (flushing || err.code === "EPIPE" || err.code === "EOF" || err.code === "ECONNRESET" || err.code === "ERR_STREAM_DESTROYED" || err.code === "ERR_STREAM_WRITE_AFTER_END") {
+      exitImmediately();
     }
   });
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
+  if (process.platform === "win32") {
+    process.on("SIGBREAK", exitImmediately);
+  }
   server.listen(process.stdin, process.stdout, flushAndExit);
 }
 main();

@@ -18,7 +18,7 @@ import {
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 
-const SERVER_VERSION = "0.2.8";
+const SERVER_VERSION = "0.2.9";
 
 export interface AgyFastServerOptions {
   env?: NodeJS.ProcessEnv;
@@ -181,6 +181,17 @@ export function createAgyFastServer(
         configEditsFormat: savedEditsFormat,
       });
     },
+    shouldRequestRoots: (_toolName, args) => {
+      const rawCwd = args.cwd;
+      if (rawCwd !== undefined && rawCwd !== null && typeof rawCwd !== "string") {
+        return false;
+      }
+      if (typeof rawCwd !== "string" || !rawCwd.trim()) return true;
+      const trimmed = rawCwd.trim();
+      const isHome =
+        trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\");
+      return !path.isAbsolute(trimmed) && !isHome;
+    },
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
@@ -317,7 +328,7 @@ export function createAgyFastServer(
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes).",
+            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes). For flat shorthand, you may also pass 'lineRanges'.",
             items: {
               type: "object",
               properties: {
@@ -335,6 +346,12 @@ export function createAgyFastServer(
               },
               required: ["path", "ranges"],
             },
+          },
+          lineRanges: {
+            type: "array",
+            maxItems: 30,
+            items: { type: "string" },
+            description: "Flat shorthand for tiny slices: 'path:start-end' or 'path:start1-end1,start2-end2' (e.g. 'src/server.ts:1-50,120-160').",
           },
           maxChars: {
             type: "integer",
@@ -455,22 +472,45 @@ export function createAgyFastServer(
 
 function main(): void {
   const server = createAgyFastServer();
+  let flushing = false;
   const exitImmediately = () => {
     process.exit(0);
   };
   const flushAndExit = () => {
-    // Wait for buffered stdout pipe writes (>64KB) to drain before exiting
-    process.stdout.end(() => {
+    if (flushing) return;
+    flushing = true;
+    // Failsafe timer prevents broken Windows named pipes from stalling stdout.end()
+    // and provoking forced CTRL_C/CTRL_BREAK termination (0xc000013a).
+    const failsafe = setTimeout(() => {
       process.exit(0);
-    });
+    }, 150);
+    failsafe.unref();
+    try {
+      // Wait for buffered stdout pipe writes (>64KB) to drain before exiting
+      process.stdout.end(() => {
+        process.exit(0);
+      });
+    } catch {
+      process.exit(0);
+    }
   };
   process.stdout.on("error", (err: NodeJS.ErrnoException) => {
-    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
-      process.exit(0);
+    if (
+      flushing ||
+      err.code === "EPIPE" ||
+      err.code === "EOF" ||
+      err.code === "ECONNRESET" ||
+      err.code === "ERR_STREAM_DESTROYED" ||
+      err.code === "ERR_STREAM_WRITE_AFTER_END"
+    ) {
+      exitImmediately();
     }
   });
   process.on("SIGINT", exitImmediately);
   process.on("SIGTERM", exitImmediately);
+  if (process.platform === "win32") {
+    process.on("SIGBREAK", exitImmediately);
+  }
   server.listen(process.stdin, process.stdout, flushAndExit);
 }
 

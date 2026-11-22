@@ -5,6 +5,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.9] - 2026-11-22
+
+### Added & Improved
+
+- **Water-filling fair token budgets, unified HTML/Vue/Svelte outliner & proactive build-log folding (#14, co-authored with `@BLACK-BIRTHDAY`)**
+  - Introduced exact water-filling budget allocation (`computeWaterFillBudgets`) across `output-filter`, `run_checks` (`compact` and `full`), and `read_slices`/`quick_outline`, so short error outputs and compact files keep their full context while oversized outputs share the remaining inline budget fairly under the hard `≤8.8 KB` UTF-8 cap.
+  - Added a unified HTML/Vue/Svelte closed-range tag-stack outliner (supporting `<template>`, `<script>`, `<style>`, landmarks, `id`/attributes, multiline tags, and comment/script/style skipping) plus breadth-first top-level-first symbol water-filling in `read_slices` / `quick_outline` so large multi-file batches preserve every file's top-level map instead of starving later files.
+  - Added proactive green build-log folding (e.g. `tsc`, `vite`, `webpack`, `esbuild`, `cargo`, `go build`, `pytest`) and tightened benign zero-count diagnostic lines (`0 errors`, `0 warnings`, `0 failed`) in `run_checks`.
+- **`quick_outline`, Head-Tail command folding, user-owned `AGENTS.local.md`, snapshot guards & Windows PowerShell unwrapping (#16, thanks `@757530253`)**
+  - Added eager `quick_outline({ paths })` flat-schema tool alongside `read_slices` to eliminate multi-level nesting friction when mapping unknown large files.
+  - Upgraded `run_checks` failure truncation to UTF-8/surrogate-safe header-aware Head-Tail folding so both initial setup errors and trailing stack traces/summaries stay visible.
+  - Preserved user-owned `rules/*.local.md` files (with `trigger: always_on` frontmatter diagnostics in `doctor` and `.gitignore` exclusion) across installs and auto-updates.
+  - Hardened `SessionStart` snapshot scanning with a 2-tier system/home-directory skip list, `250 ms` scan circuit-breaker, and explicit stdout-flushed exit (`writeAndExit`), plus Windows `powershell -Command` allowlisted unwrapping.
+- **`read_slices` flat `lineRanges` shorthand (#17, thanks `@757530253`)**
+  - Added flat `lineRanges: ["path:start-end,start2-end2"]` parameter (and runtime string shorthand support in `slices`, including Windows drive-letter paths) while keeping Gemini/Antigravity eager schemas free of `oneOf`.
+- **Visual demos, security policy & MCP directory compliance**
+  - Added EN/ZH Before-vs-After demo GIFs and Social Preview card in `assets/`, embedded Glama & GitHub Stars badges in READMEs, and added `SECURITY.md`, `.github/dependabot.yml`, `glama.json`, and a minimal non-root `Dockerfile` for Glama container introspection.
+
+### Fixed
+
+- **Windows `SessionStart` hook path mismatch across real workspaces (#17, thanks `@757530253`)**
+  - Replaced the CWD-dependent `node dist/session-start.mjs` command in `hooks.json` with a zero-metacharacter cross-platform `node -e` loader that resolves `PLUGIN_ROOT` → `AGY_PLUGIN_ROOT` → `.` → `.agents/plugins/agy-fast` → `~/.gemini/config/plugins/agy-fast` via `pathToFileURL`, fixing `Cannot find module '<WORKSPACE_ROOT>\dist\session-start.mjs'` on Windows CLI builds where `cmd /c` starts in the project workspace.
+- **Lazy on-demand MCP `roots/list` handshake isolation (#17, thanks `@757530253`)**
+  - Stopped emitting server-initiated `roots/list` requests inside `notifications/initialized`; `initialize → notifications/initialized → tools/list` is now 100% unidirectional, and `roots/list` is requested lazily (bounded at `1000 ms`, skipped entirely when an explicit absolute `cwd` is passed) only on the first `tools/call` that needs a workspace root.
+- **Clean Windows MCP process teardown (`0xc000013a`) (#17, thanks `@757530253`)**
+  - Handled Windows `SIGBREAK` (`CTRL_BREAK_EVENT`), added `stdin` `close` teardown alongside `end`/`error`, and added a `150 ms` `.unref()` exit failsafe around `stdout.end()` so broken Windows pipes cannot stall shutdown and trigger forced termination (`STATUS_CONTROL_C_EXIT`).
+- **Git `textconv` bypass, symlinked-`HOME` installer guard & Windows `taskkill` crash (#12)**
+  - Blocked `git status -v`/`--verbose` and `-u`/`--untracked-files` textconv/output bypasses, protected symlinked `HOME` directories during install/uninstall staging, and prevented Windows `taskkill` spawn crashes on missing binaries.
+
+### 简体中文摘要（v0.2.9）
+
+- **公平注水预算、统一 HTML/Vue/Svelte 大纲与绿色构建日志折叠（#14，联合贡献 `@BLACK-BIRTHDAY`）**：在 `output-filter`、`run_checks` 与 `read_slices`/`quick_outline` 引入精确注水算法（Water-filling）公平分配 `≤8.8 KB` 预算；新增支持闭合行号的 HTML/Vue/Svelte 统一标签栈大纲与广度优先顶层符号打包；自动折叠 `tsc`/`vite`/`cargo`/`pytest` 等冗长绿色构建日志。
+- **`quick_outline`、Head-Tail 首尾折叠、本地规则持久化与快照熔断（#16，感谢 `@757530253`）**：新增单参数急加载工具 `quick_outline({ paths })`；升级失败命令输出为 UTF-8 安全的首尾折叠；更新/重装自动保留 `rules/*.local.md`；为 `SessionStart` 补齐系统/家目录双层跳过清单与 `250 ms` 扫描熔断；支持 Windows `powershell -Command` 白名单解包。
+- **彻底修复 Windows 真实工程下的 4 项实测问题（#17，感谢 `@757530253`）**：
+  - `hooks.json` 改用零 Shell 元字符的跨平台 `node -e` 启动器按优先级自动定位 `PLUGIN_ROOT` / 项目插件 / 全局插件并通过 `pathToFileURL` 加载，根治 Windows 下 `cmd /c` 工作目录落到业务工程导致 `Cannot find module` 崩溃；
+  - 将 MCP `roots/list` 改为首次需要默认 `cwd` 的 `tools/call` 时按需懒加载（超时 1s，显式绝对路径 `cwd` 直接跳过），保证启动握手 `initialize → initialized → tools/list` 100% 单向纯净不卡连接；
+  - 补齐 Windows `SIGBREAK` 信号捕获、`stdin` `close` 监听与 `stdout.end` 150ms 强退兜底，消除退出时的 `0xc000013a` 异常；
+  - 为 `read_slices` 新增扁平字符串简写参数 `lineRanges`（如 `"src/server.ts:1-50,120-160"`，兼容 Windows 盘符路径）。
+- **安全加固、实测对比动图与 MCP 目录合规（#12）**：封堵 `git status -v` 旁路、修复软链 `HOME` 安装保护与 Windows `taskkill` 异常；新增中英文 Before/After 对比动图、Glama 徽章、`SECURITY.md`、`glama.json` 与最小非 root `Dockerfile`。
+
+---
+
 ## [0.2.8] - 2026-11-22
 
 ### Added & Improved

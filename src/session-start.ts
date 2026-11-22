@@ -81,6 +81,7 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
       clearTimeout(timer);
       process.stdin.off("data", onData);
       process.stdin.off("end", onEnd);
+      process.stdin.off("close", onEnd);
       process.stdin.off("error", onError);
       // Keep a no-op error listener so late pipe resets never crash fail-open exit
       process.stdin.on("error", ignoreLateError);
@@ -97,6 +98,7 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
 
     process.stdin.on("data", onData);
     process.stdin.on("end", onEnd);
+    process.stdin.on("close", onEnd);
     process.stdin.on("error", onError);
   });
 }
@@ -104,12 +106,20 @@ async function readStdin(timeoutMs = 1500): Promise<string> {
 function writeAndExit(payload: string): void {
   // Explicitly exit after stdout flushes so any abandoned libuv fs.readdir/fs.readFile
   // threadpool call after scanTimeoutMs cannot keep the SessionStart subprocess alive.
-  process.stdout.on("error", () => {
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
     process.exit(0);
-  });
-  process.stdout.write(payload, () => {
-    process.exit(0);
-  });
+  };
+  const failsafe = setTimeout(done, 150);
+  failsafe.unref();
+  process.stdout.on("error", done);
+  try {
+    process.stdout.write(payload, done);
+  } catch {
+    done();
+  }
 }
 
 async function main(): Promise<void> {

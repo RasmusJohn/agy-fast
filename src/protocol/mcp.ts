@@ -58,7 +58,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
 ]);
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 
-const ROOTS_REQUEST_TIMEOUT_MS = 1500;
+const ROOTS_REQUEST_TIMEOUT_MS = 1000;
 const MAX_KNOWN_ROOTS_IDS = 64;
 
 export class McpStdioServer {
@@ -69,18 +69,24 @@ export class McpStdioServer {
   private stdinEnded = false;
   private onDrainExit?: () => void;
   private readonly onWorkspaceRoots?: (paths: string[]) => void;
+  private readonly shouldRequestRoots?: (
+    toolName: string,
+    args: Record<string, unknown>,
+  ) => boolean;
   private readonly onInitialize?: (info: {
     clientInfo?: McpClientInfo;
     protocolVersion: string;
   }) => void;
   private sendToClient?: (request: JsonRpcOutgoingRequest, useContentLength: boolean) => void;
   private clientSupportsRoots = false;
+  private rootsDirty = false;
   private rootsRequestCount = 0;
   private lastAppliedRootsSeq = 0;
   private readonly pendingRoots = new Map<string, { seq: number; timer: NodeJS.Timeout }>();
   private readonly knownRootsIds = new Map<string, number>();
   private readonly rootsWaiters = new Set<{ minSeq: number; resolve: () => void }>();
   private activeOutgoingQueue: Array<() => void> | null = null;
+  private pendingInitFlush: Promise<void> = Promise.resolve();
   private readonly rootsTimeoutMs: number;
 
   constructor(options: {
@@ -88,6 +94,11 @@ export class McpStdioServer {
     version: string;
     // Receives the client's workspace root directories (MCP roots).
     onWorkspaceRoots?: (paths: string[]) => void;
+    // Optional predicate to skip lazy roots/list when a tool call already specifies an absolute cwd.
+    shouldRequestRoots?: (
+      toolName: string,
+      args: Record<string, unknown>,
+    ) => boolean;
     // Receives client metadata during MCP initialize before tools/list is served.
     onInitialize?: (info: {
       clientInfo?: McpClientInfo;
@@ -98,6 +109,7 @@ export class McpStdioServer {
     this.serverName = options.name;
     this.serverVersion = options.version;
     this.onWorkspaceRoots = options.onWorkspaceRoots;
+    this.shouldRequestRoots = options.shouldRequestRoots;
     this.onInitialize = options.onInitialize;
     this.rootsTimeoutMs =
       typeof options.rootsTimeoutMs === "number" &&
@@ -138,13 +150,23 @@ export class McpStdioServer {
     if (this.pendingRoots.size === 0 || this.stdinEnded) {
       return Promise.resolve();
     }
-    // If a roots/list request was queued earlier in the same JSON-RPC batch,
-    // flush it now so awaiting it inside Promise.all cannot deadlock the batch.
+    // If a roots/list request was queued earlier in the same JSON-RPC batch or
+    // pipelined chunk, wait for any preceding initialize response write to finish
+    // first so stdout ordering stays strictly deterministic, without deadlocking
+    // an interactive batch that itself contains both initialize and tools/call.
     if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
       const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      for (const task of tasks) {
-        task();
-      }
+      void this.pendingInitFlush
+        .then(() => {
+          for (const task of tasks) {
+            try {
+              task();
+            } catch {
+              // Ignore write errors if stdout already closed/destroyed
+            }
+          }
+        })
+        .catch(() => {});
     }
     const minSeq = this.rootsRequestCount;
     return new Promise<void>((resolve) => {
@@ -188,6 +210,7 @@ export class McpStdioServer {
     this.pruneKnownRootsIds();
     const send = this.sendToClient;
     const sendTask = () => {
+      if (this.stdinEnded) return;
       send({ jsonrpc: "2.0", id, method: "roots/list" }, useContentLength);
     };
     if (this.activeOutgoingQueue) {
@@ -284,10 +307,15 @@ export class McpStdioServer {
       };
     }
 
-    // Notifications (no id) must not produce a response
+    // Notifications (no id) must not produce a response.
+    // Defer roots/list until the first tools/call that actually needs a default workspace
+    // root so the initialize -> initialized -> tools/list startup handshake stays strictly
+    // unidirectional and cannot wedge clients whose roots handler waits on auth/workspace setup.
     if (!hasId) {
       if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {
-        this.requestRoots(useContentLength);
+        if (this.clientSupportsRoots) {
+          this.rootsDirty = true;
+        }
       }
       return null;
     }
@@ -305,6 +333,7 @@ export class McpStdioServer {
         capabilities?.roots !== null &&
         typeof capabilities?.roots === "object" &&
         !Array.isArray(capabilities?.roots);
+      this.rootsDirty = this.clientSupportsRoots;
       const rawClientInfo = msg.params?.clientInfo;
       let clientInfo: McpClientInfo | undefined;
       if (
@@ -417,7 +446,17 @@ export class McpStdioServer {
       }
 
       try {
-        await this.waitForRoots();
+        const needRoots =
+          this.clientSupportsRoots &&
+          Boolean(this.onWorkspaceRoots) &&
+          (this.shouldRequestRoots ? this.shouldRequestRoots(name, args) : true);
+        if (needRoots) {
+          if (this.rootsDirty && !this.stdinEnded) {
+            this.rootsDirty = false;
+            this.requestRoots(useContentLength);
+          }
+          await this.waitForRoots();
+        }
         const res = await tool.handler(args);
         return {
           jsonrpc: "2.0",
@@ -530,7 +569,20 @@ export class McpStdioServer {
         } finally {
           this.activeOutgoingQueue = prevQueue;
         }
-        Promise.all(promises)
+        const isInitOnlyBatch =
+          parsed.some(
+            (item) =>
+              item !== null &&
+              typeof item === "object" &&
+              (item as JsonRpcRequest).method === "initialize",
+          ) &&
+          !parsed.some(
+            (item) =>
+              item !== null &&
+              typeof item === "object" &&
+              (item as JsonRpcRequest).method === "tools/call",
+          );
+        const batchDone = Promise.all(promises)
           .then((responses) => {
             const nonNull = responses.filter(
               (r): r is JsonRpcResponse => r !== null,
@@ -544,9 +596,16 @@ export class McpStdioServer {
             // Isolate unexpected handler rejections from crashing stdio loop
           })
           .finally(finish);
+        if (isInitOnlyBatch) {
+          this.pendingInitFlush = batchDone;
+        }
         return;
       }
 
+      const isSingleInit =
+        parsed !== null &&
+        typeof parsed === "object" &&
+        (parsed as JsonRpcRequest).method === "initialize";
       const prevQueue = this.activeOutgoingQueue;
       this.activeOutgoingQueue = outgoingForCall;
       let promise: Promise<JsonRpcResponse | null>;
@@ -555,7 +614,7 @@ export class McpStdioServer {
       } finally {
         this.activeOutgoingQueue = prevQueue;
       }
-      promise
+      const singleDone = promise
         .then((response) => {
           if (response !== null) {
             writeResponse(response, useContentLength);
@@ -566,6 +625,9 @@ export class McpStdioServer {
           // Isolate unexpected handler rejections from crashing stdio loop
         })
         .finally(finish);
+      if (isSingleInit) {
+        this.pendingInitFlush = singleDone;
+      }
     };
 
     const drainBuffer = (): void => {
@@ -669,31 +731,28 @@ export class McpStdioServer {
       drainBuffer();
     });
 
-    input.on("end", () => {
-      // Flush any trailing line without newline
-      const remaining = buffer.toString("utf8").trim();
+    const handleInputClosed = (flushTrailing: boolean): void => {
+      if (this.stdinEnded) return;
+      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
       buffer = Buffer.alloc(0);
       this.stdinEnded = true;
-      const lowerRem = remaining.toLowerCase();
-      if (
-        remaining.length > 0 &&
-        !lowerRem.startsWith("content-length:") &&
-        !lowerRem.startsWith("content-type:")
-      ) {
-        dispatchRawJson(remaining, false);
+      if (flushTrailing && remaining.length > 0) {
+        const lowerRem = remaining.toLowerCase();
+        if (
+          !lowerRem.startsWith("content-length:") &&
+          !lowerRem.startsWith("content-type:")
+        ) {
+          dispatchRawJson(remaining, false);
+        }
       }
       this.settleAllPendingRoots();
       if (this.inFlight === 0) {
         triggerDrainExit();
       }
-    });
+    };
 
-    input.on("error", () => {
-      this.stdinEnded = true;
-      this.settleAllPendingRoots();
-      if (this.inFlight === 0) {
-        triggerDrainExit();
-      }
-    });
+    input.on("end", () => handleInputClosed(true));
+    input.on("close", () => handleInputClosed(false));
+    input.on("error", () => handleInputClosed(false));
   }
 }

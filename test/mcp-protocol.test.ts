@@ -385,7 +385,40 @@ describe("MCP Stdio Server end-to-end", () => {
     const rootsIdx = lines.findIndex((l) => l.method === "roots/list");
     assert.ok(initIdx !== -1 && rootsIdx !== -1 && initIdx < rootsIdx);
 
-    // Relative cwd resolves against the workspace root without mutating process.cwd().
+    // Startup handshake (initialize -> notifications/initialized -> tools/list) must be strictly
+    // unidirectional (0 server-initiated roots/list frames) so it cannot wedge client Connect().
+    const handshakeRes = await sendMessagesToServer(
+      [
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: { roots: { listChanged: true } },
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/list" },
+        // Explicit absolute cwd also skips lazy roots/list completely
+        {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: { name: "read_slices", arguments: { cwd: tmpDir, outlines: ["demo.ts"] } },
+        },
+      ].map((m) => `${JSON.stringify(m)}\n`),
+    );
+    assert.equal(handshakeRes.code, 0);
+    assert.equal(handshakeRes.stderr, "");
+    const handshakeLines = handshakeRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(handshakeLines.filter((l) => l.method === "roots/list").length, 0);
+    const hsCall = handshakeLines.find((l) => l.id === 3);
+    assert.equal(hsCall?.result?.isError, false);
+    assert.match(hsCall?.result?.content?.[0]?.text ?? "", /greet/);
+
+    // Relative cwd resolves against the lazily fetched workspace root without mutating process.cwd().
     const subDir = path.join(tmpDir, "sub-root-check");
     await fs.mkdir(subDir, { recursive: true });
     await fs.writeFile(path.join(subDir, "nested.ts"), "export function nestedFn() { return 42; }\n", "utf8");
@@ -404,14 +437,14 @@ describe("MCP Stdio Server end-to-end", () => {
         { jsonrpc: "2.0", method: "notifications/initialized" },
         {
           jsonrpc: "2.0",
-          id: "agy-fast-roots-1",
-          result: { roots: [{ uri: "file:///nonexistent-agy-fast-root-xyz" }, { uri: pathToFileURL(tmpDir).href }] },
-        },
-        {
-          jsonrpc: "2.0",
           id: 2,
           method: "tools/call",
           params: { name: "read_slices", arguments: { cwd: "sub-root-check", outlines: ["nested.ts"] } },
+        },
+        {
+          jsonrpc: "2.0",
+          id: "agy-fast-roots-1",
+          result: { roots: [{ uri: "file:///nonexistent-agy-fast-root-xyz" }, { uri: pathToFileURL(tmpDir).href }] },
         },
         {
           jsonrpc: "2.0",
@@ -424,6 +457,7 @@ describe("MCP Stdio Server end-to-end", () => {
     assert.equal(relRes.code, 0);
     assert.equal(relRes.stderr, "");
     const relLines = relRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(relLines.filter((l) => l.method === "roots/list").length, 1);
     const relCall = relLines.find((l) => l.id === 2);
     assert.equal(relCall.result.isError, false);
     assert.match(relCall.result.content[0].text, /nestedFn/);
@@ -451,6 +485,12 @@ describe("MCP Stdio Server end-to-end", () => {
             params: { name: "read_slices", arguments: { outlines: ["root2.ts"] } },
           },
           { jsonrpc: "2.0", method: "notifications/roots/list_changed" },
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "read_slices", arguments: { outlines: ["root2.ts"] } },
+          },
           // Newer roots-2 arrives first, stale roots-1 arrives later (must not revert root or emit -32600)
           {
             jsonrpc: "2.0",
@@ -468,7 +508,7 @@ describe("MCP Stdio Server end-to-end", () => {
       assert.equal(overlapRes.stderr, "");
       const ovLines = overlapRes.stdout.trim().split("\n").map((l) => JSON.parse(l));
       assert.equal(ovLines.filter((l) => l.error).length, 0);
-      const ovCall = ovLines.find((l) => l.id === 2);
+      const ovCall = ovLines.find((l) => l.id === 3);
       assert.equal(ovCall?.result?.isError, false);
       assert.match(ovCall?.result?.content?.[0]?.text ?? "", /fromRoot2/);
 
@@ -484,11 +524,17 @@ describe("MCP Stdio Server end-to-end", () => {
           { jsonrpc: "2.0", method: "notifications/initialized" },
           {
             jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "read_slices", arguments: { outlines: ["nonexistent-probe.ts"] } },
+          },
+          {
+            jsonrpc: "2.0",
             id: "agy-fast-roots-1",
             result: { roots: [null, { uri: "file:not a valid url" }, { uri: "file:///nonexistent-agy-fast-99999" }] },
           },
           { jsonrpc: "2.0", method: "notifications/roots/list_changed" },
-          // Deliberately leave agy-fast-roots-2 unanswered before EOF
+          // Deliberately leave lazy roots-2 unanswered before EOF on next call
           {
             jsonrpc: "2.0",
             id: 3,
@@ -505,8 +551,8 @@ describe("MCP Stdio Server end-to-end", () => {
       assert.equal(badCall?.result?.isError, false);
       assert.match(badCall?.result?.content?.[0]?.text ?? "", /greet/);
 
-      // Batched [initialize, notifications/initialized] emits initialize response BEFORE roots/list;
-      // "error": null and uppercase FILE: URI still apply roots; non-string cwd returns clean error.
+      // Batched [initialize, notifications/initialized] emits ONLY the initialize response (no eager roots/list);
+      // lazy roots/list triggers on tools/call; "error": null and uppercase FILE: URI still apply roots; non-string cwd returns clean error.
       const batchRes = await sendMessagesToServer([
         JSON.stringify([
           {
@@ -519,15 +565,15 @@ describe("MCP Stdio Server end-to-end", () => {
         ]) + "\n",
         JSON.stringify({
           jsonrpc: "2.0",
-          id: "agy-fast-roots-1",
-          error: null,
-          result: { roots: [{ uri: pathToFileURL(tmpDir).href.replace(/^file:/, "FILE:") }] },
-        }) + "\n",
-        JSON.stringify({
-          jsonrpc: "2.0",
           id: 4,
           method: "tools/call",
           params: { name: "read_slices", arguments: { outlines: ["demo.ts"] } },
+        }) + "\n",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "agy-fast-roots-1",
+          error: null,
+          result: { roots: [{ uri: pathToFileURL(tmpDir).href.replace(/^file:/, "FILE:") }] },
         }) + "\n",
         JSON.stringify({
           jsonrpc: "2.0",

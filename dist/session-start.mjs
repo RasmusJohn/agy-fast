@@ -1583,6 +1583,7 @@ async function readStdin(timeoutMs = 1500) {
       clearTimeout(timer);
       process.stdin.off("data", onData);
       process.stdin.off("end", onEnd);
+      process.stdin.off("close", onEnd);
       process.stdin.off("error", onError);
       process.stdin.on("error", ignoreLateError);
       process.stdin.pause();
@@ -1595,16 +1596,25 @@ async function readStdin(timeoutMs = 1500) {
     timer.unref();
     process.stdin.on("data", onData);
     process.stdin.on("end", onEnd);
+    process.stdin.on("close", onEnd);
     process.stdin.on("error", onError);
   });
 }
 function writeAndExit(payload) {
-  process.stdout.on("error", () => {
+  let exited = false;
+  const done = () => {
+    if (exited) return;
+    exited = true;
     process.exit(0);
-  });
-  process.stdout.write(payload, () => {
-    process.exit(0);
-  });
+  };
+  const failsafe = setTimeout(done, 150);
+  failsafe.unref();
+  process.stdout.on("error", done);
+  try {
+    process.stdout.write(payload, done);
+  } catch {
+    done();
+  }
 }
 async function main() {
   try {

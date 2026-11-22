@@ -515,4 +515,99 @@ describe("session-start hook", () => {
       await fs.rm(fakeHomeDir, { recursive: true, force: true });
     }
   });
+
+  it("hooks.json command resolves dist/session-start.mjs from an unrelated workspace CWD", async () => {
+    const hooksConfig = JSON.parse(
+      await fs.readFile(path.resolve(process.cwd(), "hooks.json"), "utf8"),
+    ) as {
+      "agy-fast-snapshot": { SessionStart: Array<{ command: string }> };
+    };
+    const hookCmd = hooksConfig["agy-fast-snapshot"].SessionStart[0]!.command;
+    // Must stay free of shell metacharacters that differ across sh -c and Windows cmd /c
+    assert.doesNotMatch(hookCmd, /[$%!<>|&`\\]/);
+
+    const runShellHook = (
+      cwd: string,
+      stdinText: string,
+      extraEnv: Record<string, string | undefined>,
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const env: NodeJS.ProcessEnv = { ...process.env, AGY_FAST_AUTO_UPDATE: "off" };
+        delete env.PLUGIN_ROOT;
+        delete env.AGY_PLUGIN_ROOT;
+        for (const [k, v] of Object.entries(extraEnv)) {
+          if (v === undefined) delete env[k];
+          else env[k] = v;
+        }
+        const child = spawn(hookCmd, {
+          cwd,
+          env,
+          shell: true,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+        child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+        child.stdin.end(stdinText);
+      });
+
+    const unrelatedWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-unrelated-ws-"));
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-fake-home-"));
+    try {
+      await fs.writeFile(
+        path.join(unrelatedWorkspace, "package.json"),
+        JSON.stringify({ name: "unrelated-biz-app", scripts: { test: "node --test" } }),
+        "utf8",
+      );
+
+      // 1. With PLUGIN_ROOT set and CWD = unrelated business workspace
+      const withRoot = await runShellHook(
+        unrelatedWorkspace,
+        JSON.stringify({ cwd: unrelatedWorkspace, workspacePaths: [unrelatedWorkspace] }),
+        { PLUGIN_ROOT: process.cwd(), HOME: fakeHome, USERPROFILE: fakeHome },
+      );
+      assert.equal(withRoot.code, 0, `stderr: ${withRoot.stderr}`);
+      assert.equal(withRoot.stderr, "");
+      const msg1: string = JSON.parse(withRoot.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.match(msg1, /unrelated-biz-app/);
+
+      // 2. Without PLUGIN_ROOT, falls back to ~/.gemini/config/plugins/agy-fast
+      const globalPlugin = path.join(fakeHome, ".gemini", "config", "plugins", "agy-fast");
+      await fs.mkdir(path.join(globalPlugin, "dist"), { recursive: true });
+      await fs.copyFile(path.resolve(process.cwd(), "plugin.json"), path.join(globalPlugin, "plugin.json"));
+      await fs.copyFile(HOOK_SCRIPT, path.join(globalPlugin, "dist", "session-start.mjs"));
+
+      const viaHomeFallback = await runShellHook(
+        unrelatedWorkspace,
+        JSON.stringify({ cwd: unrelatedWorkspace, workspacePaths: [unrelatedWorkspace] }),
+        { HOME: fakeHome, USERPROFILE: fakeHome },
+      );
+      assert.equal(viaHomeFallback.code, 0, `stderr: ${viaHomeFallback.stderr}`);
+      assert.equal(viaHomeFallback.stderr, "");
+      const msg2: string = JSON.parse(viaHomeFallback.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+      assert.match(msg2, /unrelated-biz-app/);
+
+      // 3. When no plugin dir exists anywhere, fails open with {} and exit code 0
+      const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-empty-home-"));
+      try {
+        const failOpen = await runShellHook(
+          unrelatedWorkspace,
+          JSON.stringify({ cwd: unrelatedWorkspace }),
+          { HOME: emptyHome, USERPROFILE: emptyHome },
+        );
+        assert.equal(failOpen.code, 0);
+        assert.equal(failOpen.stderr, "");
+        assert.deepEqual(JSON.parse(failOpen.stdout), {});
+      } finally {
+        await fs.rm(emptyHome, { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(unrelatedWorkspace, { recursive: true, force: true });
+      await fs.rm(fakeHome, { recursive: true, force: true });
+    }
+  });
 });

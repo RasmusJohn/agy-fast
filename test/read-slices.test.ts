@@ -1143,4 +1143,69 @@ describe("read_slices", () => {
     assert.equal(Number(h2Match[2]), (80 - Number(h2Match[1])) * 2 + 1);
     assert.equal(Number(h2Match[3]), 160);
   });
+
+  it("supports flat lineRanges and string slice shorthand including multi-range and single-line specs", async () => {
+    const fileRel = "shorthand/sample.ts";
+    await fs.mkdir(path.join(tmpDir, "shorthand"), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, fileRel),
+      [
+        "const line1 = 'one';",
+        "const line2 = 'two';",
+        "const line3 = 'three';",
+        "const line4 = 'four';",
+        "const line5 = 'five';",
+        "const line6 = 'six';",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // 1. Flat lineRanges parameter with multi-range and single-line spec
+    const res1 = await runReadSlices({
+      cwd: tmpDir,
+      lineRanges: [`${fileRel}:1-2,5-6`, `${fileRel}:4`],
+    });
+    assert.equal(res1.isError, false);
+    assert.match(res1.text, /const line1 = 'one'/);
+    assert.match(res1.text, /const line2 = 'two'/);
+    assert.doesNotMatch(res1.text, /const line3 = 'three'/);
+    assert.match(res1.text, /const line4 = 'four'/);
+    assert.match(res1.text, /const line5 = 'five'/);
+    assert.match(res1.text, /const line6 = 'six'/);
+
+    // 2. Runtime string shorthand inside slices[] alongside object form
+    const res2 = await runReadSlices({
+      cwd: tmpDir,
+      slices: [`${fileRel}:2-3`, { path: fileRel, ranges: [[6, 6]] }],
+    });
+    assert.equal(res2.isError, false);
+    assert.match(res2.text, /const line2 = 'two'/);
+    assert.match(res2.text, /const line3 = 'three'/);
+    assert.match(res2.text, /const line6 = 'six'/);
+
+    // 3. Windows drive-letter path splits on the last colon before ranges (hits ENOENT, not format error)
+    const driveRes = await runReadSlices({
+      cwd: tmpDir,
+      lineRanges: ["C:\\nonexistent-agy-dir\\sample.ts:1-2"],
+    });
+    assert.equal(driveRes.isError, false);
+    assert.match(driveRes.text, /ERROR:.*ENOENT|no such file/i);
+    assert.doesNotMatch(driveRes.text, /path:start-end/);
+
+    // 4. Missing line range returns clear shorthand format error
+    const badSpec = await runReadSlices({
+      cwd: tmpDir,
+      lineRanges: ["src/missing-range.ts"],
+    });
+    assert.equal(badSpec.isError, true);
+    assert.match(badSpec.text, /path:start-end/);
+
+    // 5. Boolean/null corruption in lineRanges still trips corrupted-array circuit breaker
+    const corrupted = await runReadSlices({
+      cwd: tmpDir,
+      lineRanges: [null as unknown as string],
+    });
+    assert.equal(corrupted.isError, true);
+    assert.match(corrupted.text, /Validation failed/);
+  });
 });
