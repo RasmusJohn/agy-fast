@@ -192,10 +192,10 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 - **可选内联 `verify`**：落盘后直接执行构建/类型检查/测试命令，自动过滤 Pino/Bunyan info JSON 与 Maven 尾注噪声，保留核心报错根因。
 
 ### 3. `quick_outline` — 极简多语言符号大纲提取
-- **扁平参数，单次最多 40 个文件** *（推荐 10–20 个/批）*：仅需传入扁平 `paths: string[]` 即可提取起止行号，覆盖 **TypeScript / JavaScript** *（含 Fastify/Express 路由与测试块）*、**Vue / Svelte SFC**、**CSS / SCSS / Less**、**Python**、**Godot GDScript（`.gd`）**、**Go**、**Rust**、**Java / Kotlin / C# / Swift / C / C++**、**Shell**、**Markdown** 与 **JSON / YAML**，配合并行内置 `read_file` 极简顺手。
+- **扁平参数，单次最多 40 个文件** *（推荐 10–20 个/批）*：仅需传入扁平 `paths: string[]` 即可提取起止行号，覆盖 **TypeScript / JavaScript** *（含 Fastify/Express 路由与测试块）*、**HTML / Vue / Svelte**、**CSS / SCSS / Less**、**Python**、**Godot GDScript（`.gd`）**、**Go**、**Rust**、**Java / Kotlin / C# / Swift / C / C++**、**Shell**、**Markdown** 与 **JSON / YAML**，配合并行内置 `read_file` 极简顺手。
 
 ### 4. `read_slices` — 符号大纲 + 精确行段切片
-- **大纲与小切片合一**：支持同等 14 种格式符号大纲，并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
+- **大纲与小切片合一**：支持同等 15 种格式符号大纲（支持单文件广度优先水填充分配），并可在同一次请求中顺带读取少量小行段（总输出死守 `≤8.8 KB` UTF-8 上限）；大段正文读取自动引导至并行内置 `read_file`。
 
 ### 5. `run_checks` — 并发构建、规范检查、测试与诊断执行器
 - **单次最多 12 条命令**：在受控并发池（`concurrency: 1..8`）中并行执行独立非交互命令，支持单条超时强杀（`1..170 s`，单次调用共享 `170 s` 预算以适配 Antigravity `180 s` MCP 上限）、ANSI 转义符清理，并在 Windows 下自动透明解包针对白名单 CLI（`git`/`npm`/`node`/`rg`/`pytest`/`cargo` 等）的冗余 `powershell -Command "..."` 包装，免去 PowerShell 冷启动开销（PowerShell cmdlet、别名与管道完全原样保留）。

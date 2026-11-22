@@ -8,7 +8,9 @@ import {
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
+  computeWaterFillBudgets,
   fitSectionsToByteBudget,
+  sliceSafeChars,
 } from "../utils/output-filter.js";
 
 export interface SliceRequest {
@@ -1548,126 +1550,936 @@ function extractCssSymbols(lines: string[], compactOnly = false): SymbolEntry[] 
   return symbols;
 }
 
-function extractSfcSymbols(lines: string[]): SymbolEntry[] {
-  const symbols: SymbolEntry[] = [];
-  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
+const HTML_VOID_ELEMENTS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
 
-  let i = 0;
-  while (i < lines.length) {
+const HTML_RAW_SKIP_TAGS = new Set([
+  "textarea",
+  "title",
+  "xmp",
+  "noembed",
+  "noframes",
+]);
+
+const HTML_SEMANTIC_TAGS = new Set([
+  "head",
+  "body",
+  "header",
+  "nav",
+  "main",
+  "aside",
+  "section",
+  "article",
+  "footer",
+  "form",
+  "dialog",
+  "template",
+]);
+
+const HTML_CONTAINER_TAGS = new Set([
+  "div",
+  "ul",
+  "ol",
+  "table",
+  "fieldset",
+  "details",
+]);
+
+const COMPONENT_LANDMARK_RE =
+  /^(?:[A-Z][A-Za-z0-9]*\.)?(?:[A-Z][A-Za-z0-9]*)?(?:Modal|Drawer|Dialog|Panel|Tabs?|View|Page|Form)$/;
+
+const MAX_HTML_DEPTH = 2;
+const MAX_TAG_HEADER_SCAN = 8192;
+
+function leadingWhitespaceCols(line: string, tabWidth = 4): number {
+  let cols = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === " ") cols += 1;
+    else if (ch === "\t") cols += tabWidth;
+    else break;
+  }
+  return cols;
+}
+
+function stripLeadingCols(line: string, colsToStrip: number, tabWidth = 4): string {
+  if (colsToStrip <= 0) return line;
+  let cols = 0;
+  let idx = 0;
+  while (idx < line.length && cols < colsToStrip) {
+    const ch = line[idx]!;
+    if (ch === " ") {
+      cols += 1;
+      idx++;
+    } else if (ch === "\t") {
+      cols += tabWidth;
+      idx++;
+    } else {
+      break;
+    }
+  }
+  if (cols > colsToStrip) {
+    return " ".repeat(cols - colsToStrip) + line.slice(idx);
+  }
+  return line.slice(idx);
+}
+
+/**
+ * Dedents an inline `<script>` / `<style>` body by visual column width so mixed
+ * tabs/spaces, opening-line code (`skipFirstLineForIndent`), and column-0
+ * multiline template-literal lines never wipe out top-level symbols.
+ */
+function dedentBlockLines(
+  lines: string[],
+  skipFirstLineForIndent = false,
+): string[] {
+  const startIdx = skipFirstLineForIndent ? 1 : 0;
+  let firstNonEmptyIndent = -1;
+  let minPosCols = Infinity;
+
+  for (let i = startIdx; i < lines.length; i++) {
     const line = lines[i]!;
-    const m = blockOpenRe.exec(line.trim());
-    if (!m || !m[1] || line.startsWith("  ") || line.startsWith("\t")) {
+    if (!line.trim()) continue;
+    const cols = leadingWhitespaceCols(line);
+    if (firstNonEmptyIndent === -1) firstNonEmptyIndent = cols;
+    if (cols > 0 && cols < minPosCols) minPosCols = cols;
+  }
+
+  if (firstNonEmptyIndent <= 0 || !Number.isFinite(minPosCols) || minPosCols <= 0) {
+    return lines;
+  }
+
+  return lines.map((line, idx) => {
+    if (idx < startIdx || !line.trim()) return line;
+    return stripLeadingCols(line, minPosCols);
+  });
+}
+
+function findMatchingBrace(
+  text: string,
+  start: number,
+  maxLookahead = 2000,
+): number {
+  const limit = Math.min(text.length, start + maxLookahead);
+  let depth = 0;
+  let quote: string | null = null;
+  let escape = false;
+  for (let i = start; i < limit; i++) {
+    const ch = text[i]!;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function findClosingMustache(
+  text: string,
+  start: number,
+  maxLookahead = 2000,
+): number {
+  const limit = Math.min(text.length, start + maxLookahead);
+  let quote: string | null = null;
+  let escape = false;
+  for (let i = start + 2; i + 1 < limit; i++) {
+    const ch = text[i]!;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "}" && text[i + 1] === "}") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function parseHtmlAttrs(attrText: string): {
+  attrs: Map<string, string>;
+  vueSlot?: string;
+} {
+  const attrs = new Map<string, string>();
+  let vueSlot: string | undefined;
+  let i = 0;
+  const len = attrText.length;
+
+  while (i < len) {
+    while (i < len && /[\s/]/.test(attrText[i]!)) i++;
+    if (i >= len) break;
+
+    const nameStart = i;
+    while (i < len && !/[\s=/>"'`]/.test(attrText[i]!)) i++;
+    const rawName = attrText.slice(nameStart, i);
+    if (!rawName) {
       i++;
       continue;
     }
 
-    const tag = m[1].toLowerCase();
-    const attrs = (m[2] ?? "").trim();
-    const startIdx = i;
-    let endIdx = i;
+    const lowerName = rawName.toLowerCase();
+    if (!vueSlot && rawName.startsWith("#") && rawName.length > 1) {
+      vueSlot = rawName.slice(1);
+    } else if (!vueSlot && lowerName.startsWith("v-slot:") && rawName.length > 7) {
+      vueSlot = rawName.slice(7);
+    }
 
-    if (tag === "template") {
-      let depth = 0;
-      const openTemplateRe = /<template\b[^>]*>/gi;
-      const closeTemplateRe = /<\/template\s*>/gi;
-      for (let j = i; j < lines.length; j++) {
-        const ln = lines[j]!;
-        const opens = ln.match(openTemplateRe)?.length ?? 0;
-        const closes = ln.match(closeTemplateRe)?.length ?? 0;
-        depth += opens - closes;
-        if (depth <= 0) {
-          endIdx = j;
-          break;
+    while (i < len && /\s/.test(attrText[i]!)) i++;
+    let value = "";
+    if (i < len && attrText[i] === "=") {
+      i++;
+      while (i < len && /\s/.test(attrText[i]!)) i++;
+      if (i < len) {
+        const ch = attrText[i]!;
+        if (ch === '"' || ch === "'") {
+          const quote = ch;
+          i++;
+          const valStart = i;
+          while (i < len && attrText[i] !== quote) i++;
+          value = attrText.slice(valStart, i);
+          if (i < len) i++;
+        } else if (ch === "{") {
+          const endBrace = findMatchingBrace(attrText, i);
+          if (endBrace >= 0) {
+            value = attrText.slice(i, endBrace + 1);
+            i = endBrace + 1;
+          } else {
+            const valStart = i;
+            while (i < len && !/[\s/>]/.test(attrText[i]!)) i++;
+            value = attrText.slice(valStart, i);
+          }
+        } else {
+          const valStart = i;
+          while (i < len && !/[\s/>]/.test(attrText[i]!)) i++;
+          value = attrText.slice(valStart, i);
         }
-        endIdx = j;
-      }
-    } else {
-      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
-      for (let j = i; j < lines.length; j++) {
-        endIdx = j;
-        if (j > i && closeRe.test(lines[j]!)) break;
-        if (j === i && closeRe.test(lines[j]!.slice(m[0].length))) break;
       }
     }
 
-    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
-    symbols.push({
-      kind: tag,
-      name: headerLabel,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: 0,
-    });
-
-    const innerStart = startIdx + 1;
-    const innerLines = lines.slice(innerStart, endIdx);
-    if (tag === "script" && innerLines.length > 0) {
-      const innerSyms = extractTsJsSymbols(innerLines);
-      for (const s of innerSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: s.depth + 1,
-        });
-      }
-    } else if (tag === "template" && innerLines.length >= 30) {
-      let landmarks = 0;
-      const commentLandmarkRe = /^<!--\s*[=\-*#]*\s*([^-][^>]{2,60}?)\s*[=\-*#]*\s*-->$/;
-      const semanticTagRe =
-        /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
-      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
-        const raw = innerLines[k]!;
-        const indent = raw.length - raw.trimStart().length;
-        if (indent > 8) continue;
-        const trimmed = raw.trim();
-        const cm = commentLandmarkRe.exec(trimmed);
-        if (cm && cm[1]) {
-          symbols.push({
-            kind: "section",
-            name: cm[1].trim(),
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1,
-          });
-          landmarks++;
-          continue;
-        }
-        const sm = semanticTagRe.exec(trimmed);
-        if (sm && sm[1]) {
-          const attrStr = sm[2] ?? "";
-          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-          const tagDesc =
-            idMatch && idMatch[1]
-              ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>`
-              : `<${sm[1]}>`;
-          symbols.push({
-            kind: "block",
-            name: tagDesc,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1,
-          });
-          landmarks++;
-        }
-      }
-    } else if (tag === "style" && innerLines.length > 0) {
-      const cssSyms = extractCssSymbols(innerLines, true).slice(0, 12);
-      for (const s of cssSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: 1,
-        });
-      }
+    if (!attrs.has(lowerName)) {
+      attrs.set(lowerName, value);
     }
-
-    i = endIdx + 1;
   }
 
+  return { attrs, vueSlot };
+}
+
+function normalizeInlineAttr(value: string | undefined, maxChars: number): string {
+  if (!value) return "";
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact ? sliceSafeChars(compact, maxChars) : "";
+}
+
+function formatHtmlTagLabel(
+  displayTag: string,
+  lowerTag: string,
+  rawAttrs: string,
+  parsed: { attrs: Map<string, string>; vueSlot?: string },
+): string {
+  if (lowerTag === "script" || lowerTag === "style") {
+    const compact = normalizeInlineAttr(rawAttrs, 40);
+    return compact ? `<${lowerTag} ${compact}>` : `<${lowerTag}>`;
+  }
+
+  const idVal = normalizeInlineAttr(parsed.attrs.get("id"), 36);
+  if (idVal) {
+    return `<${displayTag} #${idVal}>`;
+  }
+  const testIdVal = normalizeInlineAttr(parsed.attrs.get("data-testid"), 36);
+  if (testIdVal) {
+    return `<${displayTag} data-testid="${testIdVal}">`;
+  }
+  const roleVal = normalizeInlineAttr(parsed.attrs.get("role"), 36);
+  if (roleVal) {
+    return `<${displayTag} role="${roleVal}">`;
+  }
+  const slotVal = normalizeInlineAttr(parsed.vueSlot, 36);
+  if (lowerTag === "template" && slotVal) {
+    return `<template #${slotVal}>`;
+  }
+  return `<${displayTag}>`;
+}
+
+function isJsScriptType(typeAttr: string | undefined): boolean {
+  if (typeAttr === undefined) return true;
+  const mime = typeAttr.trim().toLowerCase().split(";")[0]?.trim() ?? "";
+  return (
+    !mime ||
+    mime === "module" ||
+    mime === "text/javascript" ||
+    mime === "application/javascript" ||
+    mime === "text/ecmascript" ||
+    mime === "application/ecmascript" ||
+    mime === "text/typescript" ||
+    mime === "ts" ||
+    mime === "tsx" ||
+    mime === "jsx"
+  );
+}
+
+function isCommentDecorChar(ch: string): boolean {
+  return (
+    ch === "=" ||
+    ch === "-" ||
+    ch === "*" ||
+    ch === "#" ||
+    ch === "~" ||
+    ch === ":" ||
+    ch === " " ||
+    ch === "\t" ||
+    ch === "\r" ||
+    ch === "\n"
+  );
+}
+
+function extractCommentLandmark(inner: string): string | null {
+  let start = 0;
+  let end = inner.length;
+  while (start < end && isCommentDecorChar(inner[start]!)) start++;
+  while (end > start && isCommentDecorChar(inner[end - 1]!)) end--;
+  const cleaned = inner.slice(start, end);
+  if (cleaned.length < 2 || cleaned.length > 60) return null;
+  if (/[<>]/.test(cleaned)) return null;
+  if (/^(?:eslint|prettier|istanbul|c8|v8|@ts-)/i.test(cleaned)) return null;
+  if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(cleaned)) return null;
+  return cleaned;
+}
+
+type TemplateMode = "html" | "vue" | "svelte";
+
+function extractTemplateSymbols(
+  rawLines: string[],
+  mode: TemplateMode = "html",
+): SymbolEntry[] {
+  if (rawLines.length === 0) return [];
+  const lines =
+    rawLines[0]!.startsWith("\uFEFF")
+      ? [rawLines[0]!.slice(1), ...rawLines.slice(1)]
+      : rawLines;
+
+  const text = lines.join("\n");
+  const lineStarts: number[] = new Array<number>(lines.length);
+  let acc = 0;
+  for (let idx = 0; idx < lines.length; idx++) {
+    lineStarts[idx] = acc;
+    acc += lines[idx]!.length + 1;
+  }
+
+  const offsetToLineIdx = (pos: number): number => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (lineStarts[mid]! <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+
+  interface OpenFrame {
+    lowerTag: string;
+    startLine: number;
+    emitted: boolean;
+    symbol?: SymbolEntry;
+  }
+
+  const symbols: SymbolEntry[] = [];
+  const stack: OpenFrame[] = [];
+  const stackTagCounts = new Map<string, number>();
+  const pushFrame = (frame: OpenFrame) => {
+    stack.push(frame);
+    stackTagCounts.set(frame.lowerTag, (stackTagCounts.get(frame.lowerTag) ?? 0) + 1);
+  };
+  const popFrame = (): OpenFrame => {
+    const frame = stack.pop()!;
+    const prev = stackTagCounts.get(frame.lowerTag) ?? 0;
+    if (prev <= 1) stackTagCounts.delete(frame.lowerTag);
+    else stackTagCounts.set(frame.lowerTag, prev - 1);
+    return frame;
+  };
+
+  let emittedCount = 0;
+  let noCloseSingle = false;
+  let noCloseDouble = false;
+  let noCloseScript = false;
+  let noCloseStyle = false;
+  let noCloseBodyBrace = false;
+  let noCloseMustache = false;
+  const noCloseRawSkip = new Set<string>();
+  let nextRightBrace = text.indexOf("}");
+  let nextCloseMustache = mode === "vue" ? text.indexOf("}}") : -1;
+
+  let i = 0;
+  const len = text.length;
+
+  while (i < len) {
+    const lt = text.indexOf("<", i);
+    if (lt < 0) break;
+
+    // Skip template expressions in Svelte (`{...}`) and Vue (`{{...}}`) body text
+    // before `<` so `{@html '</div>'}`, `{#if x<script && y>0}`, and `{{ a<section && x => y }}`
+    // cannot corrupt the tag stack or trigger unclosed raw-text blocks.
+    if (mode === "svelte" && !noCloseBodyBrace) {
+      const bracePos = text.indexOf("{", i);
+      if (bracePos >= 0 && bracePos < lt) {
+        if (nextRightBrace !== -1 && nextRightBrace < bracePos) {
+          nextRightBrace = text.indexOf("}", bracePos);
+        }
+        if (nextRightBrace === -1) {
+          noCloseBodyBrace = true;
+        } else if (nextRightBrace < bracePos + 2000) {
+          const endBrace = findMatchingBrace(text, bracePos);
+          if (endBrace >= 0) {
+            i = endBrace + 1;
+            continue;
+          }
+          i = bracePos + 1;
+          continue;
+        } else if (nextRightBrace < lt) {
+          i = nextRightBrace + 1;
+          continue;
+        }
+      }
+    } else if (mode === "vue" && !noCloseMustache) {
+      const mustachePos = text.indexOf("{{", i);
+      if (mustachePos >= 0 && mustachePos < lt) {
+        if (nextCloseMustache !== -1 && nextCloseMustache < mustachePos + 2) {
+          nextCloseMustache = text.indexOf("}}", mustachePos + 2);
+        }
+        if (nextCloseMustache === -1) {
+          noCloseMustache = true;
+        } else if (nextCloseMustache < mustachePos + 2000) {
+          const endMustache = findClosingMustache(text, mustachePos);
+          if (endMustache >= 0) {
+            i = endMustache + 2;
+            continue;
+          }
+          i = mustachePos + 2;
+          continue;
+        } else if (nextCloseMustache < lt) {
+          i = nextCloseMustache + 2;
+          continue;
+        }
+      }
+    }
+
+    i = lt;
+
+    // 1. HTML comments: <!-- ... --> (including HTML5 empty <!--> / <!---> and --!>)
+    if (text.startsWith("<!--", i)) {
+      if (text.startsWith("<!-->", i)) {
+        i += 5;
+        continue;
+      }
+      if (text.startsWith("<!--->", i)) {
+        i += 6;
+        continue;
+      }
+      const startLineIdx = offsetToLineIdx(i);
+      const stdClose = text.indexOf("-->", i + 4);
+      const bangClose = text.indexOf("--!>", i + 4);
+      let closePos = -1;
+      let closeLen = 3;
+      if (stdClose >= 0 && (bangClose < 0 || stdClose <= bangClose)) {
+        closePos = stdClose;
+        closeLen = 3;
+      } else if (bangClose >= 0) {
+        closePos = bangClose;
+        closeLen = 4;
+      }
+      if (closePos < 0) {
+        break;
+      }
+      const endLineIdx = offsetToLineIdx(closePos + closeLen - 1);
+      if (startLineIdx === endLineIdx && closeLen === 3) {
+        const lineTrim = lines[startLineIdx]!.trim();
+        if (
+          lineTrim.startsWith("<!--") &&
+          lineTrim.endsWith("-->") &&
+          lineTrim.indexOf("-->", 4) === lineTrim.length - 3
+        ) {
+          const landmark = extractCommentLandmark(text.slice(i + 4, closePos));
+          if (landmark) {
+            const ln = startLineIdx + 1;
+            symbols.push({
+              kind: "section",
+              name: landmark,
+              startLine: ln,
+              endLine: ln,
+              depth: Math.min(MAX_HTML_DEPTH, emittedCount),
+            });
+          }
+        }
+      }
+      i = closePos + closeLen;
+      continue;
+    }
+
+    // 2. CDATA: <![CDATA[ ... ]]>
+    if (text.startsWith("<![CDATA[", i)) {
+      const closePos = text.indexOf("]]>", i + 9);
+      i = closePos < 0 ? len : closePos + 3;
+      continue;
+    }
+
+    // 3. Processing instruction <?...?> or Doctype/declaration <!...>
+    const nextCh = text[i + 1];
+    if (nextCh === "?") {
+      const closePi = text.indexOf("?>", i + 2);
+      if (closePi >= 0) {
+        i = closePi + 2;
+      } else {
+        const closeGt = text.indexOf(">", i + 2);
+        i = closeGt >= 0 ? closeGt + 1 : len;
+      }
+      continue;
+    }
+    if (nextCh === "!") {
+      let quote: string | null = null;
+      let j = i + 2;
+      while (j < len) {
+        const c = text[j]!;
+        if (quote) {
+          if (c === quote || c === "\n") quote = null;
+        } else if (c === '"' || c === "'") {
+          quote = c;
+        } else if (c === ">") {
+          j++;
+          break;
+        }
+        j++;
+      }
+      i = j;
+      continue;
+    }
+
+    // 4. Closing tag: </tagName>
+    if (nextCh === "/") {
+      const nameStart = i + 2;
+      if (nameStart >= len || !/[A-Za-z]/.test(text[nameStart]!)) {
+        i += 2;
+        continue;
+      }
+      let j = nameStart + 1;
+      while (j < len && /[A-Za-z0-9:._-]/.test(text[j]!)) j++;
+      const closeLowerTag = text.slice(nameStart, j).toLowerCase();
+      while (j < len && text[j] !== ">") j++;
+      if (j < len && text[j] === ">") j++;
+
+      const closeLine = offsetToLineIdx(Math.max(i, j - 1)) + 1;
+
+      if ((stackTagCounts.get(closeLowerTag) ?? 0) > 0) {
+        let matchIdx = -1;
+        for (let s = stack.length - 1; s >= 0; s--) {
+          if (stack[s]!.lowerTag === closeLowerTag) {
+            matchIdx = s;
+            break;
+          }
+        }
+
+        if (matchIdx >= 0) {
+          for (let s = stack.length - 1; s > matchIdx; s--) {
+            const unclosed = popFrame();
+            if (unclosed.emitted) {
+              emittedCount = Math.max(0, emittedCount - 1);
+              if (unclosed.symbol) {
+                unclosed.symbol.endLine = Math.max(
+                  unclosed.symbol.endLine,
+                  closeLine > unclosed.startLine ? closeLine - 1 : unclosed.startLine,
+                );
+              }
+            }
+          }
+          const matched = popFrame();
+          if (matched.emitted) {
+            emittedCount = Math.max(0, emittedCount - 1);
+            if (matched.symbol) {
+              matched.symbol.endLine = Math.max(matched.symbol.endLine, closeLine);
+            }
+          }
+        }
+      }
+
+      i = j;
+      continue;
+    }
+
+    // 5. Opening tag: <tagName ...> or <tagName ... />
+    if (!nextCh || !/[A-Za-z]/.test(nextCh)) {
+      i++;
+      continue;
+    }
+
+    const tagStart = i;
+    let nameEnd = i + 1;
+    while (nameEnd < len && /[A-Za-z0-9:._-]/.test(text[nameEnd]!)) nameEnd++;
+    const afterNameCh = text[nameEnd];
+    if (afterNameCh !== undefined && !/[\s/>]/.test(afterNameCh)) {
+      i = nameEnd;
+      continue;
+    }
+
+    const rawTag = text.slice(i + 1, nameEnd);
+    const lowerTag = rawTag.toLowerCase();
+
+    // Scan tag header to unquoted closing `>` with bounded linear brace tracking
+    const headerLimit = Math.min(len, nameEnd + MAX_TAG_HEADER_SCAN);
+    let j = nameEnd;
+    let quote: string | null = null;
+    let braceDepth = 0;
+    let braceQuote: string | null = null;
+    let braceEscape = false;
+    let lastUnquotedNonWs = "";
+    let foundGt = false;
+    while (j < headerLimit) {
+      const c = text[j]!;
+      if (braceDepth > 0) {
+        if (braceEscape) {
+          braceEscape = false;
+        } else if (braceQuote) {
+          if (c === "\\") braceEscape = true;
+          else if (c === braceQuote) braceQuote = null;
+        } else if (c === '"' || c === "'" || c === "`") {
+          braceQuote = c;
+        } else if (c === "{") {
+          braceDepth++;
+        } else if (c === "}") {
+          braceDepth--;
+          if (braceDepth === 0) lastUnquotedNonWs = "}";
+        }
+        j++;
+        continue;
+      }
+      if (quote) {
+        if (c === quote) quote = null;
+        j++;
+        continue;
+      }
+      if ((c === '"' || c === "'") && lastUnquotedNonWs === "=") {
+        if ((c === '"' && !noCloseDouble) || (c === "'" && !noCloseSingle)) {
+          quote = c;
+        }
+        lastUnquotedNonWs = c;
+        j++;
+        continue;
+      }
+      if (c === "{") {
+        if (nextRightBrace !== -1 && nextRightBrace < j) {
+          nextRightBrace = text.indexOf("}", j);
+        }
+        if (nextRightBrace === -1 || nextRightBrace >= headerLimit) {
+          foundGt = false;
+          break;
+        }
+        braceDepth = 1;
+        braceQuote = null;
+        braceEscape = false;
+        j++;
+        continue;
+      }
+      if (c === "<") {
+        foundGt = false;
+        break;
+      }
+      // Reject unquoted logical/arrow operators outside quotes & braces (e.g. `a<form && b>0`)
+      if (
+        (c === "&" && text[j + 1] === "&") ||
+        (c === "|" && text[j + 1] === "|") ||
+        (c === "=" && text[j + 1] === ">")
+      ) {
+        foundGt = false;
+        break;
+      }
+      if (c === ">") {
+        foundGt = true;
+        break;
+      }
+      if (!/\s/.test(c)) {
+        lastUnquotedNonWs = c;
+      }
+      j++;
+    }
+
+    if (!foundGt) {
+      if (j === len) {
+        if (quote === '"') noCloseDouble = true;
+        else if (quote === "'") noCloseSingle = true;
+      }
+      i = tagStart + 1;
+      continue;
+    }
+
+    const gtPos = j;
+    const selfClosing = lastUnquotedNonWs === "/";
+    const rawAttrSlice = text.slice(
+      nameEnd,
+      selfClosing ? text.lastIndexOf("/", gtPos) : gtPos,
+    );
+    const startLineIdx = offsetToLineIdx(tagStart);
+    const openEndLineIdx = offsetToLineIdx(gtPos);
+    const startLine = startLineIdx + 1;
+    const openEndLine = openEndLineIdx + 1;
+
+    // Raw-text / RCDATA elements whose content must NOT be parsed as markup (<textarea>, <title>, <xmp>, etc.)
+    if (HTML_RAW_SKIP_TAGS.has(lowerTag)) {
+      if (selfClosing || noCloseRawSkip.has(lowerTag)) {
+        i = gtPos + 1;
+        continue;
+      }
+      const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+      closeRe.lastIndex = gtPos + 1;
+      const closeMatch = closeRe.exec(text);
+      if (closeMatch) {
+        i = closeMatch.index + closeMatch[0].length;
+      } else {
+        noCloseRawSkip.add(lowerTag);
+        i = gtPos + 1;
+      }
+      continue;
+    }
+
+    // Raw-text blocks with recursive symbol extraction: <script> and <style>
+    if (lowerTag === "script" || lowerTag === "style") {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const tagDepth = Math.min(MAX_HTML_DEPTH, emittedCount);
+      const label = formatHtmlTagLabel(lowerTag, lowerTag, rawAttrSlice, parsed);
+
+      if (selfClosing) {
+        symbols.push({
+          kind: lowerTag,
+          name: label,
+          startLine,
+          endLine: openEndLine,
+          depth: tagDepth,
+        });
+        i = gtPos + 1;
+        continue;
+      }
+
+      const noCloseLatch = lowerTag === "script" ? noCloseScript : noCloseStyle;
+      let closeMatch: RegExpExecArray | null = null;
+      if (!noCloseLatch) {
+        const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+        closeRe.lastIndex = gtPos + 1;
+        closeMatch = closeRe.exec(text);
+        if (!closeMatch) {
+          if (lowerTag === "script") noCloseScript = true;
+          else noCloseStyle = true;
+        }
+      }
+
+      let closeStart: number;
+      let endLine: number;
+      let nextPos: number;
+
+      if (closeMatch) {
+        closeStart = closeMatch.index;
+        const closeEndPos = closeMatch.index + closeMatch[0].length;
+        endLine = Math.max(startLine, offsetToLineIdx(closeEndPos - 1) + 1);
+        nextPos = closeEndPos;
+      } else if (lowerTag === "script" && parsed.attrs.has("src")) {
+        // Resilient recovery for unclosed external <script src="...">
+        closeStart = gtPos + 1;
+        endLine = openEndLine;
+        nextPos = gtPos + 1;
+      } else {
+        closeStart = len;
+        endLine = Math.max(startLine, lines.length);
+        nextPos = len;
+      }
+
+      symbols.push({
+        kind: lowerTag,
+        name: label,
+        startLine,
+        endLine,
+        depth: tagDepth,
+      });
+
+      const shouldRecurse =
+        closeStart > gtPos + 1 &&
+        (lowerTag === "style" ||
+          (!parsed.attrs.has("src") && isJsScriptType(parsed.attrs.get("type"))));
+
+      if (shouldRecurse) {
+        const closeLineIdx = offsetToLineIdx(
+          closeStart < len ? closeStart : Math.max(0, len - 1),
+        );
+        const innerLines: string[] = [];
+        let innerBaseLineIdx: number;
+        let hasFirstRest = false;
+
+        if (openEndLineIdx === closeLineIdx) {
+          innerBaseLineIdx = openEndLineIdx;
+          const singleInner = text.slice(gtPos + 1, closeStart);
+          if (singleInner.trim()) {
+            innerLines.push(singleInner);
+          }
+        } else {
+          const openLineEnd =
+            openEndLineIdx + 1 < lineStarts.length
+              ? lineStarts[openEndLineIdx + 1]! - 1
+              : len;
+          const firstRest = text.slice(gtPos + 1, openLineEnd);
+          if (firstRest.trim()) {
+            innerBaseLineIdx = openEndLineIdx;
+            innerLines.push(firstRest.trimStart());
+            hasFirstRest = true;
+          } else {
+            innerBaseLineIdx = openEndLineIdx + 1;
+          }
+          for (let li = openEndLineIdx + 1; li < closeLineIdx; li++) {
+            innerLines.push(lines[li]!);
+          }
+          if (closeStart < len) {
+            const lastPrefix = text.slice(lineStarts[closeLineIdx]!, closeStart);
+            if (lastPrefix.trim()) {
+              innerLines.push(lastPrefix);
+            }
+          } else if (closeLineIdx >= openEndLineIdx + 1) {
+            innerLines.push(lines[closeLineIdx]!);
+          }
+        }
+
+        if (innerLines.some((l) => l.trim().length > 0)) {
+          const dedented = dedentBlockLines(innerLines, hasFirstRest);
+          const innerSyms =
+            lowerTag === "script"
+              ? extractTsJsSymbols(dedented)
+              : extractCssSymbols(dedented, true);
+          for (const s of innerSyms) {
+            const childStart = s.startLine + innerBaseLineIdx;
+            const childEnd = Math.max(childStart, s.endLine + innerBaseLineIdx);
+            symbols.push({
+              kind: s.kind,
+              name: s.name,
+              startLine: childStart,
+              endLine: childEnd,
+              depth: Math.min(MAX_HTML_DEPTH, tagDepth + 1 + s.depth),
+            });
+          }
+        }
+      }
+
+      i = nextPos;
+      continue;
+    }
+
+    const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
+    const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
+    const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
+    const isContainer = HTML_CONTAINER_TAGS.has(lowerTag);
+
+    let shouldEmit = false;
+    let emittedSymbol: SymbolEntry | undefined;
+
+    if (isComponent || isSemantic || isContainer) {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const hasIdentityAttr =
+        Boolean(parsed.attrs.get("id")?.trim()) ||
+        Boolean(parsed.attrs.get("data-testid")?.trim()) ||
+        Boolean(parsed.attrs.get("role")?.trim());
+      // Skip nested Vue control-flow `<template v-if>` / `<template v-for>` wrappers
+      // while keeping root `<template>`, named slots (`#header`), and identified templates.
+      const keepTemplate =
+        lowerTag !== "template" ||
+        emittedCount === 0 ||
+        Boolean(parsed.vueSlot) ||
+        hasIdentityAttr;
+
+      if (
+        keepTemplate &&
+        (isComponent || isSemantic || (isContainer && hasIdentityAttr))
+      ) {
+        shouldEmit = true;
+        const displayTag = isComponent ? rawTag : lowerTag;
+        const kind =
+          lowerTag === "template"
+            ? "template"
+            : isComponent
+              ? "component"
+              : "block";
+        emittedSymbol = {
+          kind,
+          name: formatHtmlTagLabel(displayTag, lowerTag, rawAttrSlice, parsed),
+          startLine,
+          endLine: openEndLine,
+          depth: Math.min(MAX_HTML_DEPTH, emittedCount),
+        };
+        symbols.push(emittedSymbol);
+      }
+    }
+
+    if (!selfClosing && !isVoid) {
+      pushFrame({
+        lowerTag,
+        startLine,
+        emitted: shouldEmit,
+        symbol: emittedSymbol,
+      });
+      if (shouldEmit) emittedCount++;
+    }
+
+    i = gtPos + 1;
+  }
+
+  // Unwind any unclosed tags cleanly at EOF
+  const eofLine = lines.length;
+  while (stack.length > 0) {
+    const frame = popFrame();
+    if (frame.emitted && frame.symbol) {
+      frame.symbol.endLine = Math.max(frame.symbol.endLine, eofLine);
+    }
+  }
+
+  return symbols;
+}
+
+function extractHtmlSymbols(lines: string[]): SymbolEntry[] {
+  return extractTemplateSymbols(lines, "html");
+}
+
+function extractSfcSymbols(lines: string[], mode: "vue" | "svelte"): SymbolEntry[] {
+  const symbols = extractTemplateSymbols(lines, mode);
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 
@@ -1684,9 +2496,13 @@ function extractSymbolsFromLines(filePath: string, lines: string[]): SymbolEntry
     case ".mjs":
     case ".cjs":
       return extractTsJsSymbols(lines);
+    case ".html":
+    case ".htm":
+      return extractHtmlSymbols(lines);
     case ".vue":
+      return extractSfcSymbols(lines, "vue");
     case ".svelte":
-      return extractSfcSymbols(lines);
+      return extractSfcSymbols(lines, "svelte");
     case ".css":
     case ".scss":
     case ".less":
@@ -1741,19 +2557,243 @@ const SLICE_TRUNCATION_TIP =
 const OUTLINE_BATCH_TIP =
   "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
 
-function selectOutlineSymbols(symbols: SymbolEntry[], limit: number): SymbolEntry[] {
-  if (symbols.length <= limit) return symbols;
-  // Prioritize depth-0 declarations so one giant class's methods never crowd out top-level structure
-  const keptIndices = new Set<number>();
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    if (symbols[i]!.depth === 0) keptIndices.add(i);
+function formatSymbolLine(s: SymbolEntry): string {
+  const indent = "  ".repeat(s.depth);
+  const span =
+    s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
+  return `${indent}${span} [${s.kind}] ${s.name}`;
+}
+
+function formatNestedOmissionFooter(omittedNested: number, compact = false): string {
+  return compact
+    ? `\n... (+${omittedNested} nested)`
+    : `\n... (+${omittedNested} nested symbols omitted)`;
+}
+
+function pickTopLevelOmissionFooter(
+  omittedTop: number,
+  minStart: number,
+  maxEnd: number,
+  hasOmittedNested: boolean,
+  availChars: number,
+  availBytes: number,
+): string | null {
+  const candidates = [
+    hasOmittedNested
+      ? `\n... (+${omittedTop} more top-level symbols in L${minStart}-L${maxEnd} omitted, plus nested; use batch_search or read_file)`
+      : `\n... (+${omittedTop} more top-level symbols in L${minStart}-L${maxEnd} omitted; use batch_search or read_file)`,
+    `\n... (+${omittedTop} more in L${minStart}-L${maxEnd} omitted)`,
+    `\n... (+${omittedTop} L${minStart}-L${maxEnd})`,
+  ];
+  for (const cand of candidates) {
+    if (cand.length <= availChars && Buffer.byteLength(cand, "utf8") <= availBytes) {
+      return cand;
+    }
   }
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    keptIndices.add(i);
+  return null;
+}
+
+function packOutlineToBudget(
+  header: string,
+  symbols: SymbolEntry[],
+  charBudget: number,
+  byteBudget: number,
+): string {
+  const items = symbols.map((sym) => {
+    const line = formatSymbolLine(sym);
+    return {
+      line,
+      chars: line.length + 1, // +1 for leading '\n'
+      bytes: Buffer.byteLength(line, "utf8") + 1,
+    };
+  });
+
+  const headerChars = header.length;
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  let fullChars = headerChars;
+  let fullBytes = headerBytes;
+  for (const item of items) {
+    fullChars += item.chars;
+    fullBytes += item.bytes;
   }
-  return [...keptIndices]
-    .sort((a, b) => a - b)
-    .map((idx) => symbols[idx]!);
+
+  if (fullChars <= charBudget && fullBytes <= byteBudget) {
+    return `${header}\n${items.map((it) => it.line).join("\n")}`;
+  }
+
+  const byDepth = new Map<number, number[]>();
+  for (let idx = 0; idx < symbols.length; idx++) {
+    const d = symbols[idx]!.depth;
+    let list = byDepth.get(d);
+    if (!list) {
+      list = [];
+      byDepth.set(d, list);
+    }
+    list.push(idx);
+  }
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  const topDepth = depths[0] ?? 0;
+  const topIndices = byDepth.get(topDepth) ?? [];
+  const nestedTotalCount = symbols.length - topIndices.length;
+
+  let topChars = headerChars;
+  let topBytes = headerBytes;
+  for (const idx of topIndices) {
+    topChars += items[idx]!.chars;
+    topBytes += items[idx]!.bytes;
+  }
+
+  // Branch A: All top-level (minimum-depth) symbols fit alongside a nested-omission footer -> backfill deeper levels
+  if (nestedTotalCount > 0) {
+    const fullNestedFooterLen = formatNestedOmissionFooter(nestedTotalCount, false).length;
+    const compactNestedFooterLen = formatNestedOmissionFooter(nestedTotalCount, true).length;
+    const fitsFullNested =
+      topChars + fullNestedFooterLen <= charBudget &&
+      topBytes + fullNestedFooterLen <= byteBudget;
+    const fitsCompactNested =
+      !fitsFullNested &&
+      topChars + compactNestedFooterLen <= charBudget &&
+      topBytes + compactNestedFooterLen <= byteBudget;
+
+    if (fitsFullNested || fitsCompactNested) {
+      const useCompact = !fitsFullNested;
+      const selected = new Set<number>(topIndices);
+      let usedChars = topChars;
+      let usedBytes = topBytes;
+      let omittedNested = nestedTotalCount;
+      let stopped = false;
+
+      for (const d of depths) {
+        if (d === topDepth) continue;
+        if (stopped) break;
+        const indices = byDepth.get(d)!;
+        for (const idx of indices) {
+          const item = items[idx]!;
+          const nextOmitted = omittedNested - 1;
+          const nextFooterLen =
+            nextOmitted > 0
+              ? formatNestedOmissionFooter(nextOmitted, useCompact).length
+              : 0;
+          if (
+            usedChars + item.chars + nextFooterLen <= charBudget &&
+            usedBytes + item.bytes + nextFooterLen <= byteBudget
+          ) {
+            selected.add(idx);
+            usedChars += item.chars;
+            usedBytes += item.bytes;
+            omittedNested = nextOmitted;
+          } else {
+            stopped = true;
+            break;
+          }
+        }
+      }
+
+      const ordered = [...selected].sort((a, b) => a - b);
+      const footer =
+        omittedNested > 0 ? formatNestedOmissionFooter(omittedNested, useCompact) : "";
+      if (ordered.length === 0) {
+        return `${header}${footer}`;
+      }
+      return `${header}\n${ordered.map((idx) => items[idx]!.line).join("\n")}${footer}`;
+    }
+  }
+
+  // Branch B: Even top-level symbols overflow the file's budget -> fit prefix + exact L<min>-L<max> footer
+  const m = topIndices.length;
+  const suffixMinStart = new Array<number>(m);
+  const suffixMaxEnd = new Array<number>(m);
+  for (let k = m - 1; k >= 0; k--) {
+    const sym = symbols[topIndices[k]!]!;
+    if (k === m - 1) {
+      suffixMinStart[k] = sym.startLine;
+      suffixMaxEnd[k] = sym.endLine;
+    } else {
+      suffixMinStart[k] = Math.min(sym.startLine, suffixMinStart[k + 1]!);
+      suffixMaxEnd[k] = Math.max(sym.endLine, suffixMaxEnd[k + 1]!);
+    }
+  }
+
+  const tryPackPrefixWithTier = (
+    tier: "full" | "compact",
+  ): { pickedCount: number; footer: string } => {
+    let usedChars = headerChars;
+    let usedBytes = headerBytes;
+    let pickedCount = 0;
+    let chosenFooter = "";
+
+    for (let k = 0; k < m; k++) {
+      const nextOmitted = m - (k + 1);
+      const item = items[topIndices[k]!]!;
+      if (nextOmitted === 0) {
+        if (
+          usedChars + item.chars <= charBudget &&
+          usedBytes + item.bytes <= byteBudget
+        ) {
+          pickedCount = k + 1;
+          chosenFooter = "";
+        }
+        break;
+      }
+      const remChars = charBudget - (usedChars + item.chars);
+      const remBytes = byteBudget - (usedBytes + item.bytes);
+      const candFooter =
+        tier === "full"
+          ? (() => {
+              const full =
+                nestedTotalCount > 0
+                  ? `\n... (+${nextOmitted} more top-level symbols in L${suffixMinStart[k + 1]!}-L${suffixMaxEnd[k + 1]!} omitted, plus nested; use batch_search or read_file)`
+                  : `\n... (+${nextOmitted} more top-level symbols in L${suffixMinStart[k + 1]!}-L${suffixMaxEnd[k + 1]!} omitted; use batch_search or read_file)`;
+              return full.length <= remChars &&
+                Buffer.byteLength(full, "utf8") <= remBytes
+                ? full
+                : null;
+            })()
+          : pickTopLevelOmissionFooter(
+              nextOmitted,
+              suffixMinStart[k + 1]!,
+              suffixMaxEnd[k + 1]!,
+              nestedTotalCount > 0,
+              remChars,
+              remBytes,
+            );
+      if (candFooter !== null) {
+        usedChars += item.chars;
+        usedBytes += item.bytes;
+        pickedCount = k + 1;
+        chosenFooter = candFooter;
+      } else {
+        break;
+      }
+    }
+    return { pickedCount, footer: chosenFooter };
+  };
+
+  let packed = tryPackPrefixWithTier("full");
+  if (packed.pickedCount === 0) {
+    packed = tryPackPrefixWithTier("compact");
+  }
+
+  if (packed.pickedCount > 0) {
+    const pickedLines = topIndices
+      .slice(0, packed.pickedCount)
+      .map((idx) => items[idx]!.line);
+    return `${header}\n${pickedLines.join("\n")}${packed.footer}`;
+  }
+
+  // Zero top-level symbols fit alongside a footer: emit the richest footer that fits the budget
+  const fallbackFooter =
+    m > 0
+      ? pickTopLevelOmissionFooter(
+          m,
+          suffixMinStart[0]!,
+          suffixMaxEnd[0]!,
+          nestedTotalCount > 0,
+          charBudget - headerChars,
+          byteBudget - headerBytes,
+        )
+      : null;
+  return fallbackFooter ? `${header}${fallbackFooter}` : header;
 }
 
 export async function runReadSlices(
@@ -1864,17 +2904,6 @@ export async function runReadSlices(
     : 8_500;
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
 
-  const perFileSymbolLimit =
-    outlines.length <= 1
-      ? 120
-      : outlines.length <= 4
-        ? 60
-        : outlines.length <= 10
-          ? 30
-          : outlines.length <= 20
-            ? 16
-            : 10;
-
   const fileCache = new Map<string, { lines: string[]; size: number }>();
   async function loadLines(absPath: string): Promise<{ lines: string[]; size: number }> {
     const cached = fileCache.get(absPath);
@@ -1886,58 +2915,66 @@ export async function runReadSlices(
     return entry;
   }
 
-  const sections: string[] = [];
+  type RenderedSection =
+    | { kind: "outline"; header: string; symbols: SymbolEntry[]; fullText: string }
+    | { kind: "static"; fullText: string };
 
-  // Process outlines concurrently
+  const sectionEntries: RenderedSection[] = [];
+
+  // Process outlines concurrently (extract full symbols without static per-file pre-cut)
   if (outlines.length > 0) {
     const outlineResults = await Promise.all(
-      outlines.map(async (rawPath) => {
+      outlines.map(async (rawPath): Promise<RenderedSection> => {
         const absPath = resolvePath(rawPath, baseCwd);
         const relPath =
           toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
+          const header = `## Outline: ${relPath} (${lines.length} lines)`;
           if (symbols.length === 0) {
-            return `## Outline: ${relPath} (${lines.length} lines)\n(no top-level symbols detected)`;
+            return {
+              kind: "static",
+              fullText: `${header}\n(no top-level symbols detected)`,
+            };
           }
-          const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
-          const formatted = picked.map((s) => {
-            const indent = "  ".repeat(s.depth);
-            const span =
-              s.endLine > s.startLine
-                ? `L${s.startLine}-L${s.endLine}`
-                : `L${s.startLine}`;
-            return `${indent}${span} [${s.kind}] ${s.name}`;
-          });
-          const extra =
-            symbols.length > picked.length
-              ? outlines.length > 10
-                ? `\n... (+${symbols.length - picked.length} more symbols)`
-                : `\n... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)`
-              : "";
-          return `## Outline: ${relPath} (${lines.length} lines)\n${formatted.join("\n")}${extra}`;
+          const formatted = symbols.map(formatSymbolLine);
+          return {
+            kind: "outline",
+            header,
+            symbols,
+            fullText: `${header}\n${formatted.join("\n")}`,
+          };
         } catch (err) {
-          return `## Outline: ${relPath}\nERROR: ${err instanceof Error ? err.message : String(err)}`;
+          return {
+            kind: "static",
+            fullText: `## Outline: ${relPath}\nERROR: ${err instanceof Error ? err.message : String(err)}`,
+          };
         }
       }),
     );
-    sections.push(...outlineResults);
+    sectionEntries.push(...outlineResults);
   }
 
   // Process slices concurrently
   if (slices.length > 0) {
     const sliceResults = await Promise.all(
-      slices.map(async (req) => {
+      slices.map(async (req): Promise<RenderedSection> => {
         if (!req || typeof req.path !== "string" || !req.path.trim()) {
-          return "## Slice: (invalid)\nERROR: 'path' must be a non-empty string";
+          return {
+            kind: "static",
+            fullText: "## Slice: (invalid)\nERROR: 'path' must be a non-empty string",
+          };
         }
         const absPath = resolvePath(req.path, baseCwd);
         const relPath =
           toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
 
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
-          return `## Slice: ${relPath}\nERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath}\nERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`,
+          };
         }
 
         try {
@@ -1980,41 +3017,82 @@ export async function runReadSlices(
             blocks.push(snippet.join("\n"));
           }
 
-          return `## Slice: ${relPath} (${totalLines} lines)\n${blocks.join("\n")}`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath} (${totalLines} lines)\n${blocks.join("\n")}`,
+          };
         } catch (err) {
-          return `## Slice: ${relPath}\nERROR: ${err instanceof Error ? err.message : String(err)}`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath}\nERROR: ${err instanceof Error ? err.message : String(err)}`,
+          };
         }
       }),
     );
-    sections.push(...sliceResults);
+    sectionEntries.push(...sliceResults);
   }
 
-  const rawJoined = sections.join("\n\n");
-  const rawBytes = Buffer.byteLength(rawJoined, "utf8");
-  const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
-  const activeTip =
-    isOverBudget && slices.length > 0
-      ? SLICE_TRUNCATION_TIP
-      : isOverBudget && outlines.length > 20
-        ? OUTLINE_BATCH_TIP
-        : null;
+  const separator = "\n\n";
+  const sepChars = separator.length * Math.max(0, sectionEntries.length - 1);
+  const sepBytes =
+    Buffer.byteLength(separator, "utf8") * Math.max(0, sectionEntries.length - 1);
 
-  if (activeTip && maxChars > activeTip.length + 200) {
-    const tipBytes = Buffer.byteLength(activeTip, "utf8");
-    const body = fitSectionsToByteBudget(
-      sections,
-      maxChars - activeTip.length,
-      maxBytes - tipBytes,
-      "\n\n",
-    );
+  const charSizes = sectionEntries.map((s) => s.fullText.length);
+  const byteSizes = sectionEntries.map((s) =>
+    Buffer.byteLength(s.fullText, "utf8"),
+  );
+  const rawChars = charSizes.reduce((sum, n) => sum + n, 0) + sepChars;
+  const rawBytes = byteSizes.reduce((sum, n) => sum + n, 0) + sepBytes;
+  const isOverBudget = rawChars > maxChars || rawBytes > maxBytes;
+
+  if (!isOverBudget) {
     return {
-      text: `${body}${activeTip}`,
+      text: sectionEntries.map((s) => s.fullText).join(separator),
       isError: false,
     };
   }
 
+  const activeTip =
+    slices.length > 0
+      ? SLICE_TRUNCATION_TIP
+      : outlines.length > 20
+        ? OUTLINE_BATCH_TIP
+        : null;
+  const applyTip = activeTip !== null && maxChars > activeTip.length + 200;
+  const tipChars = applyTip ? activeTip.length : 0;
+  const tipBytes = applyTip ? Buffer.byteLength(activeTip, "utf8") : 0;
+  const bodyMaxChars = maxChars - tipChars;
+  const bodyMaxBytes = maxBytes - tipBytes;
+
+  const availChars = Math.max(0, bodyMaxChars - sepChars);
+  const availBytes = Math.max(0, bodyMaxBytes - sepBytes);
+  const charBudgets = computeWaterFillBudgets(charSizes, availChars);
+  const byteBudgets = computeWaterFillBudgets(byteSizes, availBytes);
+
+  const sections = sectionEntries.map((entry, idx) => {
+    if (
+      entry.kind === "outline" &&
+      (charSizes[idx]! > charBudgets[idx]! || byteSizes[idx]! > byteBudgets[idx]!)
+    ) {
+      return packOutlineToBudget(
+        entry.header,
+        entry.symbols,
+        charBudgets[idx]!,
+        byteBudgets[idx]!,
+      );
+    }
+    return entry.fullText;
+  });
+
+  const body = fitSectionsToByteBudget(
+    sections,
+    bodyMaxChars,
+    bodyMaxBytes,
+    separator,
+  );
+
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: applyTip ? `${body}${activeTip}` : body,
     isError: false,
   };
 }

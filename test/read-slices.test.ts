@@ -512,10 +512,13 @@ describe("read_slices", () => {
     const outlineRes = await runReadSlices({ cwd: tmpDir, outlines: paths });
     assert.equal(outlineRes.isError, false);
     assert.ok(Buffer.byteLength(outlineRes.text, "utf8") <= 8_800);
-    // Depth-0 tailHelper must survive even though HugeStore has 60 methods
+    // Water-filling returns unused budget from the 23 tiny sibling files to f0.ts,
+    // preserving all 60 methods + depth-0 tailHelper + fn23 without premature cuts
+    assert.match(outlineRes.text, /method0/);
+    assert.match(outlineRes.text, /method59/);
     assert.match(outlineRes.text, /tailHelper/);
     assert.match(outlineRes.text, /fn23/);
-    assert.match(outlineRes.text, /\(\+52 more symbols\)/);
+    assert.doesNotMatch(outlineRes.text, /omitted/);
 
     const tooMany = await runReadSlices({
       cwd: tmpDir,
@@ -563,6 +566,7 @@ describe("read_slices", () => {
       `Expected <= 8800B, got ${Buffer.byteLength(denseRes.text, "utf8")}`,
     );
     assert.match(denseRes.text, /module_29\.ts/);
+    assert.match(denseRes.text, /more top-level symbols in L\d+-L25 omitted; use batch_search or read_file/);
     assert.match(denseRes.text, /batch 10-20 files per call/);
   });
 
@@ -920,5 +924,223 @@ describe("read_slices", () => {
     });
     assert.equal(tooManyRes.isError, true);
     assert.match(tooManyRes.text, /max 40/);
+
+    // quick_outline inherits HTML closed-range extraction and BFS water-filling
+    const htmlQuickPath = path.join(tmpDir, "quick.html");
+    await fs.writeFile(
+      htmlQuickPath,
+      [
+        "<body>",
+        '  <main><section id="hero"><Modal /></section></main>',
+        "</body>",
+      ].join("\n"),
+      "utf8",
+    );
+    const htmlQuickRes = await runQuickOutline({ cwd: tmpDir, paths: ["quick.html"] });
+    assert.equal(htmlQuickRes.isError, false);
+    assert.match(htmlQuickRes.text, /\[block\] <body>/);
+    assert.match(htmlQuickRes.text, /\[block\] <section #hero>/);
+    assert.match(htmlQuickRes.text, /\[component\] <Modal>/);
+  });
+
+  it("extracts .html/.htm, Vue, and Svelte closed-range outlines safely across edge cases and linear-time DoS guards", async () => {
+    const htmlDoc = [
+      "<!DOCTYPE html>", // 1
+      '<html lang="en">', // 2
+      "  <head>", // 3
+      "    <title>Compare <section> vs <main></title>", // 4 (RCDATA: must NOT emit phantom landmarks)
+      '    <meta charset="utf-8">', // 5
+      "    <style>", // 6
+      "      /* === Theme Tokens === */", // 7
+      "      :root { --accent: #09f; }", // 8
+      "      @media (max-width: 768px) {", // 9
+      "        body { font-size: 14px; }", // 10
+      "      }", // 11
+      "    </style>", // 12
+      '    <script src="/vendor/bundle.js"></script>', // 13
+      "  </head>", // 14
+      "  <body>", // 15
+      "    <!-- === Header === -->", // 16
+      "    <!--> <!-- bang comment --!>", // 17 (HTML5 comment edge cases must not swallow body)
+      '    <header class="flex"><nav role="navigation"><ul><li><img src="/a.png"><br></li></ul></nav></header>', // 18
+      "    <!--", // 19
+      '      <section id="commented-out"></section>', // 20
+      "    -->", // 21
+      '    <textarea><section id="inside-ta">x</section><script>var a=1;</textarea>', // 22 (RCDATA: no phantom or swallow)
+      '    <div class="plain-wrapper"><div id="app"><main><section id="settings"><form id="prefs-form"></form></section></main></div></div>', // 23
+      '    <div id="multi\nline">x</div>', // 24-25 (multiline id normalized to single line)
+      "    <footer id=\"real-footer\">ok</footer>", // 26
+      '    <script type="module">/* banner */', // 27 (opening-line code + col-0 template + mixed tabs)
+      "      const sql = `SELECT *", // 28
+      "FROM users`;", // 29
+      "      function bootApp() {", // 30
+      "\t\treturn sql;", // 31
+      "      }", // 32
+      "    </script>", // 33
+      "  </body>", // 34
+      "</html>", // 35
+    ].join("\n");
+
+    const htmlSyms = extractSymbols("index.html", htmlDoc);
+    assert.deepEqual(extractSymbols("legacy.htm", htmlDoc), htmlSyms);
+    assert.ok(htmlSyms.every((s) => s.depth >= 0 && s.depth <= 2 && s.endLine >= s.startLine));
+    assert.ok(htmlSyms.every((s) => !s.name.includes("\n")));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<head>" && s.startLine === 3 && s.endLine === 14));
+    assert.ok(htmlSyms.some((s) => s.kind === "tokens" && s.name === ":root"));
+    assert.ok(htmlSyms.some((s) => s.kind === "script" && s.name === '<script src="/vendor/bundle.js">'));
+    assert.ok(htmlSyms.some((s) => s.kind === "section" && s.name === "Header" && s.startLine === 16));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<header>" && s.startLine === 18));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<footer #real-footer>"));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<div #multi line>"));
+    // Dedent fix: inline script with opening-line comment + col-0 template literal + tabs keeps bootApp()!
+    assert.ok(htmlSyms.some((s) => s.kind === "function" && s.name === "bootApp" && s.startLine === 30 && s.endLine === 32));
+    // Exclusions: RCDATA inner tags, commented-out tags, plain-class wrapper
+    assert.ok(!htmlSyms.some((s) => s.name.includes("inside-ta") || s.name.includes("commented-out") || s.name.includes("plain-wrapper")));
+    assert.equal(htmlSyms.filter((s) => s.name === "<section>").length, 0);
+
+    // Standalone component landmarks (<Modal />, <Drawer />, <Panel />, <Tabs.Panel />) + Vue body mustache + <template v-if> filtering
+    const vueDoc = [
+      '<script setup lang="ts">',
+      "  function save() { return true; }",
+      "</script>",
+      "<template>",
+      "  <main>",
+      "    <p>{{ a<section && items.some(x => x.ok) }}</p>",
+      '    <template v-if="ready"><Modal /><Drawer /><Panel /><Tabs.Panel /></template>',
+      "    <template #footer><footer id=\"slot-footer\">ok</footer></template>",
+      "  </main>",
+      "</template>",
+    ].join("\n");
+    const vueSyms = extractSymbols("App.vue", vueDoc);
+    assert.ok(vueSyms.some((s) => s.kind === "function" && s.name === "save"));
+    assert.ok(vueSyms.some((s) => s.kind === "template" && s.name === "<template>"));
+    assert.ok(vueSyms.some((s) => s.kind === "template" && s.name === "<template #footer>"));
+    assert.equal(vueSyms.filter((s) => s.name === "<template>").length, 1); // <template v-if> skipped!
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<Modal>"));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<Drawer>"));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<Panel>"));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<Tabs.Panel>"));
+    assert.equal(vueSyms.filter((s) => s.name === "<section>").length, 0);
+
+    // Svelte body expressions `{@html '</div>'}` and `{#if x<script && y>0}` must NOT corrupt stack or swallow EOF
+    const svelteDoc = [
+      "<main>",
+      '  <div id="content">',
+      "    {@html '</div>'}",
+      "    {#if x<script && y>0}",
+      '      <section id="inside"><SettingsModal /></section>',
+      "    {/if}",
+      "  </div>",
+      '  <footer id="after">done</footer>',
+      "</main>",
+    ].join("\n");
+    const svelteSyms = extractSymbols("Safe.svelte", svelteDoc);
+    assert.deepEqual(
+      svelteSyms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<main>:1-9:d0",
+        "<div #content>:2-7:d1",
+        "<section #inside>:5-5:d2",
+        "<SettingsModal>:5-5:d2",
+        "<footer #after>:8-8:d1",
+      ],
+    );
+
+    // Processing instruction with apostrophe `<?php // don't ?>` must NOT swallow file
+    const phpSyms = extractSymbols(
+      "view.html",
+      "<?php // don't swallow ?>\n<main><footer id=\"ok\">x</footer></main>",
+    );
+    assert.ok(phpSyms.some((s) => s.name === "<footer #ok>"));
+
+    // Linear-time DoS guards: 20k stray closes, 10k unclosed <script src>, 50k `{` in tag, 3k `<div {`, 150k unclosed Svelte/Vue body braces
+    const t0 = performance.now();
+    extractSymbols("dos1.html", "<div>".repeat(20_000) + "</span>".repeat(20_000));
+    extractSymbols("dos2.html", '<script src="x.js">\n'.repeat(10_000));
+    extractSymbols("dos3.html", `<div ${"{".repeat(50_000)}>`);
+    extractSymbols("dos4.html", "<div {".repeat(3_000) + "}".repeat(3_000));
+    const svelteDos = extractSymbols("dos5.svelte", "{".repeat(150_000) + "<main>ok</main>");
+    const vueDos = extractSymbols("dos6.vue", "{{".repeat(75_000) + "<main>ok</main>");
+    const dosMs = performance.now() - t0;
+    assert.ok(dosMs < 400, `Expected linear-time DoS handling (<400ms total), got ${dosMs.toFixed(1)}ms`);
+    assert.ok(svelteDos.some((s) => s.name === "<main>"));
+    assert.ok(vueDos.some((s) => s.name === "<main>"));
+  });
+
+  it("packs overflowing outlines breadth-first with exact L<min>-L<max> ranges even under tight budgets", async () => {
+    const bfDir = path.join(tmpDir, "breadth-first");
+    await fs.mkdir(bfDir, { recursive: true });
+
+    // 1. Breadth-first: depth 0 survives before depth 1 backfills
+    const classRel = "breadth-first/giant_class.ts";
+    const classBody = [
+      "export class GiantEngine {",
+      ...Array.from({ length: 100 }, (_, i) => `  method_${String(i).padStart(3, "0")}() { return ${i}; }`),
+      "}",
+      "export function trailingInit() { return 1; }",
+      "export function trailingSync() { return 2; }",
+      "export function trailingShutdown() { return 3; }",
+    ].join("\n");
+    await fs.writeFile(path.join(tmpDir, classRel), classBody, "utf8");
+
+    const res = await runReadSlices({ cwd: tmpDir, outlines: [classRel], maxChars: 1_200 });
+    assert.equal(res.isError, false);
+    assert.ok(res.text.length <= 1_200);
+    assert.match(res.text, /\[class\] GiantEngine/);
+    assert.match(res.text, /\[function\] trailingInit/);
+    assert.match(res.text, /\[function\] trailingShutdown/);
+    assert.match(res.text, /method_000\b/);
+    assert.doesNotMatch(res.text, /method_099\b/);
+    assert.match(res.text, /\n\.\.\. \(\+\d+ nested symbols omitted\)$/);
+
+    // 2. Tight per-file budget (10 single-class files at maxChars: 1000) must preserve class symbol without raw double-truncation
+    const tightDir = path.join(tmpDir, "tight-class-batch");
+    await fs.mkdir(tightDir, { recursive: true });
+    const tightPaths: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const rel = `tight-class-batch/engine_${i}.ts`;
+      tightPaths.push(rel);
+      const body = [
+        `export class Engine_${i} {`,
+        ...Array.from({ length: 50 }, (_, m) => `  run_${m}() { return ${m}; }`),
+        "}",
+      ].join("\n");
+      await fs.writeFile(path.join(tmpDir, rel), body, "utf8");
+    }
+    const tightRes = await runReadSlices({ cwd: tmpDir, outlines: tightPaths, maxChars: 1_000 });
+    assert.equal(tightRes.isError, false);
+    assert.ok(tightRes.text.length <= 1_000);
+    assert.match(tightRes.text, /\[class\] Engine_0/);
+    assert.match(tightRes.text, /\[class\] Engine_9/);
+    assert.doesNotMatch(tightRes.text, /\[truncated: showed \d+ of/);
+
+    // 3. Giant top-level file (ASCII + CJK + ##-only Markdown) emits exact L<min>-L<max>
+    const asciiRel = "breadth-first/many_funcs.ts";
+    const asciiLines: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      asciiLines.push(`export function computePipelineStage_${String(i).padStart(3, "0")}() {`, `  return ${i};`, "}");
+    }
+    await fs.writeFile(path.join(tmpDir, asciiRel), asciiLines.join("\n"), "utf8");
+    const asciiRes = await runReadSlices({ cwd: tmpDir, outlines: [asciiRel] });
+    assert.equal(asciiRes.isError, false);
+    assert.ok(Buffer.byteLength(asciiRes.text, "utf8") <= 8_800);
+    const asciiMatch = /\n\.\.\. \(\+(\d+) more top-level symbols in L(\d+)-L(\d+) omitted; use batch_search or read_file\)$/.exec(asciiRes.text);
+    assert.ok(asciiMatch);
+    assert.equal(Number(asciiMatch[2]), (300 - Number(asciiMatch[1])) * 3 + 1);
+    assert.equal(Number(asciiMatch[3]), 900);
+
+    const h2Rel = "breadth-first/h2_only.md";
+    const h2Lines: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      h2Lines.push(`## Section_${String(i).padStart(2, "0")}_LongHeadingForBudgetTest`, "Body.");
+    }
+    await fs.writeFile(path.join(tmpDir, h2Rel), h2Lines.join("\n"), "utf8");
+    const h2Res = await runReadSlices({ cwd: tmpDir, outlines: [h2Rel], maxChars: 1_200 });
+    assert.equal(h2Res.isError, false);
+    assert.ok(h2Res.text.length <= 1_200);
+    const h2Match = /\n\.\.\. \(\+(\d+) more top-level symbols in L(\d+)-L(\d+) omitted; use batch_search or read_file\)$/.exec(h2Res.text);
+    assert.ok(h2Match);
+    assert.equal(Number(h2Match[2]), (80 - Number(h2Match[1])) * 2 + 1);
+    assert.equal(Number(h2Match[3]), 160);
   });
 });

@@ -891,4 +891,66 @@ describe("apply_edits", () => {
       false,
     );
   });
+
+  it("folds green multi-package Vite build logs on verify failure and surfaces the TS error cleanly", async () => {
+    const f = path.join(tmpDir, "vite-verify.ts");
+    await fs.writeFile(f, "export const count = 1;\n", "utf8");
+
+    const scriptFile = path.join(tmpDir, "mock-vite-monorepo-fail.mjs");
+    await fs.writeFile(
+      scriptFile,
+      [
+        "const lines = [",
+        '  "> @demo/shared@1.0.0 build /repo/packages/shared",',
+        '  "> vite build",',
+        '  "",',
+        '  "vite v5.4.1 building for production...",',
+        '  "transforming...",',
+        '  "✓ 34 modules transformed.",',
+        '  "rendering chunks...",',
+        '  "computing gzip size...",',
+        '  "dist/shared.js          14.22 kB │ gzip: 4.88 kB",',
+        '  "dist/shared.css          2.10 kB │ gzip: 0.72 kB",',
+        '  "✓ built in 0.94s",',
+        '  "",',
+        '  "> @demo/ui@1.0.0 build /repo/packages/ui",',
+        '  "> vite build",',
+        '  "",',
+        '  "vite v5.4.1 building for production...",',
+        '  "transforming...",',
+        '  "✓ 68 modules transformed.",',
+        '  "rendering chunks...",',
+        '  "computing gzip size...",',
+        '  "dist/ui.js              42.15 kB │ gzip: 12.90 kB",',
+        '  "✓ built in 1.41s",',
+        '  "",',
+        '  "> @demo/web@1.0.0 typecheck /repo/packages/web",',
+        '  "src/Table.tsx(42,11): error TS2322: Type \'string\' is not assignable to type \'number\'.",',
+        '  "  42 | const rows: number = \\"invalid\\";",',
+        '  "     |       ~~~~",',
+        '  "Found 1 error in src/Table.tsx:42",',
+        "];",
+        'console.log(lines.join("\\n"));',
+        "process.exit(2);",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const res = await runApplyEdits({
+      cwd: tmpDir,
+      maxVerifyChars: 4000,
+      edits: [
+        { path: "vite-verify.ts", hunks: [{ target: "count = 1", replacement: "count = 2" }] },
+      ],
+      verify: `${JSON.stringify(process.execPath)} ${JSON.stringify(scriptFile)}`,
+    });
+
+    assert.equal(res.isError, false);
+    assert.equal(await fs.readFile(f, "utf8"), "export const count = 2;\n");
+    assert.match(res.text, /Verify \[FAIL \(exit 2\)/);
+    assert.match(res.text, /\.\.\. \(collapsed \d+ build\/pass lines; last:/);
+    assert.doesNotMatch(res.text, /dist\/shared\.js/);
+    assert.match(res.text, /src\/Table\.tsx\(42,11\): error TS2322/);
+    assert.match(res.text, /Found 1 error in src\/Table\.tsx:42/);
+  });
 });

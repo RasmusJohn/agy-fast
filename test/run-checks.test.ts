@@ -417,7 +417,7 @@ describe("run_checks", () => {
     assert.equal(compactRes.isError, false);
     assert.ok(compactRes.text.length <= 900);
     assert.match(compactRes.text, /FIRST_OUT_HEAD: Error in module A/);
-    assert.match(compactRes.text, /\[truncated: folded \d+ middle chars; total [3-9]\d{3,} chars\]/);
+    assert.match(compactRes.text, /\[truncated: \d+ lines omitted\]/);
     assert.match(compactRes.text, /TAIL_OUT_END: 61 errors found in suite/);
 
     const fullRes = await runChecks({
@@ -430,6 +430,132 @@ describe("run_checks", () => {
     assert.match(fullRes.text, /FIRST_OUT_HEAD: Error in module A/);
     assert.match(fullRes.text, /\[truncated: folded \d+ middle chars; total [3-9]\d{3,} chars\]/);
     assert.match(fullRes.text, /TAIL_OUT_END: 61 errors found in suite/);
+  });
+
+  it("water-fills unused budget in full mode (with head-tail) and uses 2-pass tiered PASS+FAIL pooling in compact mode", async () => {
+    const richCmd = (tag: string) =>
+      `${nodeBin} -e "for (let i = 0; i < 60; i++) console.log('${tag}_LINE_' + String(i).padStart(2, '0') + '_' + 'x'.repeat(30)); console.log('${tag}' + '_END_TAIL');"`;
+
+    const fullWf = await runChecks({
+      outputMode: "full",
+      maxChars: 8000,
+      concurrency: 4,
+      commands: [
+        { name: "empty-1", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-2", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-3", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-4", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "rich-1", command: richCmd("RICH1") },
+        { name: "rich-2", command: richCmd("RICH2") },
+        { name: "rich-3", command: richCmd("RICH3") },
+        { name: "rich-4", command: richCmd("RICH4") },
+      ],
+    });
+    assert.equal(fullWf.isError, false);
+    assert.ok(fullWf.text.length <= 8000);
+    assert.ok(Buffer.byteLength(fullWf.text, "utf8") <= 8_800);
+    for (const tag of ["RICH1", "RICH2", "RICH3", "RICH4"]) {
+      const matches = fullWf.text.match(new RegExp(`${tag}_LINE_\\d{2}_`, "g")) ?? [];
+      assert.ok(matches.length >= 30, `Expected >=30 lines for ${tag}, got ${matches.length}`);
+      assert.match(fullWf.text, new RegExp(`${tag}_END_TAIL`));
+    }
+
+    // Compact mode: PASS + short FAIL donate unused space to long FAIL; dynamic tokens avoid command-echo false positives
+    const longFailScript = [
+      "console.log('> @app/web@1.0.0 build');",
+      "console.log('> vite build');",
+      "console.log('vite v5.4.0 building for production...');",
+      "console.log('transforming...');",
+      "console.log('✓ 40 modules transformed.');",
+      "console.log('rendering chunks...');",
+      "console.log('computing gzip size...');",
+      "for (let i = 0; i < 15; i++) console.log('dist/assets/chunk-' + i + '.js   12.34 kB │ gzip: 4.12 kB');",
+      "console.log('✓ built in 1.10s');",
+      "console.error('src/root.ts(1,1): error TS2304: FIRST_' + 'LONG_FAIL_ROOT');",
+      "for (let i = 0; i < 45; i++) console.error('src/mid-' + i + '.ts(10,2): error TS2322: cascade line ' + i + ' ' + 'a'.repeat(30));",
+      "console.error('src/end.ts(99,5): error TS2345: FINAL_' + 'LONG_FAIL_TAIL');",
+      "process.exit(1);",
+    ].join(" ");
+
+    const compactWf = await runChecks({
+      outputMode: "compact",
+      maxChars: 2400,
+      commands: [
+        { name: "pass-verbose", command: `${nodeBin} -e "console.log('PASS_SUMMARY: ' + 'p'.repeat(420) + ' passed')"` },
+        { name: "fail-short", command: `${nodeBin} -e "console.error('Error: SHORT_' + 'FAIL_ONLY'); process.exit(1)"` },
+        { name: "fail-long", command: `${nodeBin} -e ${JSON.stringify(longFailScript)}` },
+      ],
+    });
+    assert.equal(compactWf.isError, false);
+    assert.ok(compactWf.text.length <= 2400);
+    assert.match(compactWf.text, /Error: SHORT_FAIL_ONLY/);
+    assert.match(compactWf.text, /FIRST_LONG_FAIL_ROOT/);
+    assert.match(compactWf.text, /FINAL_LONG_FAIL_TAIL/);
+    const longFailSection = compactWf.text.split("## [FAIL")[2] ?? "";
+    assert.ok(longFailSection.length > 1400, `Expected water-filled fail-long > 1400 chars, got ${longFailSection.length}`);
+
+    // Mixed ASCII neutral lines + dense CJK failure lines must converge and preserve CJK tail <= 8800 UTF-8 bytes
+    const mixedCjkScript = [
+      "for (let i = 0; i < 400; i++) console.log('ascii neutral build log ' + i + ' ' + 'a'.repeat(30));",
+      "console.error('Error: 首个中文根因_' + 'CJK_ROOT');",
+      "for (let i = 0; i < 120; i++) console.error('Error: 中文编译报错详情行_' + i + '_类型不匹配需要检查字段定义和接口约束');",
+      "console.error('Error: 最终中文尾部_' + 'CJK_TAIL_FINAL');",
+      "process.exit(1);",
+    ].join(" ");
+    const cjkRes = await runChecks({
+      outputMode: "compact",
+      maxChars: 8000,
+      commands: [{ name: "cjk-mixed", command: `${nodeBin} -e ${JSON.stringify(mixedCjkScript)}` }],
+    });
+    assert.equal(cjkRes.isError, false);
+    assert.ok(Buffer.byteLength(cjkRes.text, "utf8") <= 8_800);
+    assert.match(cjkRes.text, /首个中文根因_CJK_ROOT/);
+    assert.match(cjkRes.text, /最终中文尾部_CJK_TAIL_FINAL/);
+    assert.doesNotMatch(cjkRes.text, /\uFFFD/);
+
+    // Long-named PASS-heavy batch at tight maxChars: 550 must NEVER starve the sole FAIL command
+    const longNamePasses = Array.from({ length: 10 }, (_, i) => ({
+      name: `very-long-workspace-package-check-name-${String(i).padStart(2, "0")}`,
+      command: `${nodeBin} -e "console.log('ok')"`,
+    }));
+    const starveRes = await runChecks({
+      outputMode: "compact",
+      maxChars: 550,
+      concurrency: 4,
+      commands: [
+        ...longNamePasses,
+        {
+          name: "sole-fail",
+          command: `${nodeBin} -e "console.error('Error: MUST_SEE_' + 'FAIL_CAUSE'); process.exit(1)"`,
+        },
+      ],
+    });
+    assert.equal(starveRes.isError, false);
+    assert.ok(starveRes.text.length <= 550);
+    assert.match(starveRes.text, /MUST_SEE_FAIL_CAUSE/);
+
+    // Multiple long [NOT RUN] commands must share capped budget so timed-out command still keeps its output
+    const notRunStarve = await runChecks({
+      outputMode: "compact",
+      concurrency: 1,
+      maxChars: 800,
+      commands: [
+        {
+          name: "timeout-cmd",
+          timeoutSec: 1,
+          command: `${nodeBin} -e "console.error('HANG_' + 'ROOT_CAUSE'); setTimeout(() => {}, 5000)"`,
+        },
+        ...Array.from({ length: 5 }, (_, i) => ({
+          name: `not-run-${i}`,
+          command: `${nodeBin} -e "const huge = '${"x".repeat(300)}'; console.log(huge)"`,
+        })),
+      ],
+    }, 1050);
+    assert.equal(notRunStarve.isError, false);
+    assert.ok(notRunStarve.text.length <= 800);
+    assert.match(notRunStarve.text, /TIMED OUT/);
+    assert.match(notRunStarve.text, /HANG_ROOT_CAUSE/);
+    assert.match(notRunStarve.text, /\[NOT RUN\] not-run-0/);
   });
 
   it("transparently unwraps only safe Windows powershell -Command wrappers around allowlisted CLI binaries", () => {

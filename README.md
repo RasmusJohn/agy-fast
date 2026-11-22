@@ -194,10 +194,10 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 - **Inline `verify`:** Optionally runs a build/typecheck/test command right after writing, stripping noisy logs (e.g., Pino/Bunyan info JSON, Maven footers) so root causes stay within budget.
 
 ### 3. `quick_outline` — Flat Multi-Language Symbol Outlines
-- **Up to 40 files per call** *(10–20 recommended per batch)*: Takes a flat `paths: string[]` array to extract exact `[startLine, endLine]` symbol/section maps for **TypeScript / JavaScript** *(incl. Fastify/Express routes & test blocks)*, **Vue / Svelte SFC**, **CSS / SCSS / Less**, **Python**, **Godot GDScript (`.gd`)**, **Go**, **Rust**, **Java / Kotlin / C# / Swift / C / C++**, **Shell**, **Markdown**, and **JSON / YAML**—making outline-first exploration effortless before parallel built-in `read_file`.
+- **Up to 40 files per call** *(10–20 recommended per batch)*: Takes a flat `paths: string[]` array to extract exact `[startLine, endLine]` symbol/section maps for **TypeScript / JavaScript** *(incl. Fastify/Express routes & test blocks)*, **HTML / Vue / Svelte**, **CSS / SCSS / Less**, **Python**, **Godot GDScript (`.gd`)**, **Go**, **Rust**, **Java / Kotlin / C# / Swift / C / C++**, **Shell**, **Markdown**, and **JSON / YAML**—making outline-first exploration effortless before parallel built-in `read_file`.
 
 ### 4. `read_slices` — Symbol Outlines + Targeted Line Slices
-- **Outlines + piggybacked slices:** Supports the same 14-format outlines plus optional tiny `[startLine, endLine]` slices in one call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
+- **Outlines + piggybacked slices:** Supports the same 15-format outlines (with breadth-first water-filling per file) plus optional tiny `[startLine, endLine]` slices in one call under the `≤8.8 KB` UTF-8 budget, while steering bulk range reads (`>150` lines) to parallel built-in `read_file`.
 
 ### 5. `run_checks` — Concurrent Build, Lint, Test & Diagnostic Runner
 - **Up to 12 commands per call:** Executes independent non-interactive shell commands in a bounded worker pool (`concurrency: 1..8`) with per-command timeouts (`1..170 s`, sharing a `170 s` call budget under Antigravity's `180 s` MCP limit), ANSI escape stripping, and transparent Windows unwrapping of trivial `powershell -Command "..."` wrappers around allowlisted binaries (`git`, `npm`, `node`, `rg`, `pytest`, `cargo`, etc.) to skip PowerShell cold-start overhead while leaving PowerShell cmdlets/aliases untouched.
