@@ -82,7 +82,7 @@
       <text x="374" y="91.7" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#4ADE80">~40 ms · ≤1.5 KB</text>
     </g>
     <text x="44" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#CBD5E1">开局一次性注入 Git 状态、2 层目录与脚本清单</text>
-    <text x="44" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#94A3B8">省去前 3 轮 49.2s 冷启动探索 · 12h 后台无阻塞更新</text>
+    <text x="44" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#94A3B8">省去前 3 轮 49.2s 冷启动探索 · 4h 后台无阻塞更新</text>
   </g>
 
   <!-- Connector: SessionStart -> AGENTS.md -->

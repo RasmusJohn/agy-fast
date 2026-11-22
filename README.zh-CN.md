@@ -130,7 +130,7 @@ node scripts/install.mjs install --project /path/to/your-repo
 | **本地常驻 MCP 服务** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | 常驻本地进程，在 `agy-fast_fast` 下以急加载（`"eager": true`）暴露 5 个强类型合并工具 |
 | **会话启动快照钩子** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | 仅在 `SessionStart` 运行一次（`~35–50 ms`，内置 `250 ms` 扫描熔断与系统/用户目录黑名单），注入 `≤1.5 KB` 项目/Git/目录快照 |
 | **工具路由与卫生规则** | [`rules/AGENTS.md`](rules/AGENTS.md) | 约 `6.5 KB` 精简路由规则，内联参数签名（支持自定义 `rules/AGENTS.local.md`，需带 `trigger: always_on` frontmatter，更新与重装自动保留） |
-| **后台自动更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 12 小时分离式后台检查，先暂存执行 MCP 冒烟校验再原子替换 |
+| **后台自动更新器** | [`dist/updater.mjs`](dist/updater.mjs) | 4 小时分离式后台检查，先暂存执行 MCP 冒烟校验再原子替换 |
 | **离线基准测试工具** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | 本地解析 `transcript.jsonl` 并输出单次指标或前后 A/B 对比 |
 
 ## 实测数据
@@ -252,7 +252,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 
 ### 零启动延迟的后台自动更新
 
-- **0 ms 启动阻塞**：每 **12 小时**在 `SessionStart` 吐出快照*之后*，异步拉起完全分离的后台更新进程（`dist/updater.mjs`）。
+- **0 ms 启动阻塞**：每 **4 小时**在 `SessionStart` 吐出快照*之后*，异步拉起完全分离的后台更新进程（`dist/updater.mjs`）。
 - **先验证、再原子替换**：优先通过 `git ls-remote --tags`（无 `git` 时回退 GitHub Releases API）检测新版本，克隆至隔离暂存目录并完成 **MCP 实时冒烟校验**后，再按文件原子替换；损坏版本会被自动拦截，且用户自定义的 `rules/AGENTS.local.md`（需带 `---\ntrigger: always_on\n---` YAML frontmatter 以便 Antigravity 加载，已加入 `.gitignore`）在自动更新与手动重装时均会被完整保留。
 - **安全保护**：常规复制安装与干净的直接 `git clone` 安装会自动更新；`--link` 开发软链接与有未提交改动的仓库**绝不覆盖**（仅提示有新版本）。更新完成后将在下一次新会话开头展示一次性提示。
 
@@ -296,7 +296,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 同时支持 **Antigravity CLI（`agy`）**、**Antigravity Desktop 2.0** 与 **Antigravity IDE**，兼容 **macOS、Linux 与 Windows**。仅需 **Node.js >= 20** 且零运行期依赖（可选安装 `ripgrep`/`rg`，缺失时自动回退纯 Node.js）。
 
 ### `agy-fast` 会向外部上传代码或会话日志吗？
-不会。全部 5 个 MCP 工具、`SessionStart` 快照以及离线基准测试均 100% 在本机运行。唯一的可选外网动作是每 12 小时检查一次 GitHub 公开 Release 标签以支持自动更新，可随时通过 `config --auto-update off` 或 `AGY_FAST_AUTO_UPDATE=off` 完全关闭。
+不会。全部 5 个 MCP 工具、`SessionStart` 快照以及离线基准测试均 100% 在本机运行。唯一的可选外网动作是每 4 小时检查一次 GitHub 公开 Release 标签以支持自动更新，可随时通过 `config --auto-update off` 或 `AGY_FAST_AUTO_UPDATE=off` 完全关闭。
 
 ### 如何验证本机加速效果或彻底卸载？
 运行 `node dist/benchmark.mjs analyze --local --split-usage` 即可纯离线统计本机日志的前后对比。随时可执行 `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` 一键干净卸载。

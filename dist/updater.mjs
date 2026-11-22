@@ -268,7 +268,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
 
 // src/utils/updater-core.ts
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
-var DEFAULT_CHECK_INTERVAL_HOURS = 12;
+var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
 var UPDATER_RUNTIME_FILES = [
   "plugin.json",

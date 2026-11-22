@@ -130,7 +130,7 @@ Empirical analysis of **55 real Antigravity sessions** (**8,446 LLM turns**, **1
 | **Local Stdio MCP Server** | [`mcp_config.json`](mcp_config.json) → [`dist/mcp-server.mjs`](dist/mcp-server.mjs) | Persistent local process exposing 5 eagerly loaded composite tools (`"eager": true`) under `agy-fast_fast` |
 | **Startup Snapshot Hook** | [`hooks.json`](hooks.json) → [`dist/session-start.mjs`](dist/session-start.mjs) | Runs once on `SessionStart` (`~35–50 ms`, `250 ms` scan circuit-breaker + OS/home-dir skip list), emitting a `≤1.5 KB` workspace snapshot |
 | **Routing & Hygiene Rules** | [`rules/AGENTS.md`](rules/AGENTS.md) | Compact (`~6.5 KB`) routing guide with inlined schemas (supports user-owned `rules/AGENTS.local.md` with `trigger: always_on` frontmatter, preserved across updates) |
-| **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 12 h release checker with staged MCP smoke verification |
+| **Background Auto-Updater** | [`dist/updater.mjs`](dist/updater.mjs) | Detached 4 h release checker with staged MCP smoke verification |
 | **Offline Benchmark CLI** | [`dist/benchmark.mjs`](dist/benchmark.mjs) | Local `transcript.jsonl` analyzer and before/after A/B comparator |
 
 ## Real-World Benchmarks
@@ -254,7 +254,7 @@ node dist/benchmark.mjs compare --before ./run-before/transcript.jsonl --after .
 
 ### Zero-Latency Background Auto-Updater
 
-- **0 ms session startup cost:** Every **12 hours**, `SessionStart` spawns a detached background process (`dist/updater.mjs`) *after* emitting the workspace snapshot.
+- **0 ms session startup cost:** Every **4 hours**, `SessionStart` spawns a detached background process (`dist/updater.mjs`) *after* emitting the workspace snapshot.
 - **Verified before swap:** Checks GitHub release tags (`git ls-remote --tags` with GitHub Releases API fallback), clones into an isolated staging directory, runs a **live MCP smoke test**, and atomically replaces runtime files—automatically rejecting broken releases while preserving any user-created `rules/AGENTS.local.md` (add `---\ntrigger: always_on\n---` YAML frontmatter so Antigravity loads it; gitignored for `git clone` installs).
 - **Safe by design:** Standard copied installs and clean direct `git clone` installs auto-update automatically; `--link` dev symlinks and dirty git repos are **never overwritten** (notify-only). A one-time notice appears in the next new session when an update is applied or available.
 
@@ -298,7 +298,7 @@ No — it complements them in a hybrid workflow. Built-in `read_file` is locally
 `agy-fast` supports **Antigravity CLI (`agy`)**, **Antigravity Desktop 2.0**, and **Antigravity IDE** across **macOS, Linux, and Windows**. It requires **Node.js >= 20** with zero runtime dependencies (optional `ripgrep`/`rg` with automatic pure-Node.js fallback).
 
 ### Does `agy-fast` send any code or transcript data to external servers?
-No. All MCP tools, the `SessionStart` snapshot hook, and the transcript benchmark CLI operate 100% locally. The only optional network request is the background update checker checking public GitHub release tags once every 12 hours, which can be switched to `notify` or disabled completely via `config --auto-update off` or `AGY_FAST_AUTO_UPDATE=off`.
+No. All MCP tools, the `SessionStart` snapshot hook, and the transcript benchmark CLI operate 100% locally. The only optional network request is the background update checker checking public GitHub release tags once every 4 hours, which can be switched to `notify` or disabled completely via `config --auto-update off` or `AGY_FAST_AUTO_UPDATE=off`.
 
 ### How do I verify the speedup or uninstall `agy-fast` cleanly?
 Run `node dist/benchmark.mjs analyze --local --split-usage` to benchmark your own local transcripts completely offline. To remove `agy-fast` at any time, run `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall`.

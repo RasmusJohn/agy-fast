@@ -242,7 +242,7 @@ Options:
   --check                       (update) Check for newer versions without applying
   --force                       (update) Re-apply even if already on the same version
   --auto-update auto|notify|off Configure background auto-update mode
-  --interval <hours>            Configure background check interval in hours (default 12)
+  --interval <hours>            Configure background check interval in hours (default 4)
   --channel release|main        Configure update channel (default release)
   --repo <url>                  Override git repository URL for updates
   --edits-format auto|array|string
@@ -921,7 +921,7 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
   const effectiveInterval =
     process.env.AGY_FAST_UPDATE_INTERVAL_HOURS?.trim() ||
     updaterCfg.checkIntervalHours ||
-    12;
+    4;
   const effectiveChannel =
     process.env.AGY_FAST_UPDATE_CHANNEL?.trim().toLowerCase() ||
     updaterCfg.channel ||
@@ -1170,7 +1170,7 @@ async function runConfig(opts) {
   if (!opts.quiet) {
     console.log(`agy-fast updater config (${cfgPath}):`);
     console.log(`  - autoUpdate        : ${cfg.autoUpdate || "auto"}`);
-    console.log(`  - checkIntervalHours: ${cfg.checkIntervalHours || 12}`);
+    console.log(`  - checkIntervalHours: ${cfg.checkIntervalHours || 4}`);
     console.log(`  - channel           : ${cfg.channel || "release"}`);
     console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
     console.log(`  - editsFormat       : ${cfg.editsFormat || "auto"}`);

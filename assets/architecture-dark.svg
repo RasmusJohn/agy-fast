@@ -82,7 +82,7 @@
       <text x="374" y="91.7" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="600" fill="#4ADE80">~40 ms · ≤1.5 KB</text>
     </g>
     <text x="44" y="119" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="500" fill="#CBD5E1">Injects git state, 2-level tree &amp; scripts once per session</text>
-    <text x="44" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#94A3B8">Cuts 49.2s cold-start exploration · 12h detached updater</text>
+    <text x="44" y="136" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif" font-size="10.8" fill="#94A3B8">Cuts 49.2s cold-start exploration · 4h detached updater</text>
   </g>
 
   <!-- Connector: SessionStart -> AGENTS.md -->

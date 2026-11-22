@@ -6,7 +6,7 @@ import { execBinaryAsync } from "./exec-utils.js";
 
 export const DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 export const DEFAULT_GITHUB_SLUG = "INK-Q/agy-fast";
-export const DEFAULT_CHECK_INTERVAL_HOURS = 12;
+export const DEFAULT_CHECK_INTERVAL_HOURS = 4;
 export const LOCK_STALE_MS = 10 * 60 * 1000;
 
 export const UPDATER_RUNTIME_FILES = [

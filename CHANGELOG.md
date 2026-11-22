@@ -5,6 +5,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.2.10] - 2026-11-22
+
+### Fixed
+
+- **Prevent silent `PLUGIN_ROOT` fallback when `cwd` is omitted without MCP `roots/list` (#22, thanks `@GoodCoder666`)**
+  - On hosts such as **Antigravity Desktop 2.0 Hub** (`--standalone --subclient_type hub`) where the MCP server starts in `~/.gemini/config/plugins/agy-fast` and the client reports no (or empty) MCP `roots/list`, omitting `cwd` or passing a relative `cwd` previously fell back to `process.cwd()` inside the plugin directory.
+  - `src/mcp-server.ts` now detects when `process.cwd()` resides inside the installed plugin directory (via `PLUGIN_ROOT`/`AGY_PLUGIN_ROOT`, standard `.gemini/.../plugins/*` / `.agents/plugins/*` paths, or runtime-only plugin installs) and immediately fails fast with an actionable `isError: true` message instructing the caller to pass the active workspace root in `cwd`, while keeping explicit `cwd`, valid MCP `roots/list`, and local dev checkouts unaffected.
+  - Reinforced explicit `cwd` guidance across all 5 MCP tool schemas and `rules/AGENTS.md` Rule 6, with end-to-end regression tests in `test/mcp-protocol.test.ts`.
+
+### Changed
+
+- **Faster default background update check interval (`12 h` → `4 h`)**
+  - Lowered `DEFAULT_CHECK_INTERVAL_HOURS` from `12` to `4` (keeping the detached `0 ms` startup design, 5-minute concurrent debounce, `git ls-remote` priority, and `AGY_FAST_UPDATE_INTERVAL_HOURS` / `config --interval` overrides) so active users receive hotfixes within half a day instead of waiting overnight.
+- **HOL Registry verified badge & Dependabot hygiene (#24)**
+  - Moved the HOL Registry verified badge into the hero badge strip across both `README.md` and `README.zh-CN.md` using the live `metric=score` endpoint, and configured `.github/dependabot.yml` to skip pre-1.0 `esbuild` minor jumps.
+
+### 简体中文摘要（v0.2.10）
+
+- **根治 Antigravity Desktop 2.0 Hub 漏传 `cwd` 静默回退到插件目录的问题（#22，感谢 `@GoodCoder666`）**：当宿主未通过 MCP `roots/list` 上报工作区（或返回空 `roots: []`）且 MCP 服务进程位于已安装插件目录内时，若工具调用省略 `cwd` 或传入相对路径，现立即 Fail-Fast 报错提示补传当前工作区根目录，彻底避免误搜或误改 `~/.gemini/config/plugins/agy-fast`；显式绝对路径 `cwd`、正常回报 `roots/list` 的宿主与本地开发态均零影响。
+- **后台自动更新默认检查周期由 `12 小时` 调整为 `4 小时`**：在保持 0ms 启动阻塞、5 分钟防抖与优先 `git ls-remote` 不占 GitHub API 限额的前提下，让高频迭代期的热修半天内即可无感触达（仍支持 `--interval` / `AGY_FAST_UPDATE_INTERVAL_HOURS` 自定义）。
+- **HOL Registry 认证徽章对齐与 Dependabot 降噪（#24）**：将 HOL 官方认证徽章统一移至中英文 README 顶部徽章栏并修复可用端点，同时优化 `.github/dependabot.yml` 过滤规则。
+
+---
+
 ## [0.2.9] - 2026-11-22
 
 ### Added & Improved

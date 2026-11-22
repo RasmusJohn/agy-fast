@@ -1362,7 +1362,7 @@ import { promises as fs2 } from "node:fs";
 import os3 from "node:os";
 import path4 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
-var DEFAULT_CHECK_INTERVAL_HOURS = 12;
+var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
 function getHomeDir(env = process.env) {
   return process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();

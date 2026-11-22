@@ -125,15 +125,15 @@ describe("auto-updater", () => {
       shouldTriggerBackgroundCheck(
         { lastCheckAt: new Date(now - 60_000).toISOString() },
         now,
-        12 * 3600 * 1000,
+        4 * 3600 * 1000,
       ),
       false,
     );
     assert.equal(
       shouldTriggerBackgroundCheck(
-        { lastCheckAt: new Date(now - 13 * 3600 * 1000).toISOString() },
+        { lastCheckAt: new Date(now - 5 * 3600 * 1000).toISOString() },
         now,
-        12 * 3600 * 1000,
+        4 * 3600 * 1000,
       ),
       true,
     );
