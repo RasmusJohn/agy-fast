@@ -663,4 +663,36 @@ describe("session-start hook", () => {
       await fs.rm(fakeHome, { recursive: true, force: true });
     }
   });
+
+  it("prioritizes root manifests over subprojects and handles detached HEAD cleanly", async () => {
+    const monoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-root-prio-"));
+    try {
+      await fs.writeFile(
+        path.join(monoRoot, "package.json"),
+        JSON.stringify({ name: "root-workspace", scripts: { test: "vitest" } }),
+        "utf8",
+      );
+      for (const sub of ["a-api", "b-app", "c-auth", "d-cli", "e-core", "f-edge", "g-web"]) {
+        await fs.mkdir(path.join(monoRoot, sub), { recursive: true });
+        await fs.writeFile(
+          path.join(monoRoot, sub, "package.json"),
+          JSON.stringify({ name: sub }),
+          "utf8",
+        );
+      }
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: monoRoot });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: monoRoot });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: monoRoot });
+      execFileSync("git", ["add", "package.json"], { cwd: monoRoot });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: monoRoot });
+      execFileSync("git", ["checkout", "-q", "--detach", "HEAD"], { cwd: monoRoot });
+
+      const snap = await buildWorkspaceSnapshot(monoRoot);
+      assert.ok(snap);
+      assert.match(snap, /Project:\n  - package\.json \(root-workspace\) scripts: test/);
+      assert.match(snap, /Git: branch `HEAD`/);
+    } finally {
+      await fs.rm(monoRoot, { recursive: true, force: true });
+    }
+  });
 });

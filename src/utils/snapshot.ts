@@ -32,30 +32,80 @@ const HARDENED_GIT_BASE_ARGS = [
   "--no-pager",
 ] as const;
 
+async function findGitEntry(workspaceDir: string): Promise<string | null> {
+  let cur = path.resolve(workspaceDir);
+  while (true) {
+    const candidate = path.join(cur, ".git");
+    try {
+      await fs.lstat(candidate);
+      return candidate;
+    } catch {
+      // keep walking up
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+async function readBranchFromGitEntry(gitEntry: string | null): Promise<string | null> {
+  if (!gitEntry) return null;
+  try {
+    const st = await fs.stat(gitEntry);
+    let gitDir = gitEntry;
+    if (st.isFile()) {
+      const ptr = await fs.readFile(gitEntry, "utf8");
+      const m = /^gitdir:\s*(.+)$/im.exec(ptr.trim());
+      if (!m?.[1]) return null;
+      gitDir = path.resolve(path.dirname(gitEntry), m[1].trim());
+    }
+    const headRaw = (await fs.readFile(path.join(gitDir, "HEAD"), "utf8")).trim();
+    const refMatch = /^ref:\s*refs\/heads\/(.+)$/.exec(headRaw);
+    return refMatch?.[1]?.trim() || "HEAD";
+  } catch {
+    return null;
+  }
+}
+
+function parsePorcelainBranchHeader(headerLine: string): {
+  branch: string;
+  isUnborn: boolean;
+} {
+  const body = headerLine.slice(3).trim();
+  const unbornMatch = /^(?:No commits yet|Initial commit) on (.+)$/.exec(body);
+  if (unbornMatch?.[1]) {
+    return { branch: unbornMatch[1].trim(), isUnborn: true };
+  }
+  if (/^HEAD\s*\(no branch\)$/i.test(body)) {
+    return { branch: "HEAD", isUnborn: false };
+  }
+  // Strip optional upstream tracking suffix `...origin/main [ahead 1]`
+  const branchOnly = body.split("...")[0]?.trim() || "HEAD";
+  return { branch: branchOnly, isUnborn: false };
+}
+
 async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
 ): Promise<string | null> {
+  const hasExplicitGitEnv = Boolean(process.env.GIT_DIR || process.env.GIT_WORK_TREE);
+  const gitEntry = hasExplicitGitEnv ? null : await findGitEntry(workspaceDir);
+  if (!hasExplicitGitEnv && !gitEntry) {
+    return null;
+  }
+
   const gitEnv = withNonInteractiveGitEnv();
-  const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096,
-      env: gitEnv,
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 4096,
-      env: gitEnv,
-    }),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
-      cwd: workspaceDir,
-      timeoutMs,
-      maxOutputBytes: 32_768,
-      env: gitEnv,
-    }),
+  const [statusRes, logRes] = await Promise.all([
+    execBinaryAsync(
+      "git",
+      [...HARDENED_GIT_BASE_ARGS, "-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"],
+      {
+        cwd: workspaceDir,
+        timeoutMs,
+        maxOutputBytes: 32_768,
+        env: gitEnv,
+      },
+    ),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
@@ -64,34 +114,47 @@ async function getGitSummary(
     }),
   ]);
 
-  const hasValidRepo =
-    (!branchRes.error && branchRes.exitCode === 0) ||
-    (!symRefRes.error && symRefRes.exitCode === 0) ||
-    (!statusRes.error && statusRes.exitCode === 0);
+  const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
+  const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
 
-  if (!hasValidRepo) {
+  if (!statusOk && !logOk) {
     return null;
   }
 
-  const branch =
-    (branchRes.exitCode === 0 && branchRes.stdout.trim()) ||
-    (symRefRes.exitCode === 0 && symRefRes.stdout.trim()) ||
-    "HEAD";
-  const isUnborn = branchRes.exitCode !== 0 && symRefRes.exitCode === 0;
-  const statusLines = statusRes.exitCode === 0
-    ? statusRes.stdout
-        .split(/\r?\n/)
-        .filter((l) => {
-          const trimmed = l.trim();
-          if (!trimmed) return false;
-          if (trimmed.startsWith("?? ")) {
-            const topSeg = trimmed.slice(3).split("/")[0]?.replace(/\/$/, "");
-            if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
-          }
-          return true;
-        })
-    : [];
-  const logLines = logRes.exitCode === 0
+  let branch = "HEAD";
+  let isUnborn = false;
+  let statusLines: string[] = [];
+
+  if (statusOk) {
+    const rawLines = statusRes.stdout.split(/\r?\n/);
+    if (statusRes.truncated && rawLines.length > 1) {
+      // Drop potentially mid-path truncated trailing line
+      rawLines.pop();
+    }
+    const headerIdx = rawLines.findIndex((l) => l.startsWith("## "));
+    if (headerIdx !== -1) {
+      const parsed = parsePorcelainBranchHeader(rawLines[headerIdx]!);
+      branch = parsed.branch;
+      isUnborn = parsed.isUnborn;
+      rawLines.splice(headerIdx, 1);
+    } else {
+      branch = (await readBranchFromGitEntry(gitEntry)) ?? "HEAD";
+    }
+    statusLines = rawLines.filter((l) => {
+      const trimmed = l.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("?? ")) {
+        const rawPath = trimmed.slice(3).replace(/^"/, "");
+        const topSeg = rawPath.split("/")[0]?.replace(/\/$/, "");
+        if (topSeg && DEFAULT_IGNORE_DIRS.has(topSeg)) return false;
+      }
+      return true;
+    });
+  } else {
+    branch = (await readBranchFromGitEntry(gitEntry)) ?? "HEAD";
+  }
+
+  const logLines = logOk
     ? logRes.stdout
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -101,10 +164,17 @@ async function getGitSummary(
   const parts: string[] = [
     isUnborn ? `Git: branch \`${branch}\` (unborn, no commits yet)` : `Git: branch \`${branch}\``,
   ];
-  if (statusLines.length === 0) {
+  if (!statusOk) {
+    parts.push(
+      statusRes.timedOut
+        ? "Working tree: unknown (git status timed out)"
+        : "Working tree: unknown (git status failed)",
+    );
+  } else if (statusLines.length === 0) {
     parts.push("Working tree: clean");
   } else {
-    const prefix = `Modified (${statusLines.length}): `;
+    const countLabel = statusRes.truncated ? `${statusLines.length}+` : `${statusLines.length}`;
+    const prefix = `Modified (${countLabel}): `;
     const maxModifiedChars = 260;
     const maxItems = 8;
     const shown: string[] = [];
@@ -114,7 +184,8 @@ async function getGitSummary(
       const item = raw.length > 100 ? `${sliceSafeChars(raw, 97)}...` : raw;
       const sepLen = shown.length > 0 ? 2 : 0;
       const remainingAfter = statusLines.length - (i + 1);
-      const moreReserve = remainingAfter > 0 ? ` (+${remainingAfter} more)`.length : 0;
+      const moreReserve =
+        remainingAfter > 0 || statusRes.truncated ? ` (+${remainingAfter} more)`.length : 0;
       if (shown.length > 0 && currentLen + sepLen + item.length + moreReserve > maxModifiedChars) {
         break;
       }
@@ -123,8 +194,10 @@ async function getGitSummary(
     }
     const more =
       shown.length < statusLines.length
-        ? ` (+${statusLines.length - shown.length} more)`
-        : "";
+        ? ` (+${statusLines.length - shown.length}${statusRes.truncated ? "+" : ""} more)`
+        : statusRes.truncated
+          ? " (+more)"
+          : "";
     parts.push(`${prefix}${shown.join(", ")}${more}`);
   }
   if (logLines.length > 0) {
@@ -580,21 +653,28 @@ async function getTwoLevelTree(
 async function detectManifestsInDir(
   dirPath: string,
   prefix: string,
+  knownFiles?: Set<string>,
 ): Promise<string[]> {
   const hints: string[] = [];
+  const hasFile = (name: string): boolean => !knownFiles || knownFiles.has(name);
 
   await Promise.all([
     // package.json
     (async () => {
+      if (!hasFile("package.json")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "package.json"), "utf8");
         const pkg = JSON.parse(raw) as {
-          name?: string;
-          scripts?: Record<string, string>;
+          name?: unknown;
+          scripts?: unknown;
         };
-        const scriptNames = pkg.scripts ? Object.keys(pkg.scripts).slice(0, 12) : [];
-        const label = pkg.name
-          ? `${prefix}package.json (${pkg.name})`
+        const pkgName = typeof pkg.name === "string" ? pkg.name.trim() : "";
+        const scriptNames =
+          pkg.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts)
+            ? Object.keys(pkg.scripts as Record<string, unknown>).slice(0, 12)
+            : [];
+        const label = pkgName
+          ? `${prefix}package.json (${pkgName})`
           : `${prefix}package.json`;
         hints.push(
           scriptNames.length > 0
@@ -610,6 +690,7 @@ async function detectManifestsInDir(
     (async () => {
       if (prefix) return;
       for (const name of ["Makefile", "makefile"]) {
+        if (!hasFile(name)) continue;
         try {
           const raw = await fs.readFile(path.join(dirPath, name), "utf8");
           const targets: string[] = [];
@@ -634,6 +715,7 @@ async function detectManifestsInDir(
 
     // pom.xml (Maven)
     (async () => {
+      if (!hasFile("pom.xml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "pom.xml"), "utf8");
         const stripped = raw.replace(/<parent>[\s\S]*?<\/parent>/i, "");
@@ -649,6 +731,7 @@ async function detectManifestsInDir(
     // build.gradle / build.gradle.kts
     (async () => {
       for (const name of ["build.gradle.kts", "build.gradle"]) {
+        if (!hasFile(name)) continue;
         try {
           await fs.access(path.join(dirPath, name));
           hints.push(`${prefix}${name} (gradle)`);
@@ -661,6 +744,7 @@ async function detectManifestsInDir(
 
     // pyproject.toml
     (async () => {
+      if (!hasFile("pyproject.toml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "pyproject.toml"), "utf8");
         const tools: string[] = [];
@@ -681,6 +765,7 @@ async function detectManifestsInDir(
 
     // Cargo.toml
     (async () => {
+      if (!hasFile("Cargo.toml")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "Cargo.toml"), "utf8");
         const isWorkspace = /\[workspace\]/.test(raw);
@@ -694,6 +779,7 @@ async function detectManifestsInDir(
 
     // go.mod
     (async () => {
+      if (!hasFile("go.mod")) return;
       try {
         const raw = await fs.readFile(path.join(dirPath, "go.mod"), "utf8");
         const m = /^module\s+(\S+)/m.exec(raw);
@@ -713,11 +799,15 @@ async function getProjectManifestSummary(
   isHomeRoot: boolean,
   deadlineMs: number,
 ): Promise<string | null> {
+  const rootKnownFiles = topRes.ok
+    ? new Set(topRes.value.filter((e) => !e.isDirectory()).map((e) => e.name))
+    : undefined;
   const rootRes = await raceWithDeadline(
-    detectManifestsInDir(workspaceDir, ""),
+    detectManifestsInDir(workspaceDir, "", rootKnownFiles),
     deadlineMs,
   );
-  const allHints = rootRes.ok ? [...rootRes.value] : [];
+  const rootHints = rootRes.ok ? [...rootRes.value].sort() : [];
+  const subHints: string[] = [];
 
   // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/)
   if (performance.now() < deadlineMs && topRes.ok) {
@@ -744,15 +834,16 @@ async function getProjectManifestSummary(
             deadlineMs,
           );
           if (res.ok) {
-            allHints.push(...res.value);
+            subHints.push(...res.value);
           }
         }
       }),
     );
   }
 
+  subHints.sort();
+  const allHints = [...rootHints, ...subHints];
   if (allHints.length === 0) return null;
-  allHints.sort();
   return `Project:\n${allHints.slice(0, 6).map((h) => `  - ${h}`).join("\n")}`;
 }
 
