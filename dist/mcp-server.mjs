@@ -17,6 +17,7 @@ var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
 var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
 var MAX_KNOWN_ROOTS_IDS = 64;
+var MAX_FRAME_BYTES = 64 * 1024 * 1024;
 var McpStdioServer = class {
   tools = /* @__PURE__ */ new Map();
   serverName;
@@ -39,6 +40,7 @@ var McpStdioServer = class {
   initWriteInFlight = 0;
   postInitOutgoingQueue = [];
   rootsTimeoutMs;
+  maxFrameBytes;
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
@@ -46,6 +48,7 @@ var McpStdioServer = class {
     this.shouldRequestRoots = options.shouldRequestRoots;
     this.onInitialize = options.onInitialize;
     this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
+    this.maxFrameBytes = typeof options.maxFrameBytes === "number" && Number.isFinite(options.maxFrameBytes) && options.maxFrameBytes > 0 ? Math.trunc(options.maxFrameBytes) : MAX_FRAME_BYTES;
   }
   flushRootsWaiters() {
     for (const waiter of this.rootsWaiters) {
@@ -353,7 +356,9 @@ var McpStdioServer = class {
   }
   listen(input = process.stdin, output = process.stdout, onExit) {
     this.onDrainExit = onExit;
+    const maxFrameBytes = this.maxFrameBytes;
     let buffer = Buffer.alloc(0);
+    let discardingOversizedLine = false;
     const writeResponse = (payload, useContentLength) => {
       const serialized = JSON.stringify(payload);
       if (useContentLength) {
@@ -494,6 +499,16 @@ ${serialized}`);
     };
     const drainBuffer = () => {
       while (buffer.length > 0) {
+        if (discardingOversizedLine) {
+          const nlIdx = buffer.indexOf(10);
+          if (nlIdx === -1) {
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          discardingOversizedLine = false;
+          buffer = nlIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(nlIdx + 1));
+          continue;
+        }
         let offset = 0;
         while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
           offset++;
@@ -524,7 +539,6 @@ ${serialized}`);
           const sepLen = sepMatch[0].length;
           const headerText = headerScan.slice(0, sepIdx);
           const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
-          const maxFrameBytes = 64 * 1024 * 1024;
           if (clMatches.length !== 1) {
             writeResponse(
               {
@@ -560,7 +574,41 @@ ${serialized}`);
           continue;
         }
         const newlineIdx = buffer.indexOf(10);
-        if (newlineIdx === -1) break;
+        if (newlineIdx === -1) {
+          const pendingLen = buffer.length > 0 && buffer[buffer.length - 1] === 13 ? buffer.length - 1 : buffer.length;
+          if (pendingLen > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+                }
+              },
+              false
+            );
+            discardingOversizedLine = true;
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
+        const lineLen = newlineIdx > 0 && buffer[newlineIdx - 1] === 13 ? newlineIdx - 1 : newlineIdx;
+        if (lineLen > maxFrameBytes) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32600,
+                message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+              }
+            },
+            false
+          );
+          buffer = newlineIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(newlineIdx + 1));
+          continue;
+        }
         const lineBuf = buffer.subarray(0, newlineIdx);
         buffer = buffer.subarray(newlineIdx + 1);
         const line = lineBuf.toString("utf8").trim();
@@ -576,7 +624,9 @@ ${serialized}`);
     });
     const handleInputClosed = (flushTrailing) => {
       if (this.stdinEnded) return;
-      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
+      const wasDiscarding = discardingOversizedLine;
+      discardingOversizedLine = false;
+      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
       buffer = Buffer.alloc(0);
       this.stdinEnded = true;
       if (flushTrailing && remaining.length > 0) {

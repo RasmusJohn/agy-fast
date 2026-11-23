@@ -60,6 +60,7 @@ const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 
 const ROOTS_REQUEST_TIMEOUT_MS = 1000;
 const MAX_KNOWN_ROOTS_IDS = 64;
+export const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
 export class McpStdioServer {
   private readonly tools = new Map<string, RegisteredTool>();
@@ -89,6 +90,7 @@ export class McpStdioServer {
   private initWriteInFlight = 0;
   private postInitOutgoingQueue: Array<() => void> = [];
   private readonly rootsTimeoutMs: number;
+  private readonly maxFrameBytes: number;
 
   constructor(options: {
     name: string;
@@ -106,6 +108,7 @@ export class McpStdioServer {
       protocolVersion: string;
     }) => void;
     rootsTimeoutMs?: number;
+    maxFrameBytes?: number;
   }) {
     this.serverName = options.name;
     this.serverVersion = options.version;
@@ -118,6 +121,12 @@ export class McpStdioServer {
       options.rootsTimeoutMs > 0
         ? Math.trunc(options.rootsTimeoutMs)
         : ROOTS_REQUEST_TIMEOUT_MS;
+    this.maxFrameBytes =
+      typeof options.maxFrameBytes === "number" &&
+      Number.isFinite(options.maxFrameBytes) &&
+      options.maxFrameBytes > 0
+        ? Math.trunc(options.maxFrameBytes)
+        : MAX_FRAME_BYTES;
   }
 
   private flushRootsWaiters(): void {
@@ -493,7 +502,9 @@ export class McpStdioServer {
     onExit?: () => void,
   ): void {
     this.onDrainExit = onExit;
+    const maxFrameBytes = this.maxFrameBytes;
     let buffer: Buffer = Buffer.alloc(0);
+    let discardingOversizedLine = false;
 
     const writeResponse = (
       payload: JsonRpcResponse | JsonRpcResponse[] | JsonRpcOutgoingRequest,
@@ -665,6 +676,20 @@ export class McpStdioServer {
 
     const drainBuffer = (): void => {
       while (buffer.length > 0) {
+        if (discardingOversizedLine) {
+          const nlIdx = buffer.indexOf(0x0a);
+          if (nlIdx === -1) {
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          discardingOversizedLine = false;
+          buffer =
+            nlIdx + 1 >= buffer.length
+              ? Buffer.alloc(0)
+              : Buffer.from(buffer.subarray(nlIdx + 1));
+          continue;
+        }
+
         // Trim leading blank lines / whitespace
         let offset = 0;
         while (
@@ -707,7 +732,6 @@ export class McpStdioServer {
 
           const headerText = headerScan.slice(0, sepIdx);
           const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
-          const maxFrameBytes = 64 * 1024 * 1024;
           if (clMatches.length !== 1) {
             writeResponse(
               {
@@ -747,7 +771,51 @@ export class McpStdioServer {
 
         // Standard MCP Stdio newline-delimited JSON framing
         const newlineIdx = buffer.indexOf(0x0a);
-        if (newlineIdx === -1) break;
+        if (newlineIdx === -1) {
+          const pendingLen =
+            buffer.length > 0 && buffer[buffer.length - 1] === 0x0d
+              ? buffer.length - 1
+              : buffer.length;
+          if (pendingLen > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request: NDJSON message exceeds maximum allowed size",
+                },
+              },
+              false,
+            );
+            discardingOversizedLine = true;
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
+
+        const lineLen =
+          newlineIdx > 0 && buffer[newlineIdx - 1] === 0x0d
+            ? newlineIdx - 1
+            : newlineIdx;
+        if (lineLen > maxFrameBytes) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32600,
+                message: "Invalid Request: NDJSON message exceeds maximum allowed size",
+              },
+            },
+            false,
+          );
+          buffer =
+            newlineIdx + 1 >= buffer.length
+              ? Buffer.alloc(0)
+              : Buffer.from(buffer.subarray(newlineIdx + 1));
+          continue;
+        }
 
         const lineBuf = buffer.subarray(0, newlineIdx);
         buffer = buffer.subarray(newlineIdx + 1);
@@ -766,7 +834,9 @@ export class McpStdioServer {
 
     const handleInputClosed = (flushTrailing: boolean): void => {
       if (this.stdinEnded) return;
-      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
+      const wasDiscarding = discardingOversizedLine;
+      discardingOversizedLine = false;
+      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
       buffer = Buffer.alloc(0);
       this.stdinEnded = true;
       if (flushTrailing && remaining.length > 0) {
