@@ -55,16 +55,38 @@ export function isLikelyBinary(buf: Buffer): boolean {
   return false;
 }
 
-export async function readTextFile(
-  filePath: string,
-  maxBytes = 10 * 1024 * 1024,
-): Promise<{
+export interface TextFileContent {
   content: string;
   eol: "\r\n" | "\n";
+  hasBom: boolean;
   size: number;
   mode: number;
   rawBuffer: Buffer;
-}> {
+}
+
+export function hasUtf8Bom(buf: Buffer): boolean {
+  return buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+}
+
+export function detectUtf16Bom(buf: Buffer): "UTF-16 LE" | "UTF-16 BE" | null {
+  if (buf.length < 2) return null;
+  if (buf[0] === 0xff && buf[1] === 0xfe) {
+    // Distinguish UTF-32 LE BOM (FF FE 00 00) from UTF-16 LE (FF FE ...)
+    if (buf.length >= 4 && buf[2] === 0x00 && buf[3] === 0x00) {
+      return null;
+    }
+    return "UTF-16 LE";
+  }
+  if (buf[0] === 0xfe && buf[1] === 0xff) {
+    return "UTF-16 BE";
+  }
+  return null;
+}
+
+export async function readTextFile(
+  filePath: string,
+  maxBytes = 10 * 1024 * 1024,
+): Promise<TextFileContent> {
   const stat = await fs.stat(filePath);
   if (!stat.isFile()) {
     throw new Error(`Not a regular file: ${filePath}`);
@@ -75,10 +97,17 @@ export async function readTextFile(
     );
   }
   const buf = await fs.readFile(filePath);
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    throw new Error(
+      `UTF-16 encoded file is not supported (convert to UTF-8 first): ${filePath} [${utf16Bom}]`,
+    );
+  }
   if (isLikelyBinary(buf)) {
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
-  const content = buf.toString("utf8");
+  const hasBom = hasUtf8Bom(buf);
+  const content = (hasBom ? buf.subarray(3) : buf).toString("utf8");
   let crlfCount = 0;
   let lfOnlyCount = 0;
   for (let i = 0; i < content.length; i++) {
@@ -88,7 +117,7 @@ export async function readTextFile(
     }
   }
   const eol: "\r\n" | "\n" = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  return { content, eol, size: stat.size, mode: stat.mode & 0o7777, rawBuffer: buf };
+  return { content, eol, hasBom, size: stat.size, mode: stat.mode & 0o7777, rawBuffer: buf };
 }
 
 /**
