@@ -255,6 +255,7 @@ node dist/benchmark.mjs compare --before ./before/transcript.jsonl --after ./aft
 | **立即更新并自检** *（先暂存冒烟校验再替换）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs update` |
 | **配置自动更新策略** *（`auto` \| `notify` \| `off`）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --auto-update notify --interval 24` |
 | **切换 MCP 工具加载模式** *（`eager` \| `lazy`，自动更新保留）* | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs config --tool-loading lazy` |
+| **CLI 直调模式** *（供 Swarm Worker 及无 MCP 环境通过 `run_command` 调用）* | `node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli <search\|outline\|slice\|edit\|check>` |
 | **一键干净卸载** | `node ~/.gemini/config/plugins/agy-fast/scripts/install.mjs uninstall` |
 
 > 在本地克隆目录中，也可直接使用 `./install.sh <子命令>`（macOS/Linux）或 `.\install.ps1 <子命令>`（Windows）执行上述全部子命令。

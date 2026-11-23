@@ -540,6 +540,7 @@ describe("session-start hook", () => {
         const env: NodeJS.ProcessEnv = { ...process.env, AGY_FAST_AUTO_UPDATE: "off" };
         delete env.PLUGIN_ROOT;
         delete env.AGY_PLUGIN_ROOT;
+        delete env.GEMINI_HOME;
         for (const [k, v] of Object.entries(extraEnv)) {
           if (v === undefined) delete env[k];
           else env[k] = v;
@@ -596,9 +597,55 @@ describe("session-start hook", () => {
       const msg2: string = JSON.parse(viaHomeFallback.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
       assert.match(msg2, /unrelated-biz-app/);
 
-      // 3. When no plugin dir exists anywhere, fails open with {} and exit code 0
-      const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-empty-home-"));
+      // 3. Untrusted workspace with decoy plugin.json + dist/session-start.mjs (root or .agents) must NOT override global install
+      const untrustedWs = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-untrusted-ws-"));
       try {
+        await fs.writeFile(
+          path.join(untrustedWs, "package.json"),
+          JSON.stringify({ name: "untrusted-repo-app" }),
+          "utf8",
+        );
+        const marker = path.join(untrustedWs, "pwned-hook");
+        const poison = `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "1");`;
+        for (const decoyDir of [untrustedWs, path.join(untrustedWs, ".agents", "plugins", "agy-fast")]) {
+          await fs.mkdir(path.join(decoyDir, "dist"), { recursive: true });
+          await fs.writeFile(path.join(decoyDir, "plugin.json"), '{"name":"agy-fast"}', "utf8");
+          await fs.writeFile(path.join(decoyDir, "dist", "session-start.mjs"), poison, "utf8");
+        }
+        const safeRes = await runShellHook(
+          untrustedWs,
+          JSON.stringify({ cwd: untrustedWs, workspacePaths: [untrustedWs] }),
+          { HOME: fakeHome, USERPROFILE: fakeHome },
+        );
+        assert.equal(safeRes.code, 0, `stderr: ${safeRes.stderr}`);
+        assert.equal(safeRes.stderr, "");
+        const safeMsg: string = JSON.parse(safeRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+        assert.match(safeMsg, /untrusted-repo-app/);
+        assert.equal(await fs.access(marker).then(() => true, () => false), false);
+      } finally {
+        await fs.rm(untrustedWs, { recursive: true, force: true });
+      }
+
+      // 4. Isolated GEMINI_HOME resolves <GEMINI_HOME>/config/plugins/agy-fast even when HOME has no plugin
+      const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-empty-home-"));
+      const isoGeminiHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-iso-gemini-"));
+      try {
+        const isoPlugin = path.join(isoGeminiHome, "config", "plugins", "agy-fast");
+        await fs.mkdir(path.join(isoPlugin, "dist"), { recursive: true });
+        await fs.copyFile(path.resolve(process.cwd(), "plugin.json"), path.join(isoPlugin, "plugin.json"));
+        await fs.copyFile(HOOK_SCRIPT, path.join(isoPlugin, "dist", "session-start.mjs"));
+
+        const viaGeminiHome = await runShellHook(
+          unrelatedWorkspace,
+          JSON.stringify({ cwd: unrelatedWorkspace, workspacePaths: [unrelatedWorkspace] }),
+          { HOME: emptyHome, USERPROFILE: emptyHome, GEMINI_HOME: isoGeminiHome },
+        );
+        assert.equal(viaGeminiHome.code, 0, `stderr: ${viaGeminiHome.stderr}`);
+        assert.equal(viaGeminiHome.stderr, "");
+        const msgIso: string = JSON.parse(viaGeminiHome.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
+        assert.match(msgIso, /unrelated-biz-app/);
+
+        // 5. When no plugin dir exists anywhere, fails open with {} and exit code 0
         const failOpen = await runShellHook(
           unrelatedWorkspace,
           JSON.stringify({ cwd: unrelatedWorkspace }),
@@ -609,6 +656,7 @@ describe("session-start hook", () => {
         assert.deepEqual(JSON.parse(failOpen.stdout), {});
       } finally {
         await fs.rm(emptyHome, { recursive: true, force: true });
+        await fs.rm(isoGeminiHome, { recursive: true, force: true });
       }
     } finally {
       await fs.rm(unrelatedWorkspace, { recursive: true, force: true });

@@ -6,7 +6,12 @@ import {
   parseMaybeJsonArray,
   type CorruptedItem,
 } from "../utils/arg-validation.js";
-import { execBinaryAsync, isRipgrepAvailable, type ExecResult } from "../utils/exec-utils.js";
+import {
+  execBinaryAsync,
+  isRipgrepAvailable,
+  withNonInteractiveGitEnv,
+  type ExecResult,
+} from "../utils/exec-utils.js";
 import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
   globToRegExp,
@@ -1462,6 +1467,7 @@ async function runGitQuery(query: SearchQuery, searchRoot: string): Promise<stri
     cwd: searchRoot,
     timeoutMs: 10_000,
     maxOutputBytes: 512 * 1024,
+    env: withNonInteractiveGitEnv(),
   });
 
   if (res.error) {

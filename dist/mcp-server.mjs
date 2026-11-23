@@ -17,6 +17,7 @@ var SUPPORTED_PROTOCOL_VERSIONS = /* @__PURE__ */ new Set([
 var DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 var ROOTS_REQUEST_TIMEOUT_MS = 1e3;
 var MAX_KNOWN_ROOTS_IDS = 64;
+var MAX_FRAME_BYTES = 64 * 1024 * 1024;
 var McpStdioServer = class {
   tools = /* @__PURE__ */ new Map();
   serverName;
@@ -39,6 +40,7 @@ var McpStdioServer = class {
   initWriteInFlight = 0;
   postInitOutgoingQueue = [];
   rootsTimeoutMs;
+  maxFrameBytes;
   constructor(options) {
     this.serverName = options.name;
     this.serverVersion = options.version;
@@ -46,6 +48,7 @@ var McpStdioServer = class {
     this.shouldRequestRoots = options.shouldRequestRoots;
     this.onInitialize = options.onInitialize;
     this.rootsTimeoutMs = typeof options.rootsTimeoutMs === "number" && Number.isFinite(options.rootsTimeoutMs) && options.rootsTimeoutMs > 0 ? Math.trunc(options.rootsTimeoutMs) : ROOTS_REQUEST_TIMEOUT_MS;
+    this.maxFrameBytes = typeof options.maxFrameBytes === "number" && Number.isFinite(options.maxFrameBytes) && options.maxFrameBytes > 0 ? Math.trunc(options.maxFrameBytes) : MAX_FRAME_BYTES;
   }
   flushRootsWaiters() {
     for (const waiter of this.rootsWaiters) {
@@ -353,7 +356,9 @@ var McpStdioServer = class {
   }
   listen(input = process.stdin, output = process.stdout, onExit) {
     this.onDrainExit = onExit;
+    const maxFrameBytes = this.maxFrameBytes;
     let buffer = Buffer.alloc(0);
+    let discardingOversizedLine = false;
     const writeResponse = (payload, useContentLength) => {
       const serialized = JSON.stringify(payload);
       if (useContentLength) {
@@ -494,6 +499,16 @@ ${serialized}`);
     };
     const drainBuffer = () => {
       while (buffer.length > 0) {
+        if (discardingOversizedLine) {
+          const nlIdx = buffer.indexOf(10);
+          if (nlIdx === -1) {
+            buffer = Buffer.alloc(0);
+            break;
+          }
+          discardingOversizedLine = false;
+          buffer = nlIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(nlIdx + 1));
+          continue;
+        }
         let offset = 0;
         while (offset < buffer.length && (buffer[offset] === 10 || buffer[offset] === 13)) {
           offset++;
@@ -524,7 +539,6 @@ ${serialized}`);
           const sepLen = sepMatch[0].length;
           const headerText = headerScan.slice(0, sepIdx);
           const clMatches = [...headerText.matchAll(/^content-length:[ \t]*(\d+)[ \t]*\r?$/gim)];
-          const maxFrameBytes = 64 * 1024 * 1024;
           if (clMatches.length !== 1) {
             writeResponse(
               {
@@ -560,7 +574,41 @@ ${serialized}`);
           continue;
         }
         const newlineIdx = buffer.indexOf(10);
-        if (newlineIdx === -1) break;
+        if (newlineIdx === -1) {
+          const pendingLen = buffer.length > 0 && buffer[buffer.length - 1] === 13 ? buffer.length - 1 : buffer.length;
+          if (pendingLen > maxFrameBytes) {
+            writeResponse(
+              {
+                jsonrpc: "2.0",
+                id: null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+                }
+              },
+              false
+            );
+            discardingOversizedLine = true;
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
+        const lineLen = newlineIdx > 0 && buffer[newlineIdx - 1] === 13 ? newlineIdx - 1 : newlineIdx;
+        if (lineLen > maxFrameBytes) {
+          writeResponse(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32600,
+                message: "Invalid Request: NDJSON message exceeds maximum allowed size"
+              }
+            },
+            false
+          );
+          buffer = newlineIdx + 1 >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(newlineIdx + 1));
+          continue;
+        }
         const lineBuf = buffer.subarray(0, newlineIdx);
         buffer = buffer.subarray(newlineIdx + 1);
         const line = lineBuf.toString("utf8").trim();
@@ -576,7 +624,9 @@ ${serialized}`);
     });
     const handleInputClosed = (flushTrailing) => {
       if (this.stdinEnded) return;
-      const remaining = flushTrailing ? buffer.toString("utf8").trim() : "";
+      const wasDiscarding = discardingOversizedLine;
+      discardingOversizedLine = false;
+      const remaining = flushTrailing && !wasDiscarding ? buffer.toString("utf8").trim() : "";
       buffer = Buffer.alloc(0);
       this.stdinEnded = true;
       if (flushTrailing && remaining.length > 0) {
@@ -1040,7 +1090,32 @@ async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   })();
   return pendingWindowsPowerShellProbe;
 }
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
+}
 async function runShellCommandAsync(command, options) {
+  const effectiveOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env)
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -1051,13 +1126,13 @@ async function runShellCommandAsync(command, options) {
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options
+          effectiveOptions
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -1186,13 +1261,46 @@ var ANSI_REGEX = (
 function stripAnsi(text) {
   return text.replace(ANSI_REGEX, "");
 }
+var LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
+var LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
 function normalizeTerminalOutput(raw) {
-  const clean = stripAnsi(raw).replace(/\r\n/g, "\n");
-  return clean.split("\n").map((line) => {
-    if (!line.includes("\r")) return line;
-    const parts = line.split("\r").filter((p) => p.length > 0);
-    return parts[parts.length - 1] ?? "";
-  }).join("\n").trimEnd();
+  const rawLines = raw.replace(/\r\n/g, "\n").split("\n");
+  const normalizedLines = [];
+  for (const rawLine of rawLines) {
+    if (rawLine.length === 0) {
+      normalizedLines.push("");
+      continue;
+    }
+    const hadLineErase = LINE_ERASE_CSI_RE.test(rawLine);
+    let working = rawLine;
+    const lastFullErase = working.lastIndexOf("\x1B[2K");
+    if (lastFullErase !== -1) {
+      working = working.slice(lastFullErase + 4);
+    }
+    if (!working.includes("\r") && !hadLineErase) {
+      normalizedLines.push(stripAnsi(working));
+      continue;
+    }
+    let currentFrame = "";
+    const crFrames = working.split("\r");
+    for (let idx = 0; idx < crFrames.length; idx++) {
+      let seg = crFrames[idx];
+      if (idx > 0 && LEADING_CLEAR_TO_EOL_RE.test(seg)) {
+        seg = seg.replace(LEADING_CLEAR_TO_EOL_RE, "");
+        currentFrame = stripAnsi(seg);
+        continue;
+      }
+      const cleanSeg = stripAnsi(seg);
+      if (cleanSeg.length > 0) {
+        currentFrame = cleanSeg;
+      }
+    }
+    if (hadLineErase && currentFrame.length === 0) {
+      continue;
+    }
+    normalizedLines.push(currentFrame);
+  }
+  return normalizedLines.join("\n").trimEnd();
 }
 var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
@@ -1547,18 +1655,32 @@ var GREEN_BUILD_OR_PASS_PATTERNS = [
   /^>\s+Task\s+:[\w:.-]+\s+(?:UP-TO-DATE|FROM-CACHE|NO-SOURCE|SKIPPED)\s*$/,
   /^\[INFO\]\s*(?:---\s+\S|Building\s+\S|Compiling\s+\S|Changes detected|Nothing to compile|Copying\s+\d+|Using\s+'[^']+'\s+encoding|Downloading\b|Downloaded\b|Installing\s+\S|Packaging\s+\S|Tests run:\s*\d+,\s*Failures:\s*0,\s*Errors:\s*0\b|Results:|Running\s+\S|Reactor Summary|BUILD SUCCESS|Total time:|Finished at:|-+\s*$|$)/i
 ];
+var UNAMBIGUOUS_TEST_PASS_PATTERNS = [
+  /^[✓✔]\s+(?!built\b|done\b|\d+\s+modules?\s+transformed\b)\S/,
+  /^---\s+PASS:\s+\S/,
+  /^ok\s+\d+\s+-\s+\S/,
+  /^ok\t\S/,
+  /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
+  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/
+];
+function isUnambiguousTestPassLine(trimmed) {
+  if (!trimmed || /[✖✘✗×]/.test(trimmed)) return false;
+  return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
+}
 var MIN_FOLD_RUN_LINES = 4;
 var PROTECTED_TAIL_LINES = 15;
 function isGreenBuildOrPassLine(line) {
   const trimmed = line.trim();
   if (!trimmed) return false;
+  if (isUnambiguousTestPassLine(trimmed)) return true;
+  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+  const inner = prefixMatch ? trimmed.slice(prefixMatch[0].length).trim() : "";
+  if (inner && isUnambiguousTestPassLine(inner)) return true;
   if (hasFoldDangerToken(trimmed)) return false;
   if (GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(trimmed))) {
     return true;
   }
-  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
   if (prefixMatch) {
-    const inner = trimmed.slice(prefixMatch[0].length).trim();
     if (!inner) return false;
     if (inner === "Done") return true;
     return GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(inner));
@@ -1725,6 +1847,12 @@ function compactLongFailureLines(lines, maxChars) {
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const trimmed = line.trim();
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+    const monoInner = monoMatch ? trimmed.slice(monoMatch[0].length).trim() : "";
+    if (isUnambiguousTestPassLine(trimmed) || monoInner.length > 0 && isUnambiguousTestPassLine(monoInner)) {
+      continue;
+    }
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
@@ -2684,80 +2812,109 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   if (fileLines.length === 0) return "";
   const targetLines = normTarget.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
   if (targetLines.length === 0) return "";
-  const firstAnchor = targetLines.find((l) => l.length >= 6) ?? targetLines[0];
-  let longestAnchor = targetLines[0];
-  for (const tl of targetLines) {
-    if (tl.length > longestAnchor.length) longestAnchor = tl;
+  let firstAnchorIdx = 0;
+  for (let idx = 0; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length >= 6) {
+      firstAnchorIdx = idx;
+      break;
+    }
   }
-  const anchors = [firstAnchor];
-  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
-  const lastAnchor = targetLines[targetLines.length - 1];
-  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
-    anchors.push(lastAnchor);
+  let longestAnchorIdx = 0;
+  for (let idx = 1; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length > targetLines[longestAnchorIdx].length) {
+      longestAnchorIdx = idx;
+    }
   }
-  const primaryTokens = new Set(extractLineTokens(firstAnchor));
-  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  const lastAnchorIdx = targetLines.length - 1;
+  const anchorIndices = /* @__PURE__ */ new Set([firstAnchorIdx, longestAnchorIdx]);
+  if (targetLines[lastAnchorIdx].length >= 8) {
+    anchorIndices.add(lastAnchorIdx);
+  }
+  const anchors = [...anchorIndices].map((idx) => ({
+    text: targetLines[idx],
+    idx,
+    tokens: new Set(extractLineTokens(targetLines[idx]))
+  }));
+  const targetTokenSets = targetLines.map((tl) => new Set(extractLineTokens(tl)));
   const trimmedFileLines = fileLines.map((l) => l.trim());
-  let bestIdx = -1;
-  let bestScore = 0;
   const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
   const scanEnd = Math.min(
     trimmedFileLines.length - 1,
     (rangeEndLine ?? trimmedFileLines.length) - 1
   );
+  if (scanStart > scanEnd) return "";
+  const evaluatedStarts = /* @__PURE__ */ new Set();
+  let bestStart = -1;
+  let bestScore = 0;
+  const scoreIndices = [];
+  const windowLen = Math.min(targetLines.length, 10);
+  for (let k = 0; k < windowLen; k++) {
+    scoreIndices.push(k);
+  }
+  for (const idx of anchorIndices) {
+    if (idx >= windowLen) {
+      scoreIndices.push(idx);
+    }
+  }
+  const scoreCandidateStart = (candStart) => {
+    let total = 0;
+    for (const k of scoreIndices) {
+      const fIdx = candStart + k;
+      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) continue;
+      const fLine = trimmedFileLines[fIdx];
+      const tLine = targetLines[k];
+      if (!fLine || !tLine) continue;
+      const tTokens = targetTokenSets[k];
+      const isHighEntropy = tLine.length >= 12 && tTokens.size >= 2;
+      if (fLine === tLine) {
+        total += isHighEntropy ? 8 + Math.min(6, tLine.length / 14) : 4;
+      } else if (tLine.length >= 8 && (fLine.includes(tLine) || tLine.includes(fLine))) {
+        total += isHighEntropy ? 6 : 3.5;
+      } else if (tTokens.size > 0) {
+        const lineTokens = extractLineTokens(fLine);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (tTokens.has(tok)) hits += 1;
+        }
+        if (hits >= 2 || hits >= 1 && tTokens.size <= 2 && hits === tTokens.size) {
+          total += (isHighEntropy ? 4.5 : 3) * (hits / tTokens.size);
+        }
+      }
+    }
+    return total;
+  };
   for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i];
     if (!line) continue;
-    let score = 0;
-    if (line === firstAnchor) {
-      score += 10;
-    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
-      score += 6;
-    } else if (primaryTokens.size > 0) {
-      const lineTokens = extractLineTokens(line);
-      let hits = 0;
-      for (const tok of lineTokens) {
-        if (primaryTokens.has(tok)) hits += 1;
-      }
-      if (hits >= 2 || hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size) {
-        score += 4 * (hits / primaryTokens.size);
-      }
-    }
-    if (longestAnchor !== firstAnchor) {
-      if (line === longestAnchor) {
-        score += 8;
-      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
-        score += 5;
-      } else if (longestTokens.size >= 2) {
+    for (const anchor of anchors) {
+      let matchedAnchor = false;
+      if (line === anchor.text || anchor.text.length >= 8 && (line.includes(anchor.text) || anchor.text.includes(line))) {
+        matchedAnchor = true;
+      } else if (anchor.tokens.size > 0) {
         const lineTokens = extractLineTokens(line);
         let hits = 0;
         for (const tok of lineTokens) {
-          if (longestTokens.has(tok)) hits += 1;
+          if (anchor.tokens.has(tok)) hits += 1;
         }
-        if (hits >= 2) {
-          score += 3 * (hits / longestTokens.size);
-        }
-      }
-    }
-    if (score >= 2 && targetLines.length > 1) {
-      const lookahead = Math.min(targetLines.length, 6);
-      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
-        const nextLine = trimmedFileLines[i + k];
-        const tgtLine = targetLines[k];
-        if (nextLine && tgtLine && (nextLine === tgtLine || tgtLine.length >= 8 && nextLine.includes(tgtLine))) {
-          score += 3;
+        if (hits >= 2 || hits >= 1 && anchor.tokens.size <= 2 && hits === anchor.tokens.size) {
+          matchedAnchor = true;
         }
       }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
+      if (!matchedAnchor) continue;
+      const candStart = Math.max(scanStart, Math.min(scanEnd, i - anchor.idx));
+      if (evaluatedStarts.has(candStart)) continue;
+      evaluatedStarts.add(candStart);
+      const score = scoreCandidateStart(candStart);
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = candStart;
+      }
     }
   }
-  if (bestIdx < 0 || bestScore < 2.5) return "";
+  if (bestStart < 0 || bestScore < 2.5) return "";
   const span = Math.min(Math.max(targetLines.length, 4), 8);
-  const from = Math.max(1, bestIdx + 1 - 2);
-  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const from = Math.max(1, bestStart + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestStart + 1 + span + 2));
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
@@ -2766,7 +2923,7 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
     );
   }
   return `
-  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):
+  Closest match near line ${bestStart + 1} (lines ${from}-${to}):
 ${snippet.join("\n")}`;
 }
 function planHunksForContent(normalizedContent, hunks, displayPath) {
@@ -2904,6 +3061,41 @@ function countLines(text) {
   }
   return count;
 }
+function isGitInternalPath(filePath, platform = process.platform) {
+  const segments = filePath.split(/[\\/]+/);
+  for (const rawSeg of segments) {
+    if (!rawSeg) continue;
+    let seg = rawSeg.toLowerCase();
+    if (platform === "win32") {
+      seg = seg.replace(/[. ]+$/, "").replace(/:.*$/, "").replace(/[. ]+$/, "");
+    }
+    if (seg === ".git") {
+      return true;
+    }
+  }
+  return false;
+}
+async function canonicalizeTargetPath(absPath) {
+  try {
+    return await fs3.realpath(absPath);
+  } catch {
+    const trailingSegments = [];
+    let current = absPath;
+    while (true) {
+      const parent = path4.dirname(current);
+      if (parent === current) {
+        return absPath;
+      }
+      trailingSegments.push(path4.basename(current));
+      current = parent;
+      try {
+        const realAncestor = await fs3.realpath(current);
+        return path4.join(realAncestor, ...trailingSegments.reverse());
+      } catch {
+      }
+    }
+  }
+}
 async function commitPlannedWrites(plans) {
   const written = [];
   try {
@@ -2983,6 +3175,57 @@ function corruptedEditsError(items) {
     isError: true
   };
 }
+function formatErrorBulletsWithinBytes(heading, errors, maxBytes) {
+  const full = `${heading}
+- ${errors.join("\n- ")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const headingPrefix = `${heading}
+`;
+  const availBytes = maxBytes - Buffer.byteLength(headingPrefix, "utf8");
+  if (availBytes <= 64 || errors.length <= 1) {
+    return truncateWithByteNotice(full, maxBytes);
+  }
+  const fittedBullets = fitSectionsToByteBudget(
+    errors.map((e) => `- ${e}`),
+    availBytes,
+    availBytes,
+    "\n"
+  );
+  const assembled = `${headingPrefix}${fittedBullets}`;
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
+}
+function compactSummaryLinesToBytes(header, summaryLines, verb, maxBytes) {
+  const full = `${header}
+${summaryLines.join("\n")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const minimal = `${header} (${summaryLines.length} file(s) ${verb}; list omitted to preserve verify diagnostics)`;
+  const headerPrefix = `${header}
+`;
+  const kept = [];
+  let usedBytes = Buffer.byteLength(headerPrefix, "utf8");
+  for (let i = 0; i < summaryLines.length; i++) {
+    const line = summaryLines[i];
+    const remaining = summaryLines.length - (i + 1);
+    const omitNotice = remaining > 0 ? `
+... (+${remaining} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : "";
+    const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+    if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
+      break;
+    }
+    kept.push(line);
+    usedBytes += lineBytes;
+  }
+  if (kept.length > 0) {
+    const omitted = summaryLines.length - kept.length;
+    return omitted > 0 ? `${headerPrefix}${kept.join("\n")}
+... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : `${headerPrefix}${kept.join("\n")}`;
+  }
+  return Buffer.byteLength(minimal, "utf8") <= maxBytes ? minimal : truncateWithByteNotice(minimal, maxBytes);
+}
 function formatBestEffortPartialResult(params) {
   const { partialHeader, errors, summaryLines, dryRun, verifySkipped, maxBytes } = params;
   const failedHeading = dryRun ? "Failed (fix only these):" : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
@@ -3009,7 +3252,11 @@ ${summaryLines.join("\n")}`;
     Buffer.byteLength(minimalApplied, "utf8")
   );
   const maxFailedBytes = Math.max(256, maxBytes - fixedBytes - minAppliedBytes);
-  const failedSection = Buffer.byteLength(failedFull, "utf8") <= maxFailedBytes ? failedFull : truncateWithByteNotice(failedFull, maxFailedBytes);
+  const failedSection = formatErrorBulletsWithinBytes(
+    failedHeading,
+    errors,
+    maxFailedBytes
+  );
   const remainingForApplied = maxBytes - fixedBytes - Buffer.byteLength(failedSection, "utf8");
   let appliedSection = minimalApplied;
   if (remainingForApplied >= Buffer.byteLength(appliedFull, "utf8")) {
@@ -3152,6 +3399,25 @@ async function runApplyEdits(input) {
     }
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
+  if (!input.dryRun && validatedVerify?.cwd) {
+    const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
+    try {
+      const st = await fs3.stat(resolvedVerifyCwd);
+      if (!st.isDirectory()) {
+        return {
+          text: `Validation failed (0 files modified):
+- 'verify.cwd' is not a directory: ${validatedVerify.cwd}`,
+          isError: true
+        };
+      }
+    } catch {
+      return {
+        text: `Validation failed (0 files modified):
+- 'verify.cwd' directory not found: ${validatedVerify.cwd}`,
+        isError: true
+      };
+    }
+  }
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
   for (let i = 0; i < normalizedEdits.length; i++) {
@@ -3161,17 +3427,12 @@ async function runApplyEdits(input) {
       continue;
     }
     const absPath = resolvePath(entry.path, baseCwd);
-    let writeTargetPath = absPath;
-    try {
-      writeTargetPath = await fs3.realpath(absPath);
-    } catch {
-      try {
-        const realParent = await fs3.realpath(path4.dirname(absPath));
-        writeTargetPath = path4.join(realParent, path4.basename(absPath));
-      } catch {
-      }
-    }
+    const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
+      errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
+      continue;
+    }
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
     if (!hasCreate && !hasHunks) {
@@ -3328,11 +3589,7 @@ async function runApplyEdits(input) {
   if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
     const prefix = bestEffort ? "Edit aborted (0 files modified):" : "Atomic edit aborted (0 files modified):";
     return {
-      text: truncateWithByteNotice(
-        `${prefix}
-- ${errors.join("\n- ")}`,
-        DEFAULT_INLINE_MAX_BYTES
-      ),
+      text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true
     };
   }
@@ -3368,8 +3625,8 @@ async function runApplyEdits(input) {
     };
   }
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
-  const parts = [`${header}
-${summaryLines.join("\n")}`];
+  const appliedFull = `${header}
+${summaryLines.join("\n")}`;
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
@@ -3382,24 +3639,68 @@ ${summaryLines.join("\n")}`];
       cwd: verifyCwd,
       timeoutMs
     });
-    const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+    const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const verifyPrefix = `
+
+Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
+`;
+    const preparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
       timedOut: res.timedOut,
-      error: res.error,
-      maxChars: maxVerifyChars
+      error: res.error
     });
-    parts.push(
-      `
-Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
+    const minApplied = `${header} (${summaryLines.length} file(s) written; list omitted to preserve verify diagnostics)`;
+    const reservedForApplied = status === "PASS" ? Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      DEFAULT_INLINE_MAX_BYTES - 512
+    ) : Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      Buffer.byteLength(minApplied, "utf8")
     );
+    const maxVerifyBodyBytes = Math.max(
+      256,
+      DEFAULT_INLINE_MAX_BYTES - reservedForApplied - Buffer.byteLength(verifyPrefix, "utf8")
+    );
+    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
+    let formatted = renderPreparedCompactCommandOutput(
+      preparedVerify,
+      targetChars
+    ).text;
+    for (let iter = 0; iter < 4; iter++) {
+      const actualBytes = Buffer.byteLength(formatted, "utf8");
+      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
+      targetChars = Math.max(
+        64,
+        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94)
+      );
+      formatted = renderPreparedCompactCommandOutput(
+        preparedVerify,
+        targetChars
+      ).text;
+    }
+    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
+      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
+    }
+    const verifySection = `${verifyPrefix}${formatted}`;
+    const remainingAppliedBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
+    const appliedSection = compactSummaryLinesToBytes(
+      header,
+      summaryLines,
+      "written",
+      Math.max(64, remainingAppliedBytes)
+    );
+    const combined = `${appliedSection}${verifySection}`;
+    return {
+      text: Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      isError: false
+    };
   }
-  const outText = parts.join("\n");
-  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
-  return { text: finalText, isError: false };
+  return {
+    text: truncateWithByteNotice(appliedFull, DEFAULT_INLINE_MAX_BYTES),
+    isError: false
+  };
 }
 
 // src/tools/batch-search.ts
@@ -4665,7 +4966,8 @@ async function runGitQuery(query, searchRoot) {
   const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
     timeoutMs: 1e4,
-    maxOutputBytes: 512 * 1024
+    maxOutputBytes: 512 * 1024,
+    env: withNonInteractiveGitEnv()
   });
   if (res.error) {
     throw new Error(`git execution error: ${res.error}`);
@@ -8553,8 +8855,613 @@ function clampInt2(val, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
+// src/cli-runner.ts
+var MAX_CLI_STDIN_BYTES = 2 * 1024 * 1024;
+var IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS = 500;
+var TOOL_ALIASES = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks"
+};
+function resolveCliToolAlias(name) {
+  if (!name) return null;
+  return TOOL_ALIASES[name.trim().toLowerCase()] ?? null;
+}
+function formatCliUsage() {
+  return [
+    "agy-fast direct CLI mode (for Swarm workers, scripts, and non-MCP environments)",
+    "",
+    "Usage:",
+    "  node <plugin>/dist/mcp-server.mjs --cli <command> [options] [args...]",
+    "",
+    "Commands (aliases):",
+    "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
+    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
+    "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
+    "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
+    "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
+    "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "",
+    "JSON input (works for every command using the exact MCP tool schema):",
+    "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
+    "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
+    "  --cwd <dir>             Override working directory (defaults to shell CWD)",
+    "  --max-chars <N>         Override output character cap (hard UTF-8 ceiling <= 8800 bytes)"
+  ].join("\n");
+}
+function parseIntFlag(flag, raw) {
+  if (raw === void 0 || !/^-?\d+$/.test(raw.trim())) {
+    throw new Error(`Expected integer value after ${flag}`);
+  }
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid integer value after ${flag}: ${raw}`);
+  }
+  return n;
+}
+function requireValue(flag, argv, index) {
+  const next = argv[index + 1];
+  if (next === void 0) {
+    throw new Error(`Missing value after ${flag}`);
+  }
+  return next;
+}
+async function readStdinText(stream, explicitStdin) {
+  if (!explicitStdin && stream.isTTY) {
+    return "";
+  }
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    let firstByteTimer;
+    const cleanup = () => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+      stream.removeListener("error", onError);
+    };
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(text);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (typeof stream.pause === "function") {
+        stream.pause();
+      }
+      const maybeUnref = stream.unref;
+      if (typeof maybeUnref === "function") {
+        maybeUnref.call(stream);
+      }
+      reject(err);
+    };
+    const onData = (chunk) => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      totalBytes += buf.length;
+      if (totalBytes > MAX_CLI_STDIN_BYTES) {
+        fail(new Error(`stdin payload exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`));
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = () => {
+      finish(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onError = (err) => {
+      fail(err);
+    };
+    if (!explicitStdin) {
+      firstByteTimer = setTimeout(() => {
+        if (totalBytes === 0) {
+          if (typeof stream.pause === "function") {
+            stream.pause();
+          }
+          finish("");
+        }
+      }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
+    }
+    stream.on("data", onData);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+    if (typeof stream.resume === "function") {
+      stream.resume();
+    }
+  });
+}
+function parseJsonPayload(rawText, tool) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(
+      `Invalid JSON input for '${tool}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (Array.isArray(parsed)) {
+    if (tool === "batch_search") return { queries: parsed };
+    if (tool === "apply_edits") return { edits: parsed };
+    if (tool === "quick_outline") return { paths: parsed };
+    if (tool === "read_slices") {
+      if (parsed.every((item) => typeof item === "string")) {
+        return { lineRanges: parsed };
+      }
+      return { slices: parsed };
+    }
+    if (tool === "run_checks") {
+      return {
+        commands: parsed.map(
+          (item) => typeof item === "string" ? { command: item } : item
+        )
+      };
+    }
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return { ...parsed };
+  }
+  throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
+}
+function applySearchModifiers(q, mods) {
+  return {
+    ...q,
+    ...mods.path !== void 0 && q.path === void 0 ? { path: mods.path } : {},
+    ...mods.fileType !== void 0 && q.fileType === void 0 ? { fileType: mods.fileType } : {},
+    ...mods.glob !== void 0 && q.glob === void 0 ? { glob: mods.glob } : {},
+    ...mods.outputMode !== void 0 && q.outputMode === void 0 ? { outputMode: mods.outputMode } : {},
+    ...mods.sortBy !== void 0 && q.sortBy === void 0 ? { sortBy: mods.sortBy } : {},
+    ...mods.contextLines !== void 0 && q.contextLines === void 0 ? { contextLines: mods.contextLines } : {},
+    ...mods.maxResults !== void 0 && q.maxResults === void 0 ? { maxResults: mods.maxResults } : {},
+    ...mods.caseSensitive !== void 0 && q.caseSensitive === void 0 ? { caseSensitive: mods.caseSensitive } : {},
+    ...mods.multiline !== void 0 && q.multiline === void 0 ? { multiline: mods.multiline } : {}
+  };
+}
+var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--text",
+  "--regex",
+  "--glob",
+  "--fuzzy",
+  "--git",
+  "--path",
+  "--file-type",
+  "--glob-filter",
+  "--output-mode",
+  "--sort-by",
+  "--context",
+  "--max-results",
+  "--outline",
+  "--concurrency",
+  "--timeout",
+  "--verify",
+  "--verify-timeout",
+  "--max-verify-chars"
+]);
+function normalizeCliArgs(rawArgs) {
+  const out = [];
+  let afterDoubleDash = false;
+  for (const arg of rawArgs) {
+    if (afterDoubleDash) {
+      out.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      out.push(arg);
+      continue;
+    }
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 2 && arg.startsWith("--")) {
+      const flag = arg.slice(0, eqIdx);
+      if (VALUE_LONG_FLAGS.has(flag)) {
+        out.push(flag, arg.slice(eqIdx + 1));
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+function parseToolFlags(tool, rawArgs) {
+  const args = normalizeCliArgs(rawArgs);
+  const opts = {
+    showHelp: false,
+    explicitStdin: false,
+    positionals: [],
+    searchQueries: [],
+    trailingSearchMods: {},
+    outlineFiles: []
+  };
+  let pendingMods = {};
+  let afterDoubleDash = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (afterDoubleDash) {
+      opts.positionals.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      opts.showHelp = true;
+      continue;
+    }
+    if (arg === "--cwd") {
+      opts.cwd = requireValue(arg, args, i);
+      i += 1;
+      continue;
+    }
+    if (arg === "--max-chars") {
+      opts.maxChars = parseIntFlag(arg, requireValue(arg, args, i));
+      i += 1;
+      continue;
+    }
+    if (arg === "--json") {
+      opts.jsonRaw = requireValue(arg, args, i);
+      i += 1;
+      continue;
+    }
+    if (arg === "--stdin") {
+      opts.explicitStdin = true;
+      continue;
+    }
+    if (tool === "batch_search") {
+      const pushScopedQuery = (base) => {
+        opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+        pendingMods = {};
+      };
+      if (arg === "--text" || arg === "-t") {
+        pushScopedQuery({ type: "text", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--regex" || arg === "-r") {
+        pushScopedQuery({ type: "regex", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--glob" || arg === "-g") {
+        pushScopedQuery({ type: "glob", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--fuzzy" || arg === "-f") {
+        pushScopedQuery({ type: "fuzzy", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--git") {
+        pushScopedQuery({ type: "git", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--path" || arg === "-p") {
+        pendingMods.path = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--file-type") {
+        pendingMods.fileType = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--glob-filter") {
+        pendingMods.glob = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = requireValue(arg, args, i);
+        if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
+          throw new Error(`Invalid --output-mode: ${mode}`);
+        }
+        pendingMods.outputMode = mode;
+        i += 1;
+        continue;
+      }
+      if (arg === "--sort-by") {
+        const sortBy = requireValue(arg, args, i);
+        if (sortBy !== "path" && sortBy !== "mtime") {
+          throw new Error(`Invalid --sort-by: ${sortBy}`);
+        }
+        pendingMods.sortBy = sortBy;
+        i += 1;
+        continue;
+      }
+      if (arg === "--context" || arg === "-C") {
+        pendingMods.contextLines = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--max-results") {
+        pendingMods.maxResults = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--ignore-case" || arg === "-i") {
+        pendingMods.caseSensitive = false;
+        continue;
+      }
+      if (arg === "--multiline") {
+        pendingMods.multiline = true;
+        continue;
+      }
+    } else if (tool === "read_slices") {
+      if (arg === "--outline" || arg === "-o") {
+        opts.outlineFiles.push(requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+    } else if (tool === "run_checks") {
+      if (arg === "--compact") {
+        opts.outputMode = "compact";
+        continue;
+      }
+      if (arg === "--full") {
+        opts.outputMode = "full";
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = requireValue(arg, args, i);
+        if (mode !== "compact" && mode !== "full") {
+          throw new Error(`Invalid --output-mode for check: ${mode}`);
+        }
+        opts.outputMode = mode;
+        i += 1;
+        continue;
+      }
+      if (arg === "--concurrency") {
+        opts.concurrency = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--timeout") {
+        opts.timeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+    } else if (tool === "apply_edits") {
+      if (arg === "--best-effort") {
+        opts.bestEffort = true;
+        continue;
+      }
+      if (arg === "--dry-run") {
+        opts.dryRun = true;
+        continue;
+      }
+      if (arg === "--verify") {
+        opts.verify = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--verify-timeout") {
+        opts.verifyTimeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--max-verify-chars") {
+        opts.maxVerifyChars = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+    }
+    if (arg.startsWith("-")) {
+      throw new Error(`Unknown option '${arg}' for '${tool}'. Run with '--cli --help' for usage.`);
+    }
+    opts.positionals.push(arg);
+  }
+  opts.trailingSearchMods = pendingMods;
+  return opts;
+}
+async function runAgyFastCli(argv, io = {}) {
+  const stdin = io.stdin ?? process.stdin;
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const defaultCwd = io.cwd ?? process.cwd();
+  const cmdArg = argv[0];
+  if (!cmdArg || cmdArg === "--help" || cmdArg === "-h" || cmdArg === "help") {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const rest = argv.slice(1);
+  const tool = resolveCliToolAlias(cmdArg);
+  if (!tool) {
+    stderr.write(
+      `Error: unknown --cli command '${cmdArg}'. Expected one of: search, outline, slice, edit, check (or --help).
+`
+    );
+    return 1;
+  }
+  let opts;
+  try {
+    opts = parseToolFlags(tool, rest);
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  if (opts.showHelp) {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  let jsonInput = null;
+  try {
+    if (opts.jsonRaw !== void 0) {
+      jsonInput = parseJsonPayload(opts.jsonRaw, tool);
+    } else if (opts.explicitStdin || !hasShorthandArgs) {
+      const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
+      if (stdinText) {
+        jsonInput = parseJsonPayload(stdinText, tool);
+      }
+    }
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  let result;
+  const effectiveCwd = opts.cwd ?? (typeof jsonInput?.cwd === "string" ? jsonInput.cwd : defaultCwd);
+  if (tool === "batch_search") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      const queries = [
+        ...opts.searchQueries,
+        ...opts.positionals.map((pattern) => ({ type: "text", pattern }))
+      ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
+      if (queries.length === 0) {
+        stderr.write(
+          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        queries,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runBatchSearch(payload);
+  } else if (tool === "quick_outline") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          "Error: 'outline' requires one or more file paths (e.g. --cli outline src/a.ts src/b.ts) or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        paths: opts.positionals,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runQuickOutline(payload);
+  } else if (tool === "read_slices") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+        stderr.write(
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        ...opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {},
+        ...opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runReadSlices(payload);
+  } else if (tool === "apply_edits") {
+    if (!jsonInput) {
+      stderr.write(
+        `Error: 'edit' requires JSON input via --json or stdin (e.g. {"edits":[...],"bestEffort":true}).
+`
+      );
+      return 1;
+    }
+    const effectiveMaxVerifyChars = opts.maxVerifyChars ?? (opts.maxChars !== void 0 ? Math.max(300, Math.min(7500, opts.maxChars)) : void 0);
+    const payload = {
+      ...jsonInput,
+      cwd: effectiveCwd,
+      ...opts.bestEffort !== void 0 ? { bestEffort: opts.bestEffort } : {},
+      ...opts.dryRun !== void 0 ? { dryRun: opts.dryRun } : {},
+      ...opts.verify !== void 0 ? { verify: opts.verify } : {},
+      ...opts.verifyTimeoutSec !== void 0 ? { verifyTimeoutSec: opts.verifyTimeoutSec } : {},
+      ...effectiveMaxVerifyChars !== void 0 ? { maxVerifyChars: effectiveMaxVerifyChars } : {}
+    };
+    result = await runApplyEdits(payload);
+  } else {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          `Error: 'check' requires one or more shell command strings (e.g. --cli check "npm run typecheck" "npm test") or JSON input.
+`
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        commands: opts.positionals.map((command) => ({ command })),
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runChecks(payload);
+  }
+  stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}
+`);
+  return shouldCliExitNonZero(tool, result) ? 1 : 0;
+}
+function shouldCliExitNonZero(tool, result) {
+  return result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
+    result.text
+  ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+}
+
 // src/mcp-server.ts
-var SERVER_VERSION = "0.2.10";
+var SERVER_VERSION = "0.3.0";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."
@@ -9039,6 +9946,18 @@ function createAgyFastServer(options = {}) {
   return server;
 }
 function main() {
+  if (process.argv[2] === "--cli") {
+    void runAgyFastCli(process.argv.slice(3)).then((code) => {
+      process.exitCode = code;
+    }).catch((err) => {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : String(err)}
+`
+      );
+      process.exitCode = 1;
+    });
+    return;
+  }
   const server = createAgyFastServer();
   let flushing = false;
   const exitImmediately = () => {

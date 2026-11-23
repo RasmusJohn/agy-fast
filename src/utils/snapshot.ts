@@ -2,7 +2,7 @@ import { promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { execBinaryAsync } from "./exec-utils.js";
+import { execBinaryAsync, withNonInteractiveGitEnv } from "./exec-utils.js";
 import { DEFAULT_IGNORE_DIRS } from "./fs-utils.js";
 import { sliceSafeChars, sliceUtf8Bytes, truncateWithByteNotice } from "./output-filter.js";
 
@@ -36,26 +36,31 @@ async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
 ): Promise<string | null> {
+  const gitEnv = withNonInteractiveGitEnv();
   const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096,
+      env: gitEnv,
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 4096,
+      env: gitEnv,
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 32_768,
+      env: gitEnv,
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192,
+      env: gitEnv,
     }),
   ]);
 

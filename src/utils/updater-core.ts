@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execBinaryAsync } from "./exec-utils.js";
+import { execBinaryAsync, withNonInteractiveGitEnv } from "./exec-utils.js";
 
 export const DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 export const DEFAULT_GITHUB_SLUG = "INK-Q/agy-fast";
@@ -439,6 +439,7 @@ export async function detectInstallKind(pluginDir: string): Promise<InstallKind>
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
       cwd: resolved,
       timeoutMs: 4_000,
+      env: withNonInteractiveGitEnv(),
     });
     if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
       return "git-dirty";
@@ -471,7 +472,7 @@ export async function fetchLatestRemoteVersion(opts: {
   timeoutMs?: number;
 }): Promise<RemoteVersionInfo> {
   const timeoutMs = opts.timeoutMs ?? 8_000;
-  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const gitEnv = withNonInteractiveGitEnv();
 
   if (opts.channel === "release") {
     const tagsRes = await execBinaryAsync(
@@ -853,7 +854,7 @@ export async function runPluginUpdate(
       `staging-${process.pid}-${Date.now()}`,
     );
     await fs.mkdir(paths.cacheDir, { recursive: true });
-    const gitEnv = { ...env, GIT_TERMINAL_PROMPT: "0" };
+    const gitEnv = withNonInteractiveGitEnv(env);
 
     const cloneArgs =
       remote.ref === "main"

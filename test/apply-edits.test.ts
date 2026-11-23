@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { runApplyEdits } from "../src/tools/apply-edits.js";
+import { isGitInternalPath, runApplyEdits, type FileEdit } from "../src/tools/apply-edits.js";
 
 describe("apply_edits", () => {
   let tmpDir: string;
@@ -1141,5 +1141,237 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(okAbsPaths[0]!, "utf8"), "export const item_1 = 2;\n");
     assert.equal(await fs.readFile(okAbsPaths[okCount - 1]!, "utf8"), `export const item_${okCount} = 2;\n`);
     assert.match(await fs.readFile(failAbs, "utf8"), /const mode = 'production';/);
+  });
+
+  it("ranks high-entropy longest anchors above boilerplate headers, preserves Verify [FAIL] tails on large batches, water-fills multi-file errors, and validates verify.cwd pre-write", async () => {
+    const subDir = path.join(tmpDir, "precision-and-verify");
+    await fs.mkdir(subDir, { recursive: true });
+
+    // 1. Closest-match prefers high-entropy longestAnchor over generic boilerplate `if (errors.length > 0) {`
+    const anchorFile = path.join(subDir, "anchor.ts");
+    const anchorLines = [
+      ...Array.from({ length: 10 }, (_, i) => `const top_${i} = ${i};`),
+      "if (errors.length > 0) {",
+      "  return earlyExit();",
+      "}",
+      ...Array.from({ length: 40 }, (_, i) => `const mid_${i} = ${i};`),
+      "if (validationProblems.length > 0) {",
+      "  const formatted = renderStructuredDiagnosticReport(validationProblems, DEFAULT_MAX_REPORT_BYTES);",
+      "  return { ok: false, report: formatted };",
+      "}",
+    ];
+    await fs.writeFile(anchorFile, anchorLines.join("\n") + "\n", "utf8");
+
+    const missRes = await runApplyEdits({
+      cwd: subDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "anchor.ts",
+          hunks: [
+            {
+              target: [
+                "if (errors.length > 0) {",
+                "  const formatted = renderStructuredDiagnosticReport(validationProblems, DEFAULT_MAX_REPORT_BYTES);",
+                "  return { ok: false, report: formatted };",
+                "}",
+              ].join("\n"),
+              replacement: "// replaced",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(missRes.isError, true);
+    assert.match(missRes.text, /Closest match near line 54/);
+    assert.match(missRes.text, /54: if \(validationProblems\.length > 0\) \{/);
+    assert.match(missRes.text, /55:   const formatted = renderStructuredDiagnosticReport/);
+
+    // 2. Non-existent verify.cwd fails BEFORE modifying any files on disk
+    const safeFile = path.join(subDir, "safe.ts");
+    await fs.writeFile(safeFile, "export const safe = 1;\n", "utf8");
+    const badVerifyCwd = await runApplyEdits({
+      cwd: subDir,
+      verify: { command: "echo hi", cwd: "does-not-exist-subdir" },
+      edits: [{ path: "safe.ts", hunks: [{ target: "safe = 1;", replacement: "safe = 2;" }] }],
+    });
+    assert.equal(badVerifyCwd.isError, true);
+    assert.match(badVerifyCwd.text, /'verify\.cwd' directory not found/);
+    assert.equal(await fs.readFile(safeFile, "utf8"), "export const safe = 1;\n");
+
+    // 3. Multi-file atomic abort water-fills errors so later failing files are not starved off the bottom
+    const multiFailEdits: FileEdit[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const f = path.join(subDir, `fail_${i}.ts`);
+      const body = Array.from({ length: 25 }, (_, k) => `export const uniqueSymbolFile${i}_Line${k} = "${"x".repeat(90)}";`).join("\n") + "\n";
+      await fs.writeFile(f, body, "utf8");
+      multiFailEdits.push({
+        path: `fail_${i}.ts`,
+        hunks: [{ target: `export const uniqueSymbolFile${i}_Line12 = "MISMATCH";`, replacement: "y" }],
+      });
+    }
+    const multiAbort = await runApplyEdits({ cwd: subDir, edits: multiFailEdits });
+    assert.equal(multiAbort.isError, true);
+    assert.ok(Buffer.byteLength(multiAbort.text, "utf8") <= 8_800);
+    for (let i = 1; i <= 6; i++) {
+      assert.match(multiAbort.text, new RegExp(`- fail_${i}\\.ts hunk #1:`));
+    }
+
+    // 4. Large 40-file edit + failing CJK/Vitest verify compacts Applied list instead of slicing off Verify [FAIL] tail
+    const manyDir = path.join(subDir, "packages/deeply-nested-workspace-package-name/src/modules");
+    await fs.mkdir(manyDir, { recursive: true });
+    const manyEdits: FileEdit[] = [];
+    for (let i = 1; i <= 40; i++) {
+      const rel = `packages/deeply-nested-workspace-package-name/src/modules/component_handler_service_item_${String(i).padStart(2, "0")}.ts`;
+      await fs.writeFile(path.join(subDir, rel), `export const v_${i} = 1;\n`, "utf8");
+      manyEdits.push({
+        path: rel,
+        hunks: [{ target: `v_${i} = 1;`, replacement: `v_${i} = 2;` }],
+      });
+    }
+    const verifyScript = [
+      "console.error('error TS2322: 首条核心类型错误根因诊断');",
+      "for (let i = 0; i < 60; i++) console.error('  at middleFrame_' + i + ' (中文路径模块文件_' + i + '.ts:' + i + ':5)');",
+      "console.error('FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file.');",
+      "process.exit(1);",
+    ].join(" ");
+    const verifyFailRes = await runApplyEdits({
+      cwd: subDir,
+      maxVerifyChars: 6500,
+      verify: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(verifyScript)}`,
+      edits: manyEdits,
+    });
+    assert.equal(verifyFailRes.isError, false);
+    assert.ok(Buffer.byteLength(verifyFailRes.text, "utf8") <= 8_800);
+    assert.match(verifyFailRes.text, /more applied file\(s\) omitted; total 40 written/);
+    assert.match(verifyFailRes.text, /Verify \[FAIL/);
+    assert.match(verifyFailRes.text, /error TS2322: 首条核心类型错误根因诊断/);
+    assert.match(verifyFailRes.text, /FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file\./);
+
+    // 5. >10-line hunk matched via a trailing high-entropy anchor (idx >= 10) still scores and locates cleanly
+    const longHunkFile = path.join(subDir, "long-hunk.ts");
+    const longFileLines = [
+      ...Array.from({ length: 20 }, (_, i) => `const filler_${i} = ${i};`),
+      ...Array.from({ length: 12 }, (_, i) => `const mutatedLine_${i} = ${i * 10};`),
+      "const exactTrailingAnchor = computeDeterministicDigest(payloadBytes, SHA256_CONTEXT);",
+      "return exactTrailingAnchor;",
+    ];
+    await fs.writeFile(longHunkFile, longFileLines.join("\n") + "\n", "utf8");
+    const longMiss = await runApplyEdits({
+      cwd: subDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "long-hunk.ts",
+          hunks: [
+            {
+              target: [
+                ...Array.from({ length: 12 }, (_, i) => `const completelyDifferent_${i} = 'x';`),
+                "const exactTrailingAnchor = computeDeterministicDigest(payloadBytes, SHA256_CONTEXT);",
+                "return exactTrailingAnchor;",
+              ].join("\n"),
+              replacement: "// replaced",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(longMiss.isError, true);
+    assert.match(longMiss.text, /Closest match near line 21/);
+  });
+
+  it("blocks accidental writes inside .git metadata paths (including symlinks) while allowing .gitignore/.github/.gitattributes", async () => {
+    // Platform-specific and cross-platform segment matching checks
+    assert.equal(isGitInternalPath("/repo/.git/config", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.git/hooks/pre-commit", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.git", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.GIT/config", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.GIT/config", "darwin"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.GIT\\config", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git.\\config", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git::$INDEX_ALLOCATION\\hooks\\pre-commit", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git .:$DATA", "win32"), true);
+    assert.equal(isGitInternalPath("/repo/.gitignore", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.github/workflows/ci.yml", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.gitattributes", "win32"), false);
+    assert.equal(isGitInternalPath("/repo/.gitmodules", "darwin"), false);
+    assert.equal(isGitInternalPath("/repo/.gitkeep", "linux"), false);
+    assert.equal(isGitInternalPath("/repos/project.git/README.md", "linux"), false);
+
+    const subDir = path.join(tmpDir, "git-protect");
+    await fs.mkdir(path.join(subDir, ".git", "hooks"), { recursive: true });
+    const gitConfigPath = path.join(subDir, ".git", "config");
+    const gitHeadPath = path.join(subDir, ".git", "HEAD");
+    await fs.writeFile(gitConfigPath, "[core]\n\tbare = false\n", "utf8");
+    await fs.writeFile(gitHeadPath, "ref: refs/heads/main\n", "utf8");
+
+    // 1. Direct edits/creates targeting .git/* are rejected with 0 files modified
+    const directRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: ".git/config", hunks: [{ target: "bare = false", replacement: "bare = true" }] },
+        { path: ".git/HEAD", create: "ref: refs/heads/pwn\n", overwrite: true },
+        { path: ".git/hooks/pre-commit", create: "#!/bin/sh\necho hi\n" },
+      ],
+    });
+    assert.equal(directRes.isError, true);
+    assert.match(directRes.text, /\.git\/config: refusing to modify Git internal metadata path/);
+    assert.match(directRes.text, /\.git\/HEAD: refusing to modify Git internal metadata path/);
+    assert.match(directRes.text, /\.git\/hooks\/pre-commit: refusing to modify Git internal metadata path/);
+    assert.equal(await fs.readFile(gitConfigPath, "utf8"), "[core]\n\tbare = false\n");
+    assert.equal(await fs.readFile(gitHeadPath, "utf8"), "ref: refs/heads/main\n");
+
+    // 2. Symlinks pointing into .git/ (file symlink and dir symlink with nested new file) are also blocked
+    let symlinksSupported = true;
+    const symConfig = path.join(subDir, "innocent-link.txt");
+    const symGitDir = path.join(subDir, "git-dir-link");
+    try {
+      await fs.symlink(gitConfigPath, symConfig);
+      await fs.symlink(path.join(subDir, ".git"), symGitDir, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      symlinksSupported = false;
+    }
+    if (symlinksSupported) {
+      const symRes = await runApplyEdits({
+        cwd: subDir,
+        edits: [
+          { path: "innocent-link.txt", hunks: [{ target: "bare = false", replacement: "bare = true" }] },
+          { path: "git-dir-link/new-sub/hook.sh", create: "#!/bin/sh\n" },
+        ],
+      });
+      assert.equal(symRes.isError, true);
+      assert.match(symRes.text, /innocent-link\.txt: refusing to modify Git internal metadata path/);
+      assert.match(symRes.text, /git-dir-link\/new-sub\/hook\.sh: refusing to modify Git internal metadata path/);
+      assert.equal(await fs.readFile(gitConfigPath, "utf8"), "[core]\n\tbare = false\n");
+    }
+
+    // 3. Legitimate dot-git* config files work normally
+    const legitRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: ".gitignore", create: "node_modules/\n" },
+        { path: ".github/workflows/ci.yml", create: "name: CI\n" },
+        { path: ".gitattributes", create: "* text=auto\n" },
+      ],
+    });
+    assert.equal(legitRes.isError, false);
+    assert.equal(await fs.readFile(path.join(subDir, ".gitignore"), "utf8"), "node_modules/\n");
+    assert.equal(await fs.readFile(path.join(subDir, ".github/workflows/ci.yml"), "utf8"), "name: CI\n");
+    assert.equal(await fs.readFile(path.join(subDir, ".gitattributes"), "utf8"), "* text=auto\n");
+
+    // 4. Worktree / submodule regular `.git` file is also protected end-to-end
+    const wtDir = path.join(tmpDir, "git-worktree-protect");
+    await fs.mkdir(wtDir, { recursive: true });
+    const wtGitFile = path.join(wtDir, ".git");
+    await fs.writeFile(wtGitFile, "gitdir: /main-repo/.git/worktrees/wt1\n", "utf8");
+    const wtRes = await runApplyEdits({
+      cwd: wtDir,
+      edits: [
+        { path: ".git", hunks: [{ target: "wt1", replacement: "pwn" }] },
+      ],
+    });
+    assert.equal(wtRes.isError, true);
+    assert.match(wtRes.text, /\.git: refusing to modify Git internal metadata path/);
+    assert.equal(await fs.readFile(wtGitFile, "utf8"), "gitdir: /main-repo/.git/worktrees/wt1\n");
   });
 });

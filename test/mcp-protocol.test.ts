@@ -3,8 +3,10 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { after, before, describe, it } from "node:test";
+import { MAX_FRAME_BYTES, McpStdioServer } from "../src/protocol/mcp.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -994,5 +996,93 @@ describe("MCP Stdio Server end-to-end", () => {
     } finally {
       await fs.rm(fakeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("enforces frame size cap on NDJSON stdio framing without OOM and resumes cleanly on the next valid line", async () => {
+    assert.equal(MAX_FRAME_BYTES, 64 * 1024 * 1024);
+
+    const runInMemory = async (
+      maxFrameBytes: number,
+      chunks: Array<string | Buffer>,
+    ): Promise<Array<Record<string, unknown>>> => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const outChunks: Buffer[] = [];
+      output.on("data", (d: Buffer) => outChunks.push(d));
+
+      const server = new McpStdioServer({
+        name: "test-cap",
+        version: "0.0.1",
+        maxFrameBytes,
+      });
+
+      const drained = new Promise<void>((resolve) => {
+        server.listen(input, output, resolve);
+      });
+
+      for (const chunk of chunks) {
+        input.write(chunk);
+        await new Promise((r) => setImmediate(r));
+      }
+      input.end();
+      await drained;
+
+      const rawOut = Buffer.concat(outChunks).toString("utf8").trim();
+      return rawOut ? rawOut.split("\n").map((line) => JSON.parse(line)) : [];
+    };
+
+    const ping = (id: number) => JSON.stringify({ jsonrpc: "2.0", id, method: "ping" });
+
+    // 1. Chunked oversized NDJSON without newline emits -32600 immediately, discards continuation
+    //    chunks without duplicate errors, and resumes cleanly on a chunk starting with \n
+    const chunkedRes = await runInMemory(128, [
+      `{"jsonrpc":"2.0","id":1,"params":"${"a".repeat(80)}`,
+      `${"b".repeat(80)}`, // crosses 128 bytes with no \n -> triggers -32600 and discarding state
+      `${"c".repeat(200)}`, // still discarding, must NOT emit a second error
+      `\n${ping(2)}\n`, // leading \n closes discarded line; id=2 must succeed
+    ]);
+    assert.equal(chunkedRes.length, 2);
+    assert.equal((chunkedRes[0]!.error as { code: number; message: string }).code, -32600);
+    assert.match(
+      (chunkedRes[0]!.error as { message: string }).message,
+      /NDJSON message exceeds maximum allowed size/,
+    );
+    assert.equal(chunkedRes[1]!.id, 2);
+    assert.deepEqual(chunkedRes[1]!.result, {});
+
+    // 2. Single-chunk oversized NDJSON line (with \n) pipelined with a valid next request in the same chunk
+    const pipelinedRes = await runInMemory(128, [
+      `{"jsonrpc":"2.0","id":9,"data":"${"x".repeat(200)}"}\n${ping(3)}\n`,
+    ]);
+    assert.equal(pipelinedRes.length, 2);
+    assert.equal((pipelinedRes[0]!.error as { code: number }).code, -32600);
+    assert.equal(pipelinedRes[1]!.id, 3);
+    assert.deepEqual(pipelinedRes[1]!.result, {});
+
+    // 3. Oversized NDJSON terminated by EOF (no \n) emits exactly one -32600 and no spurious -32700
+    const eofRes = await runInMemory(128, [`{"jsonrpc":"2.0","data":"${"z".repeat(200)}`]);
+    assert.equal(eofRes.length, 1);
+    assert.equal((eofRes[0]!.error as { code: number }).code, -32600);
+
+    // 4. Exact boundary (LF and CRLF) succeeds, and multi-line chunks > maxFrameBytes total succeed when each line fits
+    const exactPing = ping(4);
+    const exactLimit = Buffer.byteLength(exactPing, "utf8");
+    const boundaryRes = await runInMemory(exactLimit, [
+      `${exactPing}\n${ping(5)}\r\n${ping(6)}\n`,
+    ]);
+    assert.deepEqual(
+      boundaryRes.map((r) => r.id),
+      [4, 5, 6],
+    );
+
+    // 5. Split CRLF right at the exact boundary (\r at end of chunk 1, \n at start of chunk 2) succeeds
+    const crlfSplitRes = await runInMemory(exactLimit, [
+      `${exactPing}\r`,
+      `\n${ping(7)}\n`,
+    ]);
+    assert.deepEqual(
+      crlfSplitRes.map((r) => r.id),
+      [4, 7],
+    );
   });
 });

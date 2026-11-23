@@ -10,8 +10,11 @@ import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.j
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
-  formatCompactCommandOutput,
+  fitSectionsToByteBudget,
+  prepareCompactCommandOutput,
+  renderPreparedCompactCommandOutput,
   sliceSafeChars,
+  truncateHeadTailWithByteNotice,
   truncateWithByteNotice,
 } from "../utils/output-filter.js";
 
@@ -196,92 +199,142 @@ function findClosestRegionSnippet(
     .filter((l) => l.length > 0);
   if (targetLines.length === 0) return "";
 
-  const firstAnchor =
-    targetLines.find((l) => l.length >= 6) ?? targetLines[0]!;
-  let longestAnchor = targetLines[0]!;
-  for (const tl of targetLines) {
-    if (tl.length > longestAnchor.length) longestAnchor = tl;
-  }
-  const anchors = [firstAnchor];
-  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
-  const lastAnchor = targetLines[targetLines.length - 1]!;
-  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
-    anchors.push(lastAnchor);
+  interface HunkAnchor {
+    text: string;
+    idx: number;
+    tokens: Set<string>;
   }
 
-  const primaryTokens = new Set(extractLineTokens(firstAnchor));
-  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  let firstAnchorIdx = 0;
+  for (let idx = 0; idx < targetLines.length; idx++) {
+    if (targetLines[idx]!.length >= 6) {
+      firstAnchorIdx = idx;
+      break;
+    }
+  }
+  let longestAnchorIdx = 0;
+  for (let idx = 1; idx < targetLines.length; idx++) {
+    if (targetLines[idx]!.length > targetLines[longestAnchorIdx]!.length) {
+      longestAnchorIdx = idx;
+    }
+  }
+  const lastAnchorIdx = targetLines.length - 1;
+
+  const anchorIndices = new Set<number>([firstAnchorIdx, longestAnchorIdx]);
+  if (targetLines[lastAnchorIdx]!.length >= 8) {
+    anchorIndices.add(lastAnchorIdx);
+  }
+  const anchors: HunkAnchor[] = [...anchorIndices].map((idx) => ({
+    text: targetLines[idx]!,
+    idx,
+    tokens: new Set(extractLineTokens(targetLines[idx]!)),
+  }));
+  const targetTokenSets = targetLines.map((tl) => new Set(extractLineTokens(tl)));
+
   const trimmedFileLines = fileLines.map((l) => l.trim());
-
-  let bestIdx = -1;
-  let bestScore = 0;
 
   const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
   const scanEnd = Math.min(
     trimmedFileLines.length - 1,
     (rangeEndLine ?? trimmedFileLines.length) - 1,
   );
+  if (scanStart > scanEnd) return "";
+
+  const evaluatedStarts = new Set<number>();
+  let bestStart = -1;
+  let bestScore = 0;
+
+  const scoreIndices: number[] = [];
+  const windowLen = Math.min(targetLines.length, 10);
+  for (let k = 0; k < windowLen; k++) {
+    scoreIndices.push(k);
+  }
+  for (const idx of anchorIndices) {
+    if (idx >= windowLen) {
+      scoreIndices.push(idx);
+    }
+  }
+
+  const scoreCandidateStart = (candStart: number): number => {
+    let total = 0;
+    for (const k of scoreIndices) {
+      const fIdx = candStart + k;
+      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) continue;
+      const fLine = trimmedFileLines[fIdx]!;
+      const tLine = targetLines[k]!;
+      if (!fLine || !tLine) continue;
+      const tTokens = targetTokenSets[k]!;
+      const isHighEntropy = tLine.length >= 12 && tTokens.size >= 2;
+      if (fLine === tLine) {
+        total += isHighEntropy
+          ? 8 + Math.min(6, tLine.length / 14)
+          : 4;
+      } else if (
+        tLine.length >= 8 &&
+        (fLine.includes(tLine) || tLine.includes(fLine))
+      ) {
+        total += isHighEntropy ? 6 : 3.5;
+      } else if (tTokens.size > 0) {
+        const lineTokens = extractLineTokens(fLine);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (tTokens.has(tok)) hits += 1;
+        }
+        if (
+          hits >= 2 ||
+          (hits >= 1 && tTokens.size <= 2 && hits === tTokens.size)
+        ) {
+          total += (isHighEntropy ? 4.5 : 3) * (hits / tTokens.size);
+        }
+      }
+    }
+    return total;
+  };
 
   for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i]!;
     if (!line) continue;
 
-    let score = 0;
-    if (line === firstAnchor) {
-      score += 10;
-    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
-      score += 6;
-    } else if (primaryTokens.size > 0) {
-      const lineTokens = extractLineTokens(line);
-      let hits = 0;
-      for (const tok of lineTokens) {
-        if (primaryTokens.has(tok)) hits += 1;
-      }
-      if (hits >= 2 || (hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size)) {
-        score += 4 * (hits / primaryTokens.size);
-      }
-    }
-
-    if (longestAnchor !== firstAnchor) {
-      if (line === longestAnchor) {
-        score += 8;
-      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
-        score += 5;
-      } else if (longestTokens.size >= 2) {
+    for (const anchor of anchors) {
+      let matchedAnchor = false;
+      if (
+        line === anchor.text ||
+        (anchor.text.length >= 8 &&
+          (line.includes(anchor.text) || anchor.text.includes(line)))
+      ) {
+        matchedAnchor = true;
+      } else if (anchor.tokens.size > 0) {
         const lineTokens = extractLineTokens(line);
         let hits = 0;
         for (const tok of lineTokens) {
-          if (longestTokens.has(tok)) hits += 1;
+          if (anchor.tokens.has(tok)) hits += 1;
         }
-        if (hits >= 2) {
-          score += 3 * (hits / longestTokens.size);
-        }
-      }
-    }
-
-    // Bonus when nearby subsequent lines also match subsequent target lines
-    if (score >= 2 && targetLines.length > 1) {
-      const lookahead = Math.min(targetLines.length, 6);
-      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
-        const nextLine = trimmedFileLines[i + k]!;
-        const tgtLine = targetLines[k]!;
-        if (nextLine && tgtLine && (nextLine === tgtLine || (tgtLine.length >= 8 && nextLine.includes(tgtLine)))) {
-          score += 3;
+        if (
+          hits >= 2 ||
+          (hits >= 1 && anchor.tokens.size <= 2 && hits === anchor.tokens.size)
+        ) {
+          matchedAnchor = true;
         }
       }
-    }
+      if (!matchedAnchor) continue;
 
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
+      const candStart = Math.max(scanStart, Math.min(scanEnd, i - anchor.idx));
+      if (evaluatedStarts.has(candStart)) continue;
+      evaluatedStarts.add(candStart);
+
+      const score = scoreCandidateStart(candStart);
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = candStart;
+      }
     }
   }
 
-  if (bestIdx < 0 || bestScore < 2.5) return "";
+  if (bestStart < 0 || bestScore < 2.5) return "";
 
   const span = Math.min(Math.max(targetLines.length, 4), 8);
-  const from = Math.max(1, bestIdx + 1 - 2);
-  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const from = Math.max(1, bestStart + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestStart + 1 + span + 2));
   const snippet: string[] = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
@@ -289,7 +342,7 @@ function findClosestRegionSnippet(
       `    ${ln}: ${lineText.length > 160 ? `${sliceSafeChars(lineText, 157)}...` : lineText}`,
     );
   }
-  return `\n  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):\n${snippet.join("\n")}`;
+  return `\n  Closest match near line ${bestStart + 1} (lines ${from}-${to}):\n${snippet.join("\n")}`;
 }
 
 function planHunksForContent(
@@ -459,6 +512,60 @@ function countLines(text: string): number {
   return count;
 }
 
+/**
+ * Returns true if any path segment targets Git internal metadata (`.git`).
+ * Matches case-insensitively across all platforms (including WSL/case-insensitive mounts)
+ * and strips Win32 NTFS ADS suffixes (`:stream`) and trailing dots/spaces on Windows,
+ * while never blocking `.gitignore`, `.github`, `.gitattributes`, `.gitmodules`,
+ * `.gitkeep`, or names like `repo.git`.
+ */
+export function isGitInternalPath(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const segments = filePath.split(/[\\/]+/);
+  for (const rawSeg of segments) {
+    if (!rawSeg) continue;
+    let seg = rawSeg.toLowerCase();
+    if (platform === "win32") {
+      seg = seg
+        .replace(/[. ]+$/, "")
+        .replace(/:.*$/, "")
+        .replace(/[. ]+$/, "");
+    }
+    if (seg === ".git") {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function canonicalizeTargetPath(absPath: string): Promise<string> {
+  try {
+    return await fs.realpath(absPath);
+  } catch {
+    // Walk up to the nearest existing ancestor so symlinks such as
+    // `sym_dir/new_sub/file.ts` or `sym_git/new_sub/hook` deduplicate and
+    // trigger path-safety checks cleanly.
+    const trailingSegments: string[] = [];
+    let current = absPath;
+    while (true) {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return absPath;
+      }
+      trailingSegments.push(path.basename(current));
+      current = parent;
+      try {
+        const realAncestor = await fs.realpath(current);
+        return path.join(realAncestor, ...trailingSegments.reverse());
+      } catch {
+        // Continue walking up to an existing ancestor
+      }
+    }
+  }
+}
+
 async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
   const written: PlannedWrite[] = [];
 
@@ -550,6 +657,72 @@ function corruptedEditsError(items: CorruptedItem[]): { text: string; isError: b
   };
 }
 
+function formatErrorBulletsWithinBytes(
+  heading: string,
+  errors: string[],
+  maxBytes: number,
+): string {
+  const full = `${heading}\n- ${errors.join("\n- ")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const headingPrefix = `${heading}\n`;
+  const availBytes = maxBytes - Buffer.byteLength(headingPrefix, "utf8");
+  if (availBytes <= 64 || errors.length <= 1) {
+    return truncateWithByteNotice(full, maxBytes);
+  }
+  const fittedBullets = fitSectionsToByteBudget(
+    errors.map((e) => `- ${e}`),
+    availBytes,
+    availBytes,
+    "\n",
+  );
+  const assembled = `${headingPrefix}${fittedBullets}`;
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes
+    ? assembled
+    : truncateWithByteNotice(assembled, maxBytes);
+}
+
+function compactSummaryLinesToBytes(
+  header: string,
+  summaryLines: string[],
+  verb: string,
+  maxBytes: number,
+): string {
+  const full = `${header}\n${summaryLines.join("\n")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const minimal = `${header} (${summaryLines.length} file(s) ${verb}; list omitted to preserve verify diagnostics)`;
+  const headerPrefix = `${header}\n`;
+  const kept: string[] = [];
+  let usedBytes = Buffer.byteLength(headerPrefix, "utf8");
+
+  for (let i = 0; i < summaryLines.length; i++) {
+    const line = summaryLines[i]!;
+    const remaining = summaryLines.length - (i + 1);
+    const omitNotice =
+      remaining > 0
+        ? `\n... (+${remaining} more applied file(s) omitted; total ${summaryLines.length} ${verb})`
+        : "";
+    const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+    if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
+      break;
+    }
+    kept.push(line);
+    usedBytes += lineBytes;
+  }
+
+  if (kept.length > 0) {
+    const omitted = summaryLines.length - kept.length;
+    return omitted > 0
+      ? `${headerPrefix}${kept.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${verb})`
+      : `${headerPrefix}${kept.join("\n")}`;
+  }
+  return Buffer.byteLength(minimal, "utf8") <= maxBytes
+    ? minimal
+    : truncateWithByteNotice(minimal, maxBytes);
+}
 function formatBestEffortPartialResult(params: {
   partialHeader: string;
   errors: string[];
@@ -593,10 +766,11 @@ function formatBestEffortPartialResult(params: {
     Buffer.byteLength(minimalApplied, "utf8"),
   );
   const maxFailedBytes = Math.max(256, maxBytes - fixedBytes - minAppliedBytes);
-  const failedSection =
-    Buffer.byteLength(failedFull, "utf8") <= maxFailedBytes
-      ? failedFull
-      : truncateWithByteNotice(failedFull, maxFailedBytes);
+  const failedSection = formatErrorBulletsWithinBytes(
+    failedHeading,
+    errors,
+    maxFailedBytes,
+  );
 
   const remainingForApplied =
     maxBytes - fixedBytes - Buffer.byteLength(failedSection, "utf8");
@@ -774,6 +948,24 @@ export async function runApplyEdits(
 
   const baseCwd = resolvePath(input.cwd || process.cwd());
 
+  if (!input.dryRun && validatedVerify?.cwd) {
+    const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
+    try {
+      const st = await fs.stat(resolvedVerifyCwd);
+      if (!st.isDirectory()) {
+        return {
+          text: `Validation failed (0 files modified):\n- 'verify.cwd' is not a directory: ${validatedVerify.cwd}`,
+          isError: true,
+        };
+      }
+    } catch {
+      return {
+        text: `Validation failed (0 files modified):\n- 'verify.cwd' directory not found: ${validatedVerify.cwd}`,
+        isError: true,
+      };
+    }
+  }
+
   // Merge entries targeting the same resolved file (including symlink aliases and symlinked parent dirs)
   const mergedByPath = new Map<
     string,
@@ -796,21 +988,12 @@ export async function runApplyEdits(
     }
 
     const absPath = resolvePath(entry.path, baseCwd);
-    let writeTargetPath = absPath;
-    try {
-      // Canonicalize existing paths (including symlinks and symlinked parent dirs like /var -> /private/var)
-      writeTargetPath = await fs.realpath(absPath);
-    } catch {
-      // File does not exist yet or dangling symlink — still canonicalize existing parent dir
-      // so `sym_dir/new.ts` and `real_dir/new.ts` deduplicate cleanly.
-      try {
-        const realParent = await fs.realpath(path.dirname(absPath));
-        writeTargetPath = path.join(realParent, path.basename(absPath));
-      } catch {
-        // Parent directory does not exist yet — keep absPath
-      }
-    }
+    const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
+    if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
+      errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
+      continue;
+    }
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
 
@@ -987,10 +1170,7 @@ export async function runApplyEdits(
       ? "Edit aborted (0 files modified):"
       : "Atomic edit aborted (0 files modified):";
     return {
-      text: truncateWithByteNotice(
-        `${prefix}\n- ${errors.join("\n- ")}`,
-        DEFAULT_INLINE_MAX_BYTES,
-      ),
+      text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true,
     };
   }
@@ -1037,7 +1217,7 @@ export async function runApplyEdits(
   const header = input.dryRun
     ? `Dry run validated ${plans.length} file(s) (0 files modified):`
     : `Applied edits to ${plans.length} file(s):`;
-  const parts = [`${header}\n${summaryLines.join("\n")}`];
+  const appliedFull = `${header}\n${summaryLines.join("\n")}`;
 
   // Phase 3: optional inline verify
   if (!input.dryRun && validatedVerify) {
@@ -1065,24 +1245,80 @@ export async function runApplyEdits(
 
     const status = res.timedOut
       ? "TIMEOUT"
-      : res.exitCode === 0
-        ? "PASS"
-        : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+      : res.error
+        ? "ERROR"
+        : res.exitCode === 0
+          ? "PASS"
+          : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const verifyPrefix = `\n\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
+    const preparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
       timedOut: res.timedOut,
       error: res.error,
-      maxChars: maxVerifyChars,
     });
 
-    parts.push(
-      `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n${formatted}`,
+    const minApplied = `${header} (${summaryLines.length} file(s) written; list omitted to preserve verify diagnostics)`;
+    const reservedForApplied =
+      status === "PASS"
+        ? Math.min(
+            Buffer.byteLength(appliedFull, "utf8"),
+            DEFAULT_INLINE_MAX_BYTES - 512,
+          )
+        : Math.min(
+            Buffer.byteLength(appliedFull, "utf8"),
+            Buffer.byteLength(minApplied, "utf8"),
+          );
+    const maxVerifyBodyBytes = Math.max(
+      256,
+      DEFAULT_INLINE_MAX_BYTES -
+        reservedForApplied -
+        Buffer.byteLength(verifyPrefix, "utf8"),
     );
+
+    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
+    let formatted = renderPreparedCompactCommandOutput(
+      preparedVerify,
+      targetChars,
+    ).text;
+    for (let iter = 0; iter < 4; iter++) {
+      const actualBytes = Buffer.byteLength(formatted, "utf8");
+      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
+      targetChars = Math.max(
+        64,
+        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94),
+      );
+      formatted = renderPreparedCompactCommandOutput(
+        preparedVerify,
+        targetChars,
+      ).text;
+    }
+    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
+      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
+    }
+
+    const verifySection = `${verifyPrefix}${formatted}`;
+    const remainingAppliedBytes =
+      DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
+    const appliedSection = compactSummaryLinesToBytes(
+      header,
+      summaryLines,
+      "written",
+      Math.max(64, remainingAppliedBytes),
+    );
+    const combined = `${appliedSection}${verifySection}`;
+    return {
+      text:
+        Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES
+          ? combined
+          : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      isError: false,
+    };
   }
 
-  const outText = parts.join("\n");
-  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
-  return { text: finalText, isError: false };
+  return {
+    text: truncateWithByteNotice(appliedFull, DEFAULT_INLINE_MAX_BYTES),
+    isError: false,
+  };
 }
