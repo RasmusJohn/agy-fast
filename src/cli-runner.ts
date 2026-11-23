@@ -86,14 +86,6 @@ function parseIntFlag(flag: string, raw: string | undefined): number {
   return n;
 }
 
-function requireValue(flag: string, argv: string[], index: number): string {
-  const next = argv[index + 1];
-  if (next === undefined) {
-    throw new Error(`Missing value after ${flag}`);
-  }
-  return next;
-}
-
 async function readStdinText(
   stream: NodeJS.ReadableStream & { isTTY?: boolean },
   explicitStdin: boolean,
@@ -282,32 +274,6 @@ const VALUE_LONG_FLAGS = new Set([
   "--max-verify-chars",
 ]);
 
-function normalizeCliArgs(rawArgs: string[]): string[] {
-  const out: string[] = [];
-  let afterDoubleDash = false;
-  for (const arg of rawArgs) {
-    if (afterDoubleDash) {
-      out.push(arg);
-      continue;
-    }
-    if (arg === "--") {
-      afterDoubleDash = true;
-      out.push(arg);
-      continue;
-    }
-    const eqIdx = arg.indexOf("=");
-    if (eqIdx > 2 && arg.startsWith("--")) {
-      const flag = arg.slice(0, eqIdx);
-      if (VALUE_LONG_FLAGS.has(flag)) {
-        out.push(flag, arg.slice(eqIdx + 1));
-        continue;
-      }
-    }
-    out.push(arg);
-  }
-  return out;
-}
-
 interface ParsedCliOptions {
   showHelp: boolean;
   cwd?: string;
@@ -333,7 +299,6 @@ interface ParsedCliOptions {
 }
 
 function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOptions {
-  const args = normalizeCliArgs(rawArgs);
   const opts: ParsedCliOptions = {
     showHelp: false,
     explicitStdin: false,
@@ -343,35 +308,62 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     outlineFiles: [],
   };
   let pendingMods: SearchQueryModifiers = {};
+  const pushScopedQuery = (base: SearchQuery) => {
+    opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+    pendingMods = {};
+  };
 
   let afterDoubleDash = false;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
+  for (let i = 0; i < rawArgs.length; i++) {
+    const rawArg = rawArgs[i]!;
     if (afterDoubleDash) {
-      opts.positionals.push(arg);
+      opts.positionals.push(rawArg);
       continue;
     }
-    if (arg === "--") {
+    if (rawArg === "--") {
       afterDoubleDash = true;
       continue;
     }
+
+    let arg = rawArg;
+    let inlineValue: string | undefined;
+    if (rawArg.startsWith("--")) {
+      const eqIdx = rawArg.indexOf("=");
+      if (eqIdx > 2) {
+        const candidateFlag = rawArg.slice(0, eqIdx);
+        if (VALUE_LONG_FLAGS.has(candidateFlag)) {
+          arg = candidateFlag;
+          inlineValue = rawArg.slice(eqIdx + 1);
+        }
+      }
+    }
+
+    const consumeValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue;
+      }
+      const next = rawArgs[i + 1];
+      if (next === undefined) {
+        throw new Error(`Missing value after ${arg}`);
+      }
+      i += 1;
+      return next;
+    };
+
     if (arg === "--help" || arg === "-h") {
       opts.showHelp = true;
       continue;
     }
     if (arg === "--cwd") {
-      opts.cwd = requireValue(arg, args, i);
-      i += 1;
+      opts.cwd = consumeValue();
       continue;
     }
     if (arg === "--max-chars") {
-      opts.maxChars = parseIntFlag(arg, requireValue(arg, args, i));
-      i += 1;
+      opts.maxChars = parseIntFlag(arg, consumeValue());
       continue;
     }
     if (arg === "--json") {
-      opts.jsonRaw = requireValue(arg, args, i);
-      i += 1;
+      opts.jsonRaw = consumeValue();
       continue;
     }
     if (arg === "--stdin") {
@@ -380,76 +372,60 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     }
 
     if (tool === "batch_search") {
-      const pushScopedQuery = (base: SearchQuery) => {
-        opts.searchQueries.push(applySearchModifiers(base, pendingMods));
-        pendingMods = {};
-      };
       if (arg === "--text" || arg === "-t") {
-        pushScopedQuery({ type: "text", pattern: requireValue(arg, args, i) });
-        i += 1;
+        pushScopedQuery({ type: "text", pattern: consumeValue() });
         continue;
       }
       if (arg === "--regex" || arg === "-r") {
-        pushScopedQuery({ type: "regex", pattern: requireValue(arg, args, i) });
-        i += 1;
+        pushScopedQuery({ type: "regex", pattern: consumeValue() });
         continue;
       }
       if (arg === "--glob" || arg === "-g") {
-        pushScopedQuery({ type: "glob", pattern: requireValue(arg, args, i) });
-        i += 1;
+        pushScopedQuery({ type: "glob", pattern: consumeValue() });
         continue;
       }
       if (arg === "--fuzzy" || arg === "-f") {
-        pushScopedQuery({ type: "fuzzy", pattern: requireValue(arg, args, i) });
-        i += 1;
+        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() });
         continue;
       }
       if (arg === "--git") {
-        pushScopedQuery({ type: "git", pattern: requireValue(arg, args, i) });
-        i += 1;
+        pushScopedQuery({ type: "git", pattern: consumeValue() });
         continue;
       }
       if (arg === "--path" || arg === "-p") {
-        pendingMods.path = requireValue(arg, args, i);
-        i += 1;
+        pendingMods.path = consumeValue();
         continue;
       }
       if (arg === "--file-type") {
-        pendingMods.fileType = requireValue(arg, args, i);
-        i += 1;
+        pendingMods.fileType = consumeValue();
         continue;
       }
       if (arg === "--glob-filter") {
-        pendingMods.glob = requireValue(arg, args, i);
-        i += 1;
+        pendingMods.glob = consumeValue();
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = requireValue(arg, args, i);
+        const mode = consumeValue();
         if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
           throw new Error(`Invalid --output-mode: ${mode}`);
         }
         pendingMods.outputMode = mode;
-        i += 1;
         continue;
       }
       if (arg === "--sort-by") {
-        const sortBy = requireValue(arg, args, i);
+        const sortBy = consumeValue();
         if (sortBy !== "path" && sortBy !== "mtime") {
           throw new Error(`Invalid --sort-by: ${sortBy}`);
         }
         pendingMods.sortBy = sortBy;
-        i += 1;
         continue;
       }
       if (arg === "--context" || arg === "-C") {
-        pendingMods.contextLines = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        pendingMods.contextLines = parseIntFlag(arg, consumeValue());
         continue;
       }
       if (arg === "--max-results") {
-        pendingMods.maxResults = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        pendingMods.maxResults = parseIntFlag(arg, consumeValue());
         continue;
       }
       if (arg === "--ignore-case" || arg === "-i") {
@@ -462,8 +438,7 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
       }
     } else if (tool === "read_slices") {
       if (arg === "--outline" || arg === "-o") {
-        opts.outlineFiles.push(requireValue(arg, args, i));
-        i += 1;
+        opts.outlineFiles.push(consumeValue());
         continue;
       }
     } else if (tool === "run_checks") {
@@ -476,22 +451,19 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         continue;
       }
       if (arg === "--output-mode") {
-        const mode = requireValue(arg, args, i);
+        const mode = consumeValue();
         if (mode !== "compact" && mode !== "full") {
           throw new Error(`Invalid --output-mode for check: ${mode}`);
         }
         opts.outputMode = mode;
-        i += 1;
         continue;
       }
       if (arg === "--concurrency") {
-        opts.concurrency = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        opts.concurrency = parseIntFlag(arg, consumeValue());
         continue;
       }
       if (arg === "--timeout") {
-        opts.timeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        opts.timeoutSec = parseIntFlag(arg, consumeValue());
         continue;
       }
     } else if (tool === "apply_edits") {
@@ -504,26 +476,27 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
         continue;
       }
       if (arg === "--verify") {
-        opts.verify = requireValue(arg, args, i);
-        i += 1;
+        opts.verify = consumeValue();
         continue;
       }
       if (arg === "--verify-timeout") {
-        opts.verifyTimeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        opts.verifyTimeoutSec = parseIntFlag(arg, consumeValue());
         continue;
       }
       if (arg === "--max-verify-chars") {
-        opts.maxVerifyChars = parseIntFlag(arg, requireValue(arg, args, i));
-        i += 1;
+        opts.maxVerifyChars = parseIntFlag(arg, consumeValue());
         continue;
       }
     }
 
     if (arg.startsWith("-")) {
-      throw new Error(`Unknown option '${arg}' for '${tool}'. Run with '--cli --help' for usage.`);
+      throw new Error(`Unknown option '${rawArg}' for '${tool}'. Run with '--cli --help' for usage.`);
     }
-    opts.positionals.push(arg);
+    if (tool === "batch_search") {
+      pushScopedQuery({ type: "text", pattern: rawArg });
+    } else {
+      opts.positionals.push(rawArg);
+    }
   }
 
   opts.trailingSearchMods = pendingMods;

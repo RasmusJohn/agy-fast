@@ -281,4 +281,56 @@ describe("agy-fast --cli direct runner", () => {
       false,
     );
   });
+
+  it("preserves option values matching --flag=val or '--' and scopes modifiers for positional search queries", async () => {
+    const scopeA = path.join(tmpDir, "scope-a");
+    const scopeB = path.join(tmpDir, "scope-b");
+    await fs.mkdir(scopeA, { recursive: true });
+    await fs.mkdir(scopeB, { recursive: true });
+    await fs.writeFile(
+      path.join(scopeA, "flags.ts"),
+      "export const cliSample = '--max-chars=100';\nexport const sep = '--';\nexport const alpha = 'SCOPE_A_ONLY';\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(scopeB, "flags.ts"),
+      "export const beta = 'SCOPE_B_ONLY';\n",
+      "utf8",
+    );
+
+    // 1. Value matching --<known-flag>=val after --text must NOT be split into extra queries
+    const flagValRes = await runCliSubprocess(
+      ["search", "--path=scope-a", "--text", "--max-chars=100"],
+      { cwd: tmpDir },
+    );
+    assert.equal(flagValRes.code, 0, flagValRes.stderr);
+    assert.match(flagValRes.stdout, /Query 1 \[text\] --max-chars=100 \(in scope-a\)/);
+    assert.doesNotMatch(flagValRes.stdout, /Query 2/);
+    assert.match(flagValRes.stdout, /cliSample = '--max-chars=100'/);
+
+    // 2. Value '--' after --text must NOT disable --flag=val parsing for subsequent options
+    const dashValRes = await runCliSubprocess(
+      ["search", "--text", "--", "--path=scope-a"],
+      { cwd: tmpDir },
+    );
+    assert.equal(dashValRes.code, 0, dashValRes.stderr);
+    assert.match(dashValRes.stdout, /Query 1 \[text\] -- \(in scope-a\)/);
+    assert.match(dashValRes.stdout, /sep = '--'/);
+
+    // 3. Positional search queries consume preceding modifiers and inherit trailing modifiers
+    const posScopedRes = await runCliSubprocess(
+      ["search", "--path", "scope-a", "scope_a_only", "--path", "scope-b", "scope_b_only", "--ignore-case"],
+      { cwd: tmpDir },
+    );
+    assert.equal(posScopedRes.code, 0, posScopedRes.stderr);
+    assert.match(posScopedRes.stdout, /Query 1 \[text\] scope_a_only \(in scope-a\)/);
+    assert.match(posScopedRes.stdout, /SCOPE_A_ONLY/);
+    assert.match(posScopedRes.stdout, /Query 2 \[text\] scope_b_only \(in scope-b\)/);
+    assert.match(posScopedRes.stdout, /SCOPE_B_ONLY/);
+
+    // 4. Unknown long flag with '=val' for another tool reports the full unknown option cleanly
+    const badFlagRes = await runCliSubprocess(["outline", "--text=foo"], { cwd: tmpDir });
+    assert.equal(badFlagRes.code, 1);
+    assert.match(badFlagRes.stderr, /Unknown option '--text=foo' for 'quick_outline'/);
+  });
 });
