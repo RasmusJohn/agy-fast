@@ -1687,5 +1687,30 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(qm.agyFastToolCalls.quick_outline, 1);
     assert.equal(qm.agyVerifyFailedCalls, 1);
     assert.equal(qm.agyErrorCalls, 0);
+
+    // Verify [ERROR in ...] (spawn failure) is counted as verify failure consistently with FAIL/TIMEOUT
+    const verifyErrSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T09:15:00Z",
+          output_tokens: 90,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_apply_edits", args: { edits: [{ path: "a.ts", hunks: [{ target: "x", replacement: "y" }] }] } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:15:01Z",
+          content: "Applied edits to 1 file(s):\n- a.ts: updated (1 match), lines +0\n\nVerify [ERROR in 5ms] `bad-bin`:\nspawn ENOENT",
+        }),
+      ].join("\n"),
+    );
+    const vem = analyzeTranscriptSessions([verifyErrSteps]);
+    assert.equal(vem.agyVerifyFailedCalls, 1);
+    assert.equal(vem.agyErrorCalls, 0);
   });
 });

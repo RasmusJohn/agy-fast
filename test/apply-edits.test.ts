@@ -1247,5 +1247,36 @@ describe("apply_edits", () => {
     assert.match(verifyFailRes.text, /Verify \[FAIL/);
     assert.match(verifyFailRes.text, /error TS2322: 首条核心类型错误根因诊断/);
     assert.match(verifyFailRes.text, /FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file\./);
+
+    // 5. >10-line hunk matched via a trailing high-entropy anchor (idx >= 10) still scores and locates cleanly
+    const longHunkFile = path.join(subDir, "long-hunk.ts");
+    const longFileLines = [
+      ...Array.from({ length: 20 }, (_, i) => `const filler_${i} = ${i};`),
+      ...Array.from({ length: 12 }, (_, i) => `const mutatedLine_${i} = ${i * 10};`),
+      "const exactTrailingAnchor = computeDeterministicDigest(payloadBytes, SHA256_CONTEXT);",
+      "return exactTrailingAnchor;",
+    ];
+    await fs.writeFile(longHunkFile, longFileLines.join("\n") + "\n", "utf8");
+    const longMiss = await runApplyEdits({
+      cwd: subDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "long-hunk.ts",
+          hunks: [
+            {
+              target: [
+                ...Array.from({ length: 12 }, (_, i) => `const completelyDifferent_${i} = 'x';`),
+                "const exactTrailingAnchor = computeDeterministicDigest(payloadBytes, SHA256_CONTEXT);",
+                "return exactTrailingAnchor;",
+              ].join("\n"),
+              replacement: "// replaced",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(longMiss.isError, true);
+    assert.match(longMiss.text, /Closest match near line 21/);
   });
 });

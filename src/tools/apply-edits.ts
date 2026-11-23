@@ -244,12 +244,22 @@ function findClosestRegionSnippet(
   let bestStart = -1;
   let bestScore = 0;
 
+  const scoreIndices: number[] = [];
+  const windowLen = Math.min(targetLines.length, 10);
+  for (let k = 0; k < windowLen; k++) {
+    scoreIndices.push(k);
+  }
+  for (const idx of anchorIndices) {
+    if (idx >= windowLen) {
+      scoreIndices.push(idx);
+    }
+  }
+
   const scoreCandidateStart = (candStart: number): number => {
-    const windowLen = Math.min(targetLines.length, 10);
     let total = 0;
-    for (let k = 0; k < windowLen; k++) {
+    for (const k of scoreIndices) {
       const fIdx = candStart + k;
-      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) break;
+      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) continue;
       const fLine = trimmedFileLines[fIdx]!;
       const tLine = targetLines[k]!;
       if (!fLine || !tLine) continue;

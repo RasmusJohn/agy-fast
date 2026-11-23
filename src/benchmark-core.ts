@@ -1206,7 +1206,7 @@ const AGY_MAX_RESULTS_CAPPED_RE =
   /(?:^|\n)\.\.\.\s*\[truncated(?: at \d+|; showing )/;
 const AGY_ERROR_HEAD_RE =
   /^(?:Encountered error in step execution|Error invalid tool call|Partial edit applied|Atomic edit aborted)\b/;
-const AGY_VERIFY_FAILED_RE = /(?:^|\n)Verify \[(?:FAIL\b|TIMEOUT\b)/;
+const AGY_VERIFY_FAILED_RE = /(?:^|\n)Verify \[(?:FAIL\b|TIMEOUT\b|ERROR\b)/;
 
 function stripHostMetadataPrefix(resText: string): string {
   return resText.replace(HOST_METADATA_PREFIX_RE, "");
