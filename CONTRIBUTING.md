@@ -33,6 +33,12 @@ Thanks for contributing! `agy-fast` uses a protected **`main` + `dev`** branchin
 
 ## Release Flow (Maintainers)
 
-1. On `dev`, bump version in `package.json`, `plugin.json`, and `CHANGELOG.md`, run `npm run typecheck && npm run build && npm test && npm run validate && npm run bench:stress`, and commit.
-2. Open a Release PR from `dev` → `main` and wait for all required CI checks to pass.
-3. Merge to `main`, tag `vX.Y.Z` on the merged `main` commit (tags matching `v*` are protected once pushed), and publish the GitHub Release.
+1. On `dev`, bump `version` in `package.json` and `plugin.json`, add the `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, run `npm run typecheck && npm run build && npm test && npm run validate && npm run bench:stress`, and commit.
+2. Open a Release PR from `dev` → `main` and wait for all required CI checks (`verify (ubuntu-latest)`, `verify (windows-latest)`, `stress`) to pass.
+3. Merge using **Create a merge commit** (avoid Squash on `dev` → `main` so branch history stays aligned), pull the merged `main`, and push the tag `vX.Y.Z`:
+   ```bash
+   git checkout main && git pull origin main
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+   Pushing `vX.Y.Z` automatically triggers `.github/workflows/release.yml`, which verifies the tag is on `main`, checks version parity & tests, extracts notes from `CHANGELOG.md`, and publishes the GitHub Release (tags matching `v*` are protected once pushed).
+4. Fast-forward/sync `dev` with `main` (`git checkout dev && git merge main && git push origin dev`) so the next release cycle stays conflict-free.
