@@ -333,6 +333,31 @@ describe("run_checks", () => {
     // GBK bytes for "'x' 不是"
     const gbk = Buffer.from("27782720b2bbcac7", "hex");
     assert.equal(decodeProcessOutput(gbk, false, "gb18030"), "'x' 不是");
+
+    // Multi-line pure GBK preserves line endings and decodes every line
+    const multiGbk = Buffer.from("27782720b2bbcac70d0a27792720b2bbcac7", "hex");
+    assert.equal(decodeProcessOutput(multiGbk, false, "gb18030"), "'x' 不是\r\n'y' 不是");
+
+    // Mixed UTF-8 + GBK lines (e.g. chained `python && node` on Windows CP936)
+    // must keep valid UTF-8 lines intact instead of turning the whole buffer into mojibake
+    const mixed = Buffer.concat([
+      Buffer.from("ℹ pass 11\r\n", "utf8"),
+      Buffer.from("构建产物校验通过 → 404\n", "utf8"),
+      Buffer.from("27782720b2bbcac70d0a", "hex"),
+      Buffer.from("尾部 UTF-8 保留", "utf8"),
+    ]);
+    assert.equal(
+      decodeProcessOutput(mixed, false, "gb18030"),
+      "ℹ pass 11\r\n构建产物校验通过 → 404\n'x' 不是\r\n尾部 UTF-8 保留",
+    );
+
+    // Mixed GBK line followed by a UTF-8 final line truncated mid-character
+    const mixedTrunc = Buffer.concat([
+      Buffer.from("27782720b2bbcac70a", "hex"),
+      Buffer.from("中文", "utf8"),
+      Buffer.from([0xe8, 0xbe]),
+    ]);
+    assert.equal(decodeProcessOutput(mixedTrunc, true, "gb18030"), "'x' 不是\n中文");
   });
 
   it("folds oversized command output with Head-Tail preservation and UTF-8/surrogate safety", async () => {
