@@ -9461,7 +9461,7 @@ function shouldCliExitNonZero(tool, result) {
 }
 
 // src/mcp-server.ts
-var SERVER_VERSION = "0.2.10";
+var SERVER_VERSION = "0.3.0";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
   path7.dirname(fileURLToPath2(import.meta.url)),
   ".."

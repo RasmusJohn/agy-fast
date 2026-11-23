@@ -20,7 +20,7 @@ import {
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
 import { runAgyFastCli } from "./cli-runner.js";
 
-const SERVER_VERSION = "0.2.10";
+const SERVER_VERSION = "0.3.0";
 const DEFAULT_PLUGIN_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
