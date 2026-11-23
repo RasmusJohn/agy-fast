@@ -155,10 +155,12 @@ async function readStdinText(
     if (!explicitStdin) {
       firstByteTimer = setTimeout(() => {
         if (totalBytes === 0) {
+          if (typeof (stream as { pause?: () => void }).pause === "function") {
+            (stream as { pause: () => void }).pause();
+          }
           finish("");
         }
       }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
-      firstByteTimer.unref();
     }
 
     stream.on("data", onData);
