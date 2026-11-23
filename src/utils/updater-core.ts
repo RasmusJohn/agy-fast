@@ -222,9 +222,11 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
   return null;
 }
 
+let tmpWriteSeq = 0;
+
 async function writeJsonAtomically(filePath: string, data: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
   await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   try {
     await fs.rename(tmpPath, filePath);
@@ -466,21 +468,32 @@ function extractGithubSlug(repoUrl: string): string | null {
   return m?.[1] ?? null;
 }
 
+export function validateRepoUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.startsWith("-") || /[\0\r\n]/.test(trimmed)) {
+    throw new Error(`Invalid update repository URL: ${rawUrl}`);
+  }
+  return trimmed;
+}
+
 export async function fetchLatestRemoteVersion(opts: {
   repoUrl: string;
   channel: UpdateChannel;
   timeoutMs?: number;
 }): Promise<RemoteVersionInfo> {
+  const safeRepoUrl = validateRepoUrl(opts.repoUrl);
   const timeoutMs = opts.timeoutMs ?? 8_000;
   const gitEnv = withNonInteractiveGitEnv();
 
   if (opts.channel === "release") {
+    let tagsFetchSucceeded = false;
     const tagsRes = await execBinaryAsync(
       "git",
-      ["ls-remote", "--tags", "--refs", opts.repoUrl],
+      ["ls-remote", "--tags", "--refs", "--", safeRepoUrl],
       { cwd: os.tmpdir(), timeoutMs, env: gitEnv },
     );
     if (!tagsRes.error && !tagsRes.timedOut && tagsRes.exitCode === 0) {
+      tagsFetchSucceeded = true;
       const latest = pickLatestSemverTag(tagsRes.stdout);
       if (latest) {
         return {
@@ -492,8 +505,8 @@ export async function fetchLatestRemoteVersion(opts: {
       }
     }
 
-    // Fallback to GitHub Releases API if git is unavailable and URL is GitHub
-    const slug = extractGithubSlug(opts.repoUrl);
+    // Fallback to GitHub Releases API if git is unavailable or returned no tags and URL is GitHub
+    const slug = extractGithubSlug(safeRepoUrl);
     if (slug && typeof fetch === "function") {
       try {
         const res = await fetch(
@@ -520,25 +533,42 @@ export async function fetchLatestRemoteVersion(opts: {
           }
         }
       } catch {
-        // Fall through to git main check or error
+        // Handled below
       }
+    }
+
+    // Never silently fall back to unreleased `main` when release tag lookup itself failed;
+    // only allow fallback when git ls-remote succeeded cleanly on an untagged repository.
+    if (!tagsFetchSucceeded) {
+      throw new Error(
+        tagsRes.stderr.trim() ||
+          tagsRes.error ||
+          (tagsRes.timedOut
+            ? `Timed out checking releases from: ${safeRepoUrl}`
+            : `Unable to reach update source: ${safeRepoUrl}`),
+      );
     }
   }
 
   // Main channel (or fallback when repo has no semver tags yet)
   const headRes = await execBinaryAsync(
     "git",
-    ["ls-remote", opts.repoUrl, "refs/heads/main", "HEAD"],
+    ["ls-remote", "--", safeRepoUrl, "refs/heads/main", "HEAD"],
     { cwd: os.tmpdir(), timeoutMs, env: gitEnv },
   );
   if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
-    const firstLine = headRes.stdout.trim().split(/\r?\n/)[0] ?? "";
-    const sha = firstLine.split(/\s+/)[0] || undefined;
-    if (sha) {
+    const entries = headRes.stdout
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.trim().split(/\s+/))
+      .filter((parts) => parts.length >= 2 && Boolean(parts[0]));
+    const mainEntry = entries.find((parts) => parts[1] === "refs/heads/main");
+    const chosen = mainEntry ?? entries[0];
+    if (chosen?.[0]) {
       return {
-        ref: "main",
+        ref: mainEntry ? "main" : "HEAD",
         version: null,
-        commitSha: sha,
+        commitSha: chosen[0],
         source: "git-main",
       };
     }
@@ -547,7 +577,7 @@ export async function fetchLatestRemoteVersion(opts: {
   throw new Error(
     headRes.stderr.trim() ||
       headRes.error ||
-      `Unable to reach update source: ${opts.repoUrl}`,
+      `Unable to reach update source: ${safeRepoUrl}`,
   );
 }
 
@@ -578,7 +608,7 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
   const mcpPath = path.join(stagingDir, "dist", "mcp-server.mjs");
   const smokeOk = await new Promise<boolean>((resolve) => {
     const child = spawn(process.execPath, [mcpPath], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
     });
     let stdout = "";
@@ -588,6 +618,9 @@ export async function verifyStagedPlugin(stagingDir: string): Promise<{
     }, 6_000);
     timer.unref();
 
+    child.stdin.on("error", () => {
+      // Ignore EPIPE if a broken staged bundle exits before reading stdin
+    });
     child.stdout.on("data", (d: Buffer | string) => {
       stdout += d.toString();
     });
@@ -693,23 +726,24 @@ function isProcessDead(pid: number): boolean {
   }
 }
 
-async function acquireUpdateLock(lockPath: string): Promise<boolean> {
+async function acquireUpdateLock(lockPath: string): Promise<string | null> {
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${++tmpWriteSeq}-${Math.random().toString(36).slice(2, 10)}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const handle = await fs.open(lockPath, "wx");
       try {
         await handle.writeFile(
-          JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
           "utf8",
         );
       } finally {
         await handle.close();
       }
-      return true;
+      return token;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== "EEXIST") return false;
+      if (code !== "EEXIST") return null;
       try {
         const st = await fs.stat(lockPath);
         let stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
@@ -724,16 +758,35 @@ async function acquireUpdateLock(lockPath: string): Promise<boolean> {
           }
         }
         if (stale) {
-          await fs.rm(lockPath, { force: true });
+          // Atomically claim the stale lock via rename so concurrent reclaimers
+          // never unlink a live lock freshly acquired by another process.
+          const claimedPath = `${lockPath}.stale.${process.pid}.${++tmpWriteSeq}`;
+          try {
+            await fs.rename(lockPath, claimedPath);
+            await fs.rm(claimedPath, { force: true }).catch(() => {});
+          } catch {
+            // Another process already reclaimed or removed it; retry open("wx")
+          }
           continue;
         }
       } catch {
         continue;
       }
-      return false;
+      return null;
     }
   }
-  return false;
+  return null;
+}
+
+async function releaseUpdateLock(lockPath: string, token: string): Promise<void> {
+  try {
+    const info = await readJsonFile<{ token?: unknown }>(lockPath);
+    if (info?.token === token) {
+      await fs.rm(lockPath, { force: true });
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
 }
 
 export async function runPluginUpdate(
@@ -760,8 +813,8 @@ export async function runPluginUpdate(
     };
   }
 
-  const locked = await acquireUpdateLock(paths.lockFile);
-  if (!locked) {
+  const lockToken = await acquireUpdateLock(paths.lockFile);
+  if (!lockToken) {
     return {
       status: "skipped-locked",
       currentVersion,
@@ -856,10 +909,11 @@ export async function runPluginUpdate(
     await fs.mkdir(paths.cacheDir, { recursive: true });
     const gitEnv = withNonInteractiveGitEnv(env);
 
+    const safeRepoUrl = validateRepoUrl(repoUrl);
     const cloneArgs =
-      remote.ref === "main"
-        ? ["clone", "--depth", "1", "--branch", "main", repoUrl, stagingDir]
-        : ["clone", "--depth", "1", "--branch", remote.ref, repoUrl, stagingDir];
+      remote.ref === "HEAD"
+        ? ["clone", "--depth", "1", "--", safeRepoUrl, stagingDir]
+        : ["clone", "--depth", "1", "--branch", remote.ref, "--", safeRepoUrl, stagingDir];
     const cloneRes = await execBinaryAsync("git", cloneArgs, {
       cwd: paths.cacheDir,
       timeoutMs: Math.max(timeoutMs, 30_000),
@@ -981,7 +1035,7 @@ export async function runPluginUpdate(
     if (stagingDir) {
       await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
     }
-    await fs.rm(paths.lockFile, { force: true }).catch(() => {});
+    await releaseUpdateLock(paths.lockFile, lockToken);
   }
 }
 

@@ -8,11 +8,14 @@ import { pathToFileURL } from "node:url";
 import {
   compareSemver,
   consumeSnapshotUpdateNotice,
+  fetchLatestRemoteVersion,
   pickLatestSemverTag,
   readInstalledVersion,
   runPluginUpdate,
   shouldTriggerBackgroundCheck,
   UPDATER_RUNTIME_FILES,
+  validateRepoUrl,
+  verifyStagedPlugin,
 } from "../src/utils/updater-core.js";
 
 const REPO_ROOT = process.cwd();
@@ -541,5 +544,50 @@ describe("auto-updater", () => {
       await fs.readFile(path.join(lazyUpdateDir, "mcp_config.json"), "utf8"),
     );
     assert.equal(updatedMcpCfg.mcpServers.fast.tools, undefined);
+  });
+
+  it("blocks git option injection in repoUrl, avoids release->main error fallback, and handles verifyStagedPlugin EPIPE/stderr", async () => {
+    // 1. Option-like or control-char repoUrl values are rejected before spawning git
+    for (const bad of ["--upload-pack=evil", "-c", "https://example.com\n--upload-pack=x", ""]) {
+      assert.throws(() => validateRepoUrl(bad), /Invalid update repository URL/);
+      await assert.rejects(
+        () => fetchLatestRemoteVersion({ repoUrl: bad, channel: "release", timeoutMs: 2000 }),
+        /Invalid update repository URL/,
+      );
+    }
+
+    // 2. Transient/unreachable release remote throws immediately instead of falling through to main
+    await assert.rejects(
+      () =>
+        fetchLatestRemoteVersion({
+          repoUrl: pathToFileURL(path.join(rootTmp, "definitely-missing-repo.git")).href,
+          channel: "release",
+          timeoutMs: 3000,
+        }),
+    );
+
+    // 3. verifyStagedPlugin survives immediate crash (EPIPE) and >128 KiB stderr without crashing or deadlocking
+    const crashStage = path.join(rootTmp, "crash-stage");
+    await copyRuntimeFixture(crashStage, "0.9.0", "crash");
+    await fs.writeFile(path.join(crashStage, "dist", "mcp-server.mjs"), "process.exit(1);\n", "utf8");
+    const crashCheck = await verifyStagedPlugin(crashStage);
+    assert.equal(crashCheck.ok, false);
+
+    const loudStage = path.join(rootTmp, "loud-stderr-stage");
+    await copyRuntimeFixture(loudStage, "0.9.1", "loud");
+    await fs.writeFile(
+      path.join(loudStage, "dist", "mcp-server.mjs"),
+      `process.stderr.write("E".repeat(160 * 1024));
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
+  if (msg.method === "tools/list") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "a" }, { name: "b" }, { name: "c" }, { name: "d" }] } }) + "\\n");
+});\n`,
+      "utf8",
+    );
+    const loudCheck = await verifyStagedPlugin(loudStage);
+    assert.equal(loudCheck.ok, true);
   });
 });
