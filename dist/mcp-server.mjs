@@ -1090,12 +1090,26 @@ async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   })();
   return pendingWindowsPowerShellProbe;
 }
-function withNonInteractiveGitEnv(baseEnv = process.env) {
-  return {
-    ...baseEnv,
-    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
-    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never"
-  };
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
 }
 async function runShellCommandAsync(command, options) {
   const effectiveOptions = {
@@ -3048,13 +3062,12 @@ function countLines(text) {
   return count;
 }
 function isGitInternalPath(filePath, platform = process.platform) {
-  const caseInsensitive = platform === "win32" || platform === "darwin";
   const segments = filePath.split(/[\\/]+/);
   for (const rawSeg of segments) {
     if (!rawSeg) continue;
-    let seg = caseInsensitive ? rawSeg.toLowerCase() : rawSeg;
+    let seg = rawSeg.toLowerCase();
     if (platform === "win32") {
-      seg = seg.replace(/[. ]+$/, "");
+      seg = seg.replace(/[. ]+$/, "").replace(/:.*$/, "").replace(/[. ]+$/, "");
     }
     if (seg === ".git") {
       return true;

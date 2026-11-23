@@ -728,6 +728,23 @@ describe("run_checks", () => {
     assert.equal(overridden.GIT_TERMINAL_PROMPT, "1");
     assert.equal(overridden.GCM_INTERACTIVE, "always");
 
+    // Plain shallow-cloned env objects on Windows must respect case-insensitive caller keys
+    const winLower = withNonInteractiveGitEnv(
+      { git_terminal_prompt: "1", gcm_interactive: "auto" },
+      "win32",
+    );
+    assert.equal(winLower.git_terminal_prompt, "1");
+    assert.equal(winLower.gcm_interactive, "auto");
+    assert.equal(winLower.GIT_TERMINAL_PROMPT, undefined);
+    assert.equal(winLower.GCM_INTERACTIVE, undefined);
+
+    const posixLower = withNonInteractiveGitEnv(
+      { git_terminal_prompt: "1", gcm_interactive: "auto" },
+      "linux",
+    );
+    assert.equal(posixLower.GIT_TERMINAL_PROMPT, "0");
+    assert.equal(posixLower.GCM_INTERACTIVE, "never");
+
     const prevPrompt = process.env.GIT_TERMINAL_PROMPT;
     const prevGcm = process.env.GCM_INTERACTIVE;
     try {

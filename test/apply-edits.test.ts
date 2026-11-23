@@ -1281,14 +1281,16 @@ describe("apply_edits", () => {
   });
 
   it("blocks accidental writes inside .git metadata paths (including symlinks) while allowing .gitignore/.github/.gitattributes", async () => {
-    // Platform-specific segment matching checks
+    // Platform-specific and cross-platform segment matching checks
     assert.equal(isGitInternalPath("/repo/.git/config", "linux"), true);
     assert.equal(isGitInternalPath("/repo/.git/hooks/pre-commit", "linux"), true);
     assert.equal(isGitInternalPath("/repo/.git", "linux"), true);
-    assert.equal(isGitInternalPath("/repo/.GIT/config", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.GIT/config", "linux"), true);
     assert.equal(isGitInternalPath("/repo/.GIT/config", "darwin"), true);
     assert.equal(isGitInternalPath("C:\\repo\\.GIT\\config", "win32"), true);
     assert.equal(isGitInternalPath("C:\\repo\\.git.\\config", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git::$INDEX_ALLOCATION\\hooks\\pre-commit", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git .:$DATA", "win32"), true);
     assert.equal(isGitInternalPath("/repo/.gitignore", "linux"), false);
     assert.equal(isGitInternalPath("/repo/.github/workflows/ci.yml", "linux"), false);
     assert.equal(isGitInternalPath("/repo/.gitattributes", "win32"), false);
@@ -1356,5 +1358,20 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(path.join(subDir, ".gitignore"), "utf8"), "node_modules/\n");
     assert.equal(await fs.readFile(path.join(subDir, ".github/workflows/ci.yml"), "utf8"), "name: CI\n");
     assert.equal(await fs.readFile(path.join(subDir, ".gitattributes"), "utf8"), "* text=auto\n");
+
+    // 4. Worktree / submodule regular `.git` file is also protected end-to-end
+    const wtDir = path.join(tmpDir, "git-worktree-protect");
+    await fs.mkdir(wtDir, { recursive: true });
+    const wtGitFile = path.join(wtDir, ".git");
+    await fs.writeFile(wtGitFile, "gitdir: /main-repo/.git/worktrees/wt1\n", "utf8");
+    const wtRes = await runApplyEdits({
+      cwd: wtDir,
+      edits: [
+        { path: ".git", hunks: [{ target: "wt1", replacement: "pwn" }] },
+      ],
+    });
+    assert.equal(wtRes.isError, true);
+    assert.match(wtRes.text, /\.git: refusing to modify Git internal metadata path/);
+    assert.equal(await fs.readFile(wtGitFile, "utf8"), "gitdir: /main-repo/.git/worktrees/wt1\n");
   });
 });

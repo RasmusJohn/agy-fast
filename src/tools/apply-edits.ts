@@ -514,21 +514,24 @@ function countLines(text: string): number {
 
 /**
  * Returns true if any path segment targets Git internal metadata (`.git`).
- * Matches case-insensitively on Windows and macOS (and strips Win32 trailing
- * dots/spaces on Windows), while never blocking `.gitignore`, `.github`,
- * `.gitattributes`, `.gitmodules`, `.gitkeep`, or names like `repo.git`.
+ * Matches case-insensitively across all platforms (including WSL/case-insensitive mounts)
+ * and strips Win32 NTFS ADS suffixes (`:stream`) and trailing dots/spaces on Windows,
+ * while never blocking `.gitignore`, `.github`, `.gitattributes`, `.gitmodules`,
+ * `.gitkeep`, or names like `repo.git`.
  */
 export function isGitInternalPath(
   filePath: string,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  const caseInsensitive = platform === "win32" || platform === "darwin";
   const segments = filePath.split(/[\\/]+/);
   for (const rawSeg of segments) {
     if (!rawSeg) continue;
-    let seg = caseInsensitive ? rawSeg.toLowerCase() : rawSeg;
+    let seg = rawSeg.toLowerCase();
     if (platform === "win32") {
-      seg = seg.replace(/[. ]+$/, "");
+      seg = seg
+        .replace(/[. ]+$/, "")
+        .replace(/:.*$/, "")
+        .replace(/[. ]+$/, "");
     }
     if (seg === ".git") {
       return true;

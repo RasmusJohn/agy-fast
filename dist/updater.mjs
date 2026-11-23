@@ -163,6 +163,27 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
+}
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
@@ -501,7 +522,8 @@ async function detectInstallKind(pluginDir) {
   if (hasGit) {
     const statusRes = await execBinaryAsync("git", ["status", "--porcelain"], {
       cwd: resolved,
-      timeoutMs: 4e3
+      timeoutMs: 4e3,
+      env: withNonInteractiveGitEnv()
     });
     if (statusRes.error || statusRes.exitCode !== 0 || statusRes.stdout.trim() !== "") {
       return "git-dirty";
@@ -524,7 +546,7 @@ function extractGithubSlug(repoUrl) {
 }
 async function fetchLatestRemoteVersion(opts) {
   const timeoutMs = opts.timeoutMs ?? 8e3;
-  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  const gitEnv = withNonInteractiveGitEnv();
   if (opts.channel === "release") {
     const tagsRes = await execBinaryAsync(
       "git",
@@ -830,7 +852,7 @@ async function runPluginUpdate(opts) {
       `staging-${process.pid}-${Date.now()}`
     );
     await fs.mkdir(paths.cacheDir, { recursive: true });
-    const gitEnv = { ...env, GIT_TERMINAL_PROMPT: "0" };
+    const gitEnv = withNonInteractiveGitEnv(env);
     const cloneArgs = remote.ref === "main" ? ["clone", "--depth", "1", "--branch", "main", repoUrl, stagingDir] : ["clone", "--depth", "1", "--branch", remote.ref, repoUrl, stagingDir];
     const cloneRes = await execBinaryAsync("git", cloneArgs, {
       cwd: paths.cacheDir,

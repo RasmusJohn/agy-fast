@@ -225,12 +225,26 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
-function withNonInteractiveGitEnv(baseEnv = process.env) {
-  return {
-    ...baseEnv,
-    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
-    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never"
-  };
+function hasDefinedEnvKey(env, key, platform) {
+  if (env[key] !== void 0) return true;
+  if (platform !== "win32") return false;
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing.toUpperCase() === upper && env[existing] !== void 0) {
+      return true;
+    }
+  }
+  return false;
+}
+function withNonInteractiveGitEnv(baseEnv = process.env, platform = process.platform) {
+  const result = { ...baseEnv };
+  if (!hasDefinedEnvKey(baseEnv, "GIT_TERMINAL_PROMPT", platform)) {
+    result.GIT_TERMINAL_PROMPT = "0";
+  }
+  if (!hasDefinedEnvKey(baseEnv, "GCM_INTERACTIVE", platform)) {
+    result.GCM_INTERACTIVE = "never";
+  }
+  return result;
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
