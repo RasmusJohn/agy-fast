@@ -1008,10 +1008,35 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
 
+export function formatExitFailureLabel(
+  exitCode: number | null,
+  signal?: NodeJS.Signals | null,
+): string {
+  if (signal) {
+    switch (signal) {
+      case "SIGKILL":
+        return "SIGKILL - possible OOM";
+      case "SIGSEGV":
+        return "SIGSEGV - segmentation fault";
+      case "SIGABRT":
+        return "SIGABRT - process aborted";
+      case "SIGTERM":
+        return "SIGTERM";
+      default:
+        return String(signal);
+    }
+  }
+  if (exitCode === 137) return "exit 137 / SIGKILL - possible OOM";
+  if (exitCode === 139) return "exit 139 / SIGSEGV";
+  if (exitCode === 134) return "exit 134 / SIGABRT";
+  return `exit ${exitCode ?? "err"}`;
+}
+
 export interface FormatCompactCommandOutputParams {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  signal?: NodeJS.Signals | null;
   timedOut: boolean;
   error?: string;
   maxChars: number;
@@ -1095,9 +1120,14 @@ export function prepareCompactCommandOutput(
   }
 
   if (!combined) {
+    const bodyText = params.signal
+      ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}`
+      : params.exitCode === 137 || params.exitCode === 139 || params.exitCode === 134
+        ? `Terminated (${formatExitFailureLabel(params.exitCode, null)})`
+        : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
-      bodyText: `Exited with code ${params.exitCode ?? "unknown"}`,
+      bodyText,
       collapsedLines: 0,
       rawLines: 0,
       rawChars: 0,
