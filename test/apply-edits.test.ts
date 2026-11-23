@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { runApplyEdits, type FileEdit } from "../src/tools/apply-edits.js";
+import { isGitInternalPath, runApplyEdits, type FileEdit } from "../src/tools/apply-edits.js";
 
 describe("apply_edits", () => {
   let tmpDir: string;
@@ -1278,5 +1278,83 @@ describe("apply_edits", () => {
     });
     assert.equal(longMiss.isError, true);
     assert.match(longMiss.text, /Closest match near line 21/);
+  });
+
+  it("blocks accidental writes inside .git metadata paths (including symlinks) while allowing .gitignore/.github/.gitattributes", async () => {
+    // Platform-specific segment matching checks
+    assert.equal(isGitInternalPath("/repo/.git/config", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.git/hooks/pre-commit", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.git", "linux"), true);
+    assert.equal(isGitInternalPath("/repo/.GIT/config", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.GIT/config", "darwin"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.GIT\\config", "win32"), true);
+    assert.equal(isGitInternalPath("C:\\repo\\.git.\\config", "win32"), true);
+    assert.equal(isGitInternalPath("/repo/.gitignore", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.github/workflows/ci.yml", "linux"), false);
+    assert.equal(isGitInternalPath("/repo/.gitattributes", "win32"), false);
+    assert.equal(isGitInternalPath("/repo/.gitmodules", "darwin"), false);
+    assert.equal(isGitInternalPath("/repo/.gitkeep", "linux"), false);
+    assert.equal(isGitInternalPath("/repos/project.git/README.md", "linux"), false);
+
+    const subDir = path.join(tmpDir, "git-protect");
+    await fs.mkdir(path.join(subDir, ".git", "hooks"), { recursive: true });
+    const gitConfigPath = path.join(subDir, ".git", "config");
+    const gitHeadPath = path.join(subDir, ".git", "HEAD");
+    await fs.writeFile(gitConfigPath, "[core]\n\tbare = false\n", "utf8");
+    await fs.writeFile(gitHeadPath, "ref: refs/heads/main\n", "utf8");
+
+    // 1. Direct edits/creates targeting .git/* are rejected with 0 files modified
+    const directRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: ".git/config", hunks: [{ target: "bare = false", replacement: "bare = true" }] },
+        { path: ".git/HEAD", create: "ref: refs/heads/pwn\n", overwrite: true },
+        { path: ".git/hooks/pre-commit", create: "#!/bin/sh\necho hi\n" },
+      ],
+    });
+    assert.equal(directRes.isError, true);
+    assert.match(directRes.text, /\.git\/config: refusing to modify Git internal metadata path/);
+    assert.match(directRes.text, /\.git\/HEAD: refusing to modify Git internal metadata path/);
+    assert.match(directRes.text, /\.git\/hooks\/pre-commit: refusing to modify Git internal metadata path/);
+    assert.equal(await fs.readFile(gitConfigPath, "utf8"), "[core]\n\tbare = false\n");
+    assert.equal(await fs.readFile(gitHeadPath, "utf8"), "ref: refs/heads/main\n");
+
+    // 2. Symlinks pointing into .git/ (file symlink and dir symlink with nested new file) are also blocked
+    let symlinksSupported = true;
+    const symConfig = path.join(subDir, "innocent-link.txt");
+    const symGitDir = path.join(subDir, "git-dir-link");
+    try {
+      await fs.symlink(gitConfigPath, symConfig);
+      await fs.symlink(path.join(subDir, ".git"), symGitDir, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      symlinksSupported = false;
+    }
+    if (symlinksSupported) {
+      const symRes = await runApplyEdits({
+        cwd: subDir,
+        edits: [
+          { path: "innocent-link.txt", hunks: [{ target: "bare = false", replacement: "bare = true" }] },
+          { path: "git-dir-link/new-sub/hook.sh", create: "#!/bin/sh\n" },
+        ],
+      });
+      assert.equal(symRes.isError, true);
+      assert.match(symRes.text, /innocent-link\.txt: refusing to modify Git internal metadata path/);
+      assert.match(symRes.text, /git-dir-link\/new-sub\/hook\.sh: refusing to modify Git internal metadata path/);
+      assert.equal(await fs.readFile(gitConfigPath, "utf8"), "[core]\n\tbare = false\n");
+    }
+
+    // 3. Legitimate dot-git* config files work normally
+    const legitRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: ".gitignore", create: "node_modules/\n" },
+        { path: ".github/workflows/ci.yml", create: "name: CI\n" },
+        { path: ".gitattributes", create: "* text=auto\n" },
+      ],
+    });
+    assert.equal(legitRes.isError, false);
+    assert.equal(await fs.readFile(path.join(subDir, ".gitignore"), "utf8"), "node_modules/\n");
+    assert.equal(await fs.readFile(path.join(subDir, ".github/workflows/ci.yml"), "utf8"), "name: CI\n");
+    assert.equal(await fs.readFile(path.join(subDir, ".gitattributes"), "utf8"), "* text=auto\n");
   });
 });

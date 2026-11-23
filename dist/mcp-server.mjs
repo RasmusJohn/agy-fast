@@ -3036,6 +3036,42 @@ function countLines(text) {
   }
   return count;
 }
+function isGitInternalPath(filePath, platform = process.platform) {
+  const caseInsensitive = platform === "win32" || platform === "darwin";
+  const segments = filePath.split(/[\\/]+/);
+  for (const rawSeg of segments) {
+    if (!rawSeg) continue;
+    let seg = caseInsensitive ? rawSeg.toLowerCase() : rawSeg;
+    if (platform === "win32") {
+      seg = seg.replace(/[. ]+$/, "");
+    }
+    if (seg === ".git") {
+      return true;
+    }
+  }
+  return false;
+}
+async function canonicalizeTargetPath(absPath) {
+  try {
+    return await fs3.realpath(absPath);
+  } catch {
+    const trailingSegments = [];
+    let current = absPath;
+    while (true) {
+      const parent = path4.dirname(current);
+      if (parent === current) {
+        return absPath;
+      }
+      trailingSegments.push(path4.basename(current));
+      current = parent;
+      try {
+        const realAncestor = await fs3.realpath(current);
+        return path4.join(realAncestor, ...trailingSegments.reverse());
+      } catch {
+      }
+    }
+  }
+}
 async function commitPlannedWrites(plans) {
   const written = [];
   try {
@@ -3367,17 +3403,12 @@ async function runApplyEdits(input) {
       continue;
     }
     const absPath = resolvePath(entry.path, baseCwd);
-    let writeTargetPath = absPath;
-    try {
-      writeTargetPath = await fs3.realpath(absPath);
-    } catch {
-      try {
-        const realParent = await fs3.realpath(path4.dirname(absPath));
-        writeTargetPath = path4.join(realParent, path4.basename(absPath));
-      } catch {
-      }
-    }
+    const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
+      errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
+      continue;
+    }
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
     if (!hasCreate && !hasHunks) {

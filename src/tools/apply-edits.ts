@@ -512,6 +512,57 @@ function countLines(text: string): number {
   return count;
 }
 
+/**
+ * Returns true if any path segment targets Git internal metadata (`.git`).
+ * Matches case-insensitively on Windows and macOS (and strips Win32 trailing
+ * dots/spaces on Windows), while never blocking `.gitignore`, `.github`,
+ * `.gitattributes`, `.gitmodules`, `.gitkeep`, or names like `repo.git`.
+ */
+export function isGitInternalPath(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const caseInsensitive = platform === "win32" || platform === "darwin";
+  const segments = filePath.split(/[\\/]+/);
+  for (const rawSeg of segments) {
+    if (!rawSeg) continue;
+    let seg = caseInsensitive ? rawSeg.toLowerCase() : rawSeg;
+    if (platform === "win32") {
+      seg = seg.replace(/[. ]+$/, "");
+    }
+    if (seg === ".git") {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function canonicalizeTargetPath(absPath: string): Promise<string> {
+  try {
+    return await fs.realpath(absPath);
+  } catch {
+    // Walk up to the nearest existing ancestor so symlinks such as
+    // `sym_dir/new_sub/file.ts` or `sym_git/new_sub/hook` deduplicate and
+    // trigger path-safety checks cleanly.
+    const trailingSegments: string[] = [];
+    let current = absPath;
+    while (true) {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return absPath;
+      }
+      trailingSegments.push(path.basename(current));
+      current = parent;
+      try {
+        const realAncestor = await fs.realpath(current);
+        return path.join(realAncestor, ...trailingSegments.reverse());
+      } catch {
+        // Continue walking up to an existing ancestor
+      }
+    }
+  }
+}
+
 async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
   const written: PlannedWrite[] = [];
 
@@ -934,21 +985,12 @@ export async function runApplyEdits(
     }
 
     const absPath = resolvePath(entry.path, baseCwd);
-    let writeTargetPath = absPath;
-    try {
-      // Canonicalize existing paths (including symlinks and symlinked parent dirs like /var -> /private/var)
-      writeTargetPath = await fs.realpath(absPath);
-    } catch {
-      // File does not exist yet or dangling symlink — still canonicalize existing parent dir
-      // so `sym_dir/new.ts` and `real_dir/new.ts` deduplicate cleanly.
-      try {
-        const realParent = await fs.realpath(path.dirname(absPath));
-        writeTargetPath = path.join(realParent, path.basename(absPath));
-      } catch {
-        // Parent directory does not exist yet — keep absPath
-      }
-    }
+    const writeTargetPath = await canonicalizeTargetPath(absPath);
     const relPath = toPosixPath(path.relative(baseCwd, absPath)) || path.basename(absPath);
+    if (isGitInternalPath(absPath) || isGitInternalPath(writeTargetPath)) {
+      errors.push(`${relPath}: refusing to modify Git internal metadata path (.git)`);
+      continue;
+    }
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
 
