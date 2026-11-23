@@ -17,6 +17,8 @@ var BLOCKING_TOOLS = /* @__PURE__ */ new Set([
   "manage_subagents",
   "wait_for_subagents"
 ]);
+var PLAN_MODE_TOOLS = /* @__PURE__ */ new Set(["enter_plan_mode", "exit_plan_mode"]);
+var PLAN_MODE_NOTICE_RE = /\[plan review(?: due)?\]|Plan mode is (?:on|off):/i;
 var READONLY_SIMPLE_CMDS = /* @__PURE__ */ new Set([
   "rg",
   "grep",
@@ -997,6 +999,21 @@ function analyzeTranscriptSessions(sessions) {
   let cacheHitCount = 0;
   let turnGapsTotal = 0;
   let turnGapsOver60s = 0;
+  const cacheMissAttribution = {
+    total: 0,
+    planModeSwitch: 0,
+    modelSwitch: 0,
+    errorRetry: 0,
+    activeSlowGap: 0,
+    idleOrWaitGap: 0,
+    asyncWakeupFast: 0,
+    fastReplicaOrPrefixMiss: 0,
+    compactionResets: 0,
+    contextDilutionTurns: 0,
+    sustainedCollapseRuns: 0,
+    sustainedCollapseTurns: 0,
+    maxConsecutiveMisses: 0
+  };
   for (const steps of sessions) {
     if (steps.length === 0) continue;
     let hasPlanner = false;
@@ -1006,6 +1023,24 @@ function analyzeTranscriptSessions(sessions) {
     let prevPlannerMs = null;
     let prevTurnHadUserInputBetween = false;
     let prevTurnHadCalls = false;
+    let prevCacheCtxTok = null;
+    let prevCachePlannerMs = null;
+    let prevCacheModel = null;
+    let prevCacheHadCalls = false;
+    let prevCacheHadBlockingTool = false;
+    let prevCacheHadPlanSwitch = false;
+    let betweenCacheUserInput = false;
+    let betweenCacheSysMsg = false;
+    let betweenCachePlanNotice = false;
+    let betweenCacheError = false;
+    let missStreak = 0;
+    const flushMissStreak = () => {
+      if (missStreak >= 3) {
+        cacheMissAttribution.sustainedCollapseRuns += 1;
+        cacheMissAttribution.sustainedCollapseTurns += missStreak;
+      }
+      missStreak = 0;
+    };
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       if (Array.isArray(step.media) && step.media.length > 0) {
@@ -1015,13 +1050,22 @@ function analyzeTranscriptSessions(sessions) {
         prevSingleToolName = null;
         prevTurnHadUserInputBetween = true;
         prevTurnHadCalls = false;
+        betweenCacheUserInput = true;
         continue;
       }
       if (step.type === "SYSTEM_MESSAGE") {
+        betweenCacheSysMsg = true;
+        if (typeof step.content === "string" && PLAN_MODE_NOTICE_RE.test(step.content)) {
+          betweenCachePlanNotice = true;
+        }
         if (!prevTurnHadCalls) {
           prevSingleToolName = null;
           prevTurnHadUserInputBetween = true;
         }
+        continue;
+      }
+      if (step.type === "ERROR_MESSAGE") {
+        betweenCacheError = true;
         continue;
       }
       if (step.type !== "PLANNER_RESPONSE") continue;
@@ -1043,7 +1087,17 @@ function analyzeTranscriptSessions(sessions) {
       }
       const inTok = Number(step.input_tokens ?? 0);
       const cacheTok = Number(step.cache_read_tokens ?? 0);
-      const ctxTok = (Number.isFinite(inTok) ? inTok : 0) + (Number.isFinite(cacheTok) ? cacheTok : 0);
+      const safeInTok = Number.isFinite(inTok) && inTok > 0 ? inTok : 0;
+      const safeCacheTok = Number.isFinite(cacheTok) && cacheTok > 0 ? cacheTok : 0;
+      const ctxTok = safeInTok + safeCacheTok;
+      const curModel = typeof step.model === "string" && step.model.trim() ? step.model.trim() : null;
+      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      const hasBlockingTool = calls.some(
+        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
+      );
+      const hasPlanModeTool = calls.some(
+        (c) => typeof c.name === "string" && PLAN_MODE_TOOLS.has(c.name)
+      );
       if (ctxTok > 0) {
         contextSum += ctxTok;
         contextCount += 1;
@@ -1052,14 +1106,77 @@ function analyzeTranscriptSessions(sessions) {
           multimodalHighCtxTurns += 1;
         }
         if (ctxTok >= 1e4) {
-          cacheHitSum += cacheTok / ctxTok;
+          cacheHitSum += safeCacheTok / ctxTok;
           cacheHitCount += 1;
         }
+        if (prevCacheCtxTok !== null) {
+          const isCompacted = prevCacheCtxTok >= 3e4 && ctxTok < prevCacheCtxTok * 0.78;
+          if (isCompacted) {
+            flushMissStreak();
+            cacheMissAttribution.compactionResets += 1;
+          } else if (prevCacheCtxTok >= 1e4 && ctxTok >= 1e4) {
+            const hitRate = safeCacheTok / ctxTok;
+            const retainedRatio = safeCacheTok / prevCacheCtxTok;
+            if (hitRate < 0.5 && retainedRatio < 0.75) {
+              cacheMissAttribution.total += 1;
+              missStreak += 1;
+              if (missStreak > cacheMissAttribution.maxConsecutiveMisses) {
+                cacheMissAttribution.maxConsecutiveMisses = missStreak;
+              }
+              const rawGapSec = prevCachePlannerMs !== null && tPlanner !== null ? (tPlanner - prevCachePlannerMs) / 1e3 : null;
+              const validGapSec = rawGapSec !== null && rawGapSec >= 0 ? rawGapSec : null;
+              if (prevCacheHadPlanSwitch || betweenCachePlanNotice) {
+                cacheMissAttribution.planModeSwitch += 1;
+              } else if (prevCacheModel && curModel && prevCacheModel !== curModel) {
+                cacheMissAttribution.modelSwitch += 1;
+              } else if (betweenCacheError) {
+                cacheMissAttribution.errorRetry += 1;
+              } else if (validGapSec !== null && validGapSec >= 60) {
+                if (betweenCacheUserInput || !prevCacheHadCalls || prevCacheHadBlockingTool) {
+                  cacheMissAttribution.idleOrWaitGap += 1;
+                } else {
+                  cacheMissAttribution.activeSlowGap += 1;
+                }
+              } else if (!prevCacheHadCalls && (betweenCacheSysMsg || betweenCacheUserInput)) {
+                cacheMissAttribution.asyncWakeupFast += 1;
+              } else {
+                cacheMissAttribution.fastReplicaOrPrefixMiss += 1;
+              }
+            } else {
+              flushMissStreak();
+              if (hitRate < 0.5 && retainedRatio >= 0.75) {
+                cacheMissAttribution.contextDilutionTurns += 1;
+              }
+            }
+          } else {
+            flushMissStreak();
+          }
+        }
+        prevCacheCtxTok = ctxTok;
+        prevCachePlannerMs = tPlanner;
+        prevCacheModel = curModel;
+        prevCacheHadCalls = calls.length > 0;
+        prevCacheHadBlockingTool = hasBlockingTool;
+        prevCacheHadPlanSwitch = hasPlanModeTool;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = step.status === "ERROR";
+      } else if (step.status === "ERROR") {
+        betweenCacheError = true;
+      } else {
+        flushMissStreak();
+        prevCacheCtxTok = null;
+        prevCachePlannerMs = null;
+        prevCacheModel = null;
+        prevCacheHadCalls = false;
+        prevCacheHadBlockingTool = false;
+        prevCacheHadPlanSwitch = false;
+        betweenCacheUserInput = false;
+        betweenCacheSysMsg = false;
+        betweenCachePlanNotice = false;
+        betweenCacheError = false;
       }
-      const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      const hasBlockingTool = calls.some(
-        (c) => typeof c.name === "string" && BLOCKING_TOOLS.has(c.name)
-      );
       const agyCallsThisTurn = [];
       let turnCorruptedAgyCalls = 0;
       if (calls.length > 0) {
@@ -1288,6 +1405,7 @@ function analyzeTranscriptSessions(sessions) {
         }
       }
     }
+    flushMissStreak();
     if (hasPlanner) {
       validSessions += 1;
       mediaLoadedCount += sessionMediaCount;
@@ -1342,7 +1460,8 @@ function analyzeTranscriptSessions(sessions) {
     avgContextTokens: contextCount > 0 ? Math.round(contextSum / contextCount) : 0,
     over150kContextRatio: contextCount > 0 ? over150kCount / contextCount : 0,
     avgCacheHitRate: cacheHitCount > 0 ? cacheHitSum / cacheHitCount : 0,
-    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0
+    over60sGapRatio: turnGapsTotal > 0 ? turnGapsOver60s / turnGapsTotal : 0,
+    cacheMissAttribution
   };
 }
 function round2(n) {
@@ -1579,6 +1698,7 @@ function formatMetricsMarkdown(m) {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
+    ...formatCacheMissRows(m.cacheMissAttribution),
     `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyMaxResultsCappedCalls} / ${m.agyErrorCalls} / ${m.agyVerifyFailedCalls} |`,
     ...m.agyUnpairedResultCalls > 0 ? [`| agy-fast unpaired results | ${m.agyUnpairedResultCalls} |`] : [],
@@ -1591,6 +1711,25 @@ function formatMetricsMarkdown(m) {
     `| Parallel batching leaks (same-MCP (diff-MCP) / multi-run_command) | ${m.multiSameMcpTurns} (${m.multiDiffMcpTurns}) / ${m.multiRunCommandTurns} |`,
     `| Multimodal >=180k turns (media loaded) | ${m.multimodalHighCtxTurns} (${m.mediaLoadedCount} media) |`
   ].join("\n");
+}
+function formatCacheMissRows(a) {
+  const rows = [];
+  if (a.total > 0 || a.compactionResets > 0 || a.contextDilutionTurns > 0) {
+    const extras = [];
+    if (a.modelSwitch > 0) extras.push(`model:${a.modelSwitch}`);
+    if (a.compactionResets > 0) extras.push(`compact:${a.compactionResets}`);
+    if (a.contextDilutionTurns > 0) extras.push(`dilute:${a.contextDilutionTurns}`);
+    const extraSuffix = extras.length > 0 ? `; ${extras.join(", ")}` : "";
+    rows.push(
+      `| Prompt Cache misses (active>=60s / idle>=60s / plan / err / async<60s / fast-other) | ${a.total} (${a.activeSlowGap} / ${a.idleOrWaitGap} / ${a.planModeSwitch} / ${a.errorRetry} / ${a.asyncWakeupFast} / ${a.fastReplicaOrPrefixMiss}${extraSuffix}) |`
+    );
+  }
+  if (a.sustainedCollapseRuns > 0) {
+    rows.push(
+      `| Sustained cache collapse (>=3 consecutive misses) | ${a.sustainedCollapseRuns} runs (${a.sustainedCollapseTurns} turns, max streak: ${a.maxConsecutiveMisses}) |`
+    );
+  }
+  return rows;
 }
 function formatDelta(before, after) {
   if (before === 0) return after === 0 ? "0.0%" : "n/a";
@@ -1613,6 +1752,12 @@ function formatCompareMarkdown(before, after) {
     `| Average context (tokens) | ${before.avgContextTokens} | ${after.avgContextTokens} | ${formatDelta(before.avgContextTokens, after.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(before.avgCacheHitRate)} | ${pct(after.avgCacheHitRate)} | ${formatDelta(before.avgCacheHitRate, after.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(before.over60sGapRatio)} | ${pct(after.over60sGapRatio)} | ${formatDelta(before.over60sGapRatio, after.over60sGapRatio)} |`,
+    ...before.cacheMissAttribution.total > 0 || after.cacheMissAttribution.total > 0 ? [
+      `| Prompt Cache misses (non-compact) | ${before.cacheMissAttribution.total} | ${after.cacheMissAttribution.total} | ${formatDelta(before.cacheMissAttribution.total, after.cacheMissAttribution.total)} |`
+    ] : [],
+    ...before.cacheMissAttribution.sustainedCollapseRuns > 0 || after.cacheMissAttribution.sustainedCollapseRuns > 0 ? [
+      `| Sustained cache collapse (>=3 misses) | ${before.cacheMissAttribution.sustainedCollapseRuns} runs (${before.cacheMissAttribution.sustainedCollapseTurns}t) | ${after.cacheMissAttribution.sustainedCollapseRuns} runs (${after.cacheMissAttribution.sustainedCollapseTurns}t) | - |`
+    ] : [],
     `| agy-fast MCP spills (output.txt) | ${before.mcpSpillCalls} | ${after.mcpSpillCalls} | ${formatDelta(before.mcpSpillCalls, after.mcpSpillCalls)} |`,
     `| agy-fast budget truncations | ${before.agyTruncatedCalls} | ${after.agyTruncatedCalls} | ${formatDelta(before.agyTruncatedCalls, after.agyTruncatedCalls)} |`,
     `| agy-fast maxResults caps | ${before.agyMaxResultsCappedCalls} | ${after.agyMaxResultsCappedCalls} | ${formatDelta(before.agyMaxResultsCappedCalls, after.agyMaxResultsCappedCalls)} |`,
@@ -1646,6 +1791,12 @@ function formatUsageSplitMarkdown(split) {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
+    ...overall.cacheMissAttribution.total > 0 ? [
+      `| Prompt Cache misses (non-compact) | ${overall.cacheMissAttribution.total} | ${wo.cacheMissAttribution.total} | ${wf.cacheMissAttribution.total} | ${formatDelta(wo.cacheMissAttribution.total, wf.cacheMissAttribution.total)} |`
+    ] : [],
+    ...overall.cacheMissAttribution.sustainedCollapseRuns > 0 ? [
+      `| Sustained cache collapse (>=3 misses) | ${overall.cacheMissAttribution.sustainedCollapseRuns} runs (${overall.cacheMissAttribution.sustainedCollapseTurns}t) | ${wo.cacheMissAttribution.sustainedCollapseRuns} runs (${wo.cacheMissAttribution.sustainedCollapseTurns}t) | ${wf.cacheMissAttribution.sustainedCollapseRuns} runs (${wf.cacheMissAttribution.sustainedCollapseTurns}t) | - |`
+    ] : [],
     `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}${overall.agyCliCalls > 0 ? `, cli:${overall.agyCliCalls}` : ""}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}${wf.agyCliCalls > 0 ? `, cli:${wf.agyCliCalls}` : ""}) | - |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyMaxResultsCappedCalls} / ${overall.agyErrorCalls} / ${overall.agyVerifyFailedCalls} | 0 / 0 / 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyMaxResultsCappedCalls} / ${wf.agyErrorCalls} / ${wf.agyVerifyFailedCalls} | - |`,
     ...overall.agyUnpairedResultCalls > 0 ? [
