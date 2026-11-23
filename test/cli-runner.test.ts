@@ -5,7 +5,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { runAgyFastCli } from "../src/cli-runner.js";
+import { runAgyFastCli, shouldCliExitNonZero } from "../src/cli-runner.js";
 
 const MCP_SERVER_SCRIPT = path.resolve(process.cwd(), "dist", "mcp-server.mjs");
 
@@ -250,5 +250,35 @@ describe("agy-fast --cli direct runner", () => {
     assert.equal(failedVerifyEdit.code, 1);
     assert.match(failedVerifyEdit.stdout, /Verify \[FAIL/);
     assert.match(failedVerifyEdit.stdout, /TYPE_ERR/);
+
+    // 5. shouldCliExitNonZero must flag `not run` even when failedCount === 0 (no "0 failed," segment)
+    assert.equal(
+      shouldCliExitNonZero("run_checks", {
+        text: "Checks: 1/2 passed, 1 not run (call time budget of 170s used up) (wall: 170000ms)",
+        isError: false,
+      }),
+      true,
+    );
+    assert.equal(
+      shouldCliExitNonZero("run_checks", {
+        text: "Checks: 1/2 passed, 1 failed (wall: 50ms)",
+        isError: false,
+      }),
+      true,
+    );
+    assert.equal(
+      shouldCliExitNonZero("run_checks", {
+        text: "Checks: 2/2 passed (wall: 50ms)",
+        isError: false,
+      }),
+      false,
+    );
+    assert.equal(
+      shouldCliExitNonZero("apply_edits", {
+        text: "Applied edits to 1 file(s):\n- a.ts\n\nVerify [PASS in 10ms] `npm test`:\nOK",
+        isError: false,
+      }),
+      false,
+    );
   });
 });

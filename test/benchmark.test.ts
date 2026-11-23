@@ -1624,5 +1624,68 @@ describe("benchmark analyzer & CLI", () => {
       formatCompareMarkdown(m, em),
       /agy-fast dispatch \(eager \/ lazy \/ cli\) \| 0 \/ 0 \/ 2 \| 1 \/ 0 \/ 2 \|/,
     );
+
+    // Verify Error: inside Verify [FAIL] or Checks failure body does NOT misclassify as agyErrorCalls,
+    // and quoted Windows/macOS plugin paths containing spaces are still recognized as --cli calls.
+    const quotedAndBodyErrorSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T09:10:00Z",
+          output_tokens: 120,
+          tool_calls: [
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  'node "C:\\Users\\John Doe\\.gemini\\config\\plugins\\agy-fast\\dist\\mcp-server.mjs" --cli outline src/a.ts',
+              },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node dist/mcp-server.mjs --cli edit --verify 'npm test' --json '{}'",
+              },
+            },
+            {
+              name: "run_command",
+              args: {
+                CommandLine: 'node dist/mcp-server.mjs --cli check "npm test"',
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:10:01Z",
+          content: "## Outline: src/a.ts (10 lines)\nL1-L3 [function] foo",
+        }),
+        JSON.stringify({
+          step_index: 3,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:10:02Z",
+          content:
+            "Command exited with code 1.\n\nCommand output:\nApplied edits to 1 file(s):\n- a.ts: updated\n\nVerify [FAIL (exit 1) in 45ms] `npm test`:\nError: expect(1).toBe(2)",
+        }),
+        JSON.stringify({
+          step_index: 4,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:10:03Z",
+          content:
+            "Command exited with code 1.\n\nCommand output:\nChecks: 0/1 passed, 1 failed (wall: 90ms)\n\n## [FAIL] test\nError: assertion failed",
+        }),
+      ].join("\n"),
+    );
+    const qm = analyzeTranscriptSessions([quotedAndBodyErrorSteps]);
+    assert.equal(qm.agyCliCalls, 3);
+    assert.equal(qm.agyFastToolCalls.quick_outline, 1);
+    assert.equal(qm.agyVerifyFailedCalls, 1);
+    assert.equal(qm.agyErrorCalls, 0);
   });
 });

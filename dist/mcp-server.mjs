@@ -8641,6 +8641,7 @@ function formatCliUsage() {
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
     "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "                          (modifiers before a query scope only to that query; trailing modifiers apply to all)",
     "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
     "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
     "",
@@ -9202,10 +9203,12 @@ async function runAgyFastCli(argv, io = {}) {
   }
   stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}
 `);
-  const cliFailed = result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|0\s+failed,\s+[1-9]\d*\s+not run)\b/.test(
+  return shouldCliExitNonZero(tool, result) ? 1 : 0;
+}
+function shouldCliExitNonZero(tool, result) {
+  return result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|[1-9]\d*\s+not run)\b/.test(
     result.text
   ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
-  return cliFailed ? 1 : 0;
 }
 
 // src/mcp-server.ts

@@ -644,7 +644,7 @@ function parseTranscriptJsonl(content) {
   }
   return steps;
 }
-var AGY_FAST_CLI_SEGMENT_RE = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:["']?(?:[^\s"']*[/\\])?node(?:\.exe)?["']?\s+)(?:--\S+\s+)*["']?(?:[^\s"']*[/\\])?mcp-server\.mjs["']?\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
+var AGY_FAST_CLI_SEGMENT_RE = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:(?:"[^"]*[/\\]?node(?:\.exe)?"|'[^']*[/\\]?node(?:\.exe)?'|(?:[^\s"']*[/\\])?node(?:\.exe)?)\s+)(?:--\S+\s+)*(?:"[^"]*[/\\]?mcp-server\.mjs"|'[^']*[/\\]?mcp-server\.mjs'|(?:[^\s"']*[/\\])?mcp-server\.mjs)\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
 var AGY_FAST_CLI_ALIAS_MAP = {
   search: "batch_search",
   batch_search: "batch_search",
@@ -1236,7 +1236,7 @@ function analyzeTranscriptSessions(sessions) {
           const isVerifyFailure = fastTool === "apply_edits" && !isSpill && AGY_VERIFY_FAILED_RE.test(body);
           const isNormalFailedCheckRun = fastTool === "run_checks" && cliExitCode !== null && cliExitCode !== 0 && /^Checks:\s+\d+\/\d+\s+passed,/.test(body);
           const isCliError = cliExitCode !== null && cliExitCode !== 0 && !isVerifyFailure && !isNormalFailedCheckRun;
-          const isError = resStep.status === "ERROR" || resStep.status === "INVALID" || isCliError || AGY_ERROR_HEAD_RE.test(body) || (call.name ?? "") === "run_command" && /^Error:/m.test(body);
+          const isError = resStep.status === "ERROR" || resStep.status === "INVALID" || isCliError || AGY_ERROR_HEAD_RE.test(body) || (call.name ?? "") === "run_command" && !isVerifyFailure && !isNormalFailedCheckRun && /^Error:/.test(body);
           if (isError) {
             agyErrorCalls += 1;
           } else if (isVerifyFailure) {

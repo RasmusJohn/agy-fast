@@ -893,7 +893,7 @@ export function parseTranscriptJsonl(content: string): TranscriptStep[] {
 }
 
 const AGY_FAST_CLI_SEGMENT_RE =
-  /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:["']?(?:[^\s"']*[/\\])?node(?:\.exe)?["']?\s+)(?:--\S+\s+)*["']?(?:[^\s"']*[/\\])?mcp-server\.mjs["']?\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
+  /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+)\s+)*)(?:(?:"[^"]*[/\\]?node(?:\.exe)?"|'[^']*[/\\]?node(?:\.exe)?'|(?:[^\s"']*[/\\])?node(?:\.exe)?)\s+)(?:--\S+\s+)*(?:"[^"]*[/\\]?mcp-server\.mjs"|'[^']*[/\\]?mcp-server\.mjs'|(?:[^\s"']*[/\\])?mcp-server\.mjs)\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?=\s|$)/i;
 
 const AGY_FAST_CLI_ALIAS_MAP: Record<string, string> = {
   search: "batch_search",
@@ -1619,7 +1619,10 @@ export function analyzeTranscriptSessions(
             resStep.status === "INVALID" ||
             isCliError ||
             AGY_ERROR_HEAD_RE.test(body) ||
-            ((call.name ?? "") === "run_command" && /^Error:/m.test(body));
+            ((call.name ?? "") === "run_command" &&
+              !isVerifyFailure &&
+              !isNormalFailedCheckRun &&
+              /^Error:/.test(body));
           if (isError) {
             agyErrorCalls += 1;
           } else if (isVerifyFailure) {
