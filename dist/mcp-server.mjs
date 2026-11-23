@@ -9502,12 +9502,11 @@ function buildApplyEditsToolDefinition(compat) {
   const preferStringEdits = compat.editsFormat === "string";
   const editsSchema = preferStringEdits ? {
     type: "string",
-    description: 'JSON array string of 1-50 files to edit or create: [{"path", "hunks"?: [{"target", "replacement", "startLine"?, "endLine"?, "replaceAll"?}], "create"?, "overwrite"?}]. A hunk replaces exact target text (optional 1-based line window; replaceAll replaces every occurrence in it); "create" writes the whole file instead of hunks, and "overwrite" allows replacing an existing file. A native array is also accepted, but this host version can deliver a long array of objects in call_mcp_tool Arguments as [] while a string arrives intact.'
+    description: 'JSON array string (1-50 files): [{"path","hunks"?:[{"target","replacement","startLine"?,"endLine"?,"replaceAll"?}],"create"?,"overwrite"?}]. Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create. Native arrays also work, but call_mcp_tool can turn long ones into [].'
   } : {
     type: "array",
     minItems: 1,
     maxItems: 50,
-    description: "Files to edit or create (a JSON array string of the same shape is also accepted).",
     items: {
       type: "object",
       properties: {
@@ -9517,72 +9516,42 @@ function buildApplyEditsToolDefinition(compat) {
           items: {
             type: "object",
             properties: {
-              target: { type: "string", description: "Exact text to replace." },
-              replacement: { type: "string", description: "Replacement text." },
-              startLine: {
-                type: "integer",
-                minimum: 1,
-                description: "Optional 1-based start line to narrow matching."
-              },
-              endLine: {
-                type: "integer",
-                minimum: 1,
-                description: "Optional 1-based end line to narrow matching."
-              },
-              replaceAll: {
-                type: "boolean",
-                description: "Replace every occurrence in range (default false)."
-              }
+              target: { type: "string" },
+              replacement: { type: "string" },
+              startLine: { type: "integer", minimum: 1 },
+              endLine: { type: "integer", minimum: 1 },
+              replaceAll: { type: "boolean" }
             },
             required: ["target", "replacement"]
           }
         },
-        create: {
-          type: "string",
-          description: "Create file with this full content instead of hunks."
-        },
-        overwrite: {
-          type: "boolean",
-          description: "Allow overwriting existing file when using 'create'."
-        }
+        create: { type: "string" },
+        overwrite: { type: "boolean" }
       },
       required: ["path"]
     }
   };
+  const baseDesc = `Atomic batch. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
   return {
     name: "apply_edits",
-    description: preferStringEdits ? "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command. Pass 'edits' as one JSON array string." : "Atomically apply multiple non-contiguous hunks across one or more files (all-or-nothing) with optional file creation and inline verify command.",
+    description: preferStringEdits ? baseDesc : `${baseDesc} edits accepts JSON array strings. Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
     inputSchema: {
       type: "object",
       properties: {
-        cwd: {
-          type: "string",
-          description: "Workspace root directory for relative file paths and verify command (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-        },
+        cwd: { type: "string" },
         edits: editsSchema,
-        dryRun: {
-          type: "boolean",
-          description: "Validate all hunks without writing files (default false)."
-        },
-        bestEffort: {
-          type: "boolean",
-          description: "When true, write valid files even if other files fail validation (each file remains atomic; failed files return closest-line snippets and verify is skipped until fixed). Default false (all-or-nothing)."
-        },
-        verify: {
-          type: "string",
-          description: "Optional shell command run right after writing (e.g. 'npm run typecheck')."
-        },
+        dryRun: { type: "boolean" },
+        bestEffort: { type: "boolean" },
+        verify: { type: "string" },
         verifyTimeoutSec: {
           type: "integer",
           minimum: 1,
-          maximum: MCP_CALL_BUDGET_SEC,
-          description: `Optional timeout in seconds for the verify command (default 60, max ${MCP_CALL_BUDGET_SEC}: agy drops MCP results after 180s).`
+          maximum: MCP_CALL_BUDGET_SEC
         },
         maxVerifyChars: {
           type: "integer",
           minimum: 300,
-          maximum: 7500,
-          description: "Optional character cap for verify output (default 4000; full response hard-capped <= 8800 UTF-8 bytes)."
+          maximum: 7500
         }
       },
       required: ["edits"]
@@ -9687,19 +9656,15 @@ function createAgyFastServer(options = {}) {
   server.registerTool(
     {
       name: "batch_search",
-      description: "Run multiple read-only text/regex searches, file globs, fuzzy path lookups, and read-only git queries (status/diff/log/show/branch) concurrently in one call with bounded output.",
+      description: "Parallel. Literal text, fuzzy paths. Glob */{a,b}, no |. Read-only git subcommand. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir. Text/regex glob filter. multiline spans lines (dot too). count/file=matching lines or multiline occurrences. Defaults outputMode=content, caseSensitive=true, contextLines=0, maxResults=40 matches/files, maxChars=8500. fileType lang/ext (text/regex/fuzzy). Glob sortBy=path (mtime newest). 8800 UTF-8 bytes total.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-          },
+          cwd: { type: "string" },
           queries: {
             type: "array",
             minItems: 1,
             maxItems: 20,
-            description: "List of search/glob/git queries to run concurrently.",
             items: {
               type: "object",
               properties: {
@@ -9707,62 +9672,24 @@ function createAgyFastServer(options = {}) {
                   type: "string",
                   enum: ["text", "regex", "glob", "fuzzy", "git"]
                 },
-                pattern: {
-                  type: "string",
-                  description: "Literal text, regex, fuzzy path query, glob pattern (use * and {a,b}, not regex |), or read-only git subcommand (e.g. 'status --short', 'log -n 5 --oneline')."
-                },
-                path: {
-                  type: "string",
-                  description: "Optional subdirectory or file relative to cwd."
-                },
-                glob: {
-                  type: "string",
-                  description: "Optional file filter glob for text/regex queries (e.g. '*.ts')."
-                },
-                multiline: {
-                  type: "boolean",
-                  description: "Allow text/regex to span lines. In multiline regex, dot matches newlines."
-                },
+                pattern: { type: "string" },
+                path: { type: "string" },
+                glob: { type: "string" },
+                multiline: { type: "boolean" },
                 outputMode: {
                   type: "string",
-                  enum: ["content", "files_with_matches", "count"],
-                  description: "Text/regex output (default content). Count reports matching lines per file, or occurrences in multiline mode."
+                  enum: ["content", "files_with_matches", "count"]
                 },
-                fileType: {
-                  type: "string",
-                  description: "Language or extension filter for text, regex, or fuzzy queries (e.g. typescript or ts)."
-                },
-                sortBy: {
-                  type: "string",
-                  enum: ["path", "mtime"],
-                  description: "Glob order (default path). Use mtime for newest first."
-                },
-                caseSensitive: {
-                  type: "boolean",
-                  description: "Case sensitivity for text/regex (default true)."
-                },
-                contextLines: {
-                  type: "integer",
-                  minimum: 0,
-                  maximum: 5,
-                  description: "Context lines around matches (default 0)."
-                },
-                maxResults: {
-                  type: "integer",
-                  minimum: 1,
-                  maximum: 200,
-                  description: "Max matches/files for this query (default 40)."
-                }
+                fileType: { type: "string" },
+                sortBy: { type: "string", enum: ["path", "mtime"] },
+                caseSensitive: { type: "boolean" },
+                contextLines: { type: "integer", minimum: 0, maximum: 5 },
+                maxResults: { type: "integer", minimum: 1, maximum: 200 }
               },
               required: ["type", "pattern"]
             }
           },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to avoid disk spills)."
-          }
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },
         required: ["queries"]
       }
@@ -9784,24 +9711,19 @@ function createAgyFastServer(options = {}) {
   server.registerTool(
     {
       name: "read_slices",
-      description: "Batch-extract symbol/section outlines (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML) across files (prefer 10-20 files/batch, max 40) in one call, plus optional tiny <=120-line slices. For reading >150 lines of known ranges, prefer parallel built-in read_file(StartLine, EndLine) (46KB/call inline, 0 remote check).",
+      description: "Batch outlines (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) + tiny <=120-line slices. For >150 known lines total, prefer parallel read_file(StartLine, EndLine) if available (agy: 46KB/call, no remote check). Absolute cwd if no roots/list (Desktop 2.0 Hub). slices: 1-based inclusive [start,end]; lineRanges: 'path:start-end,s2-e2'. maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-          },
+          cwd: { type: "string" },
           outlines: {
             type: "array",
             maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch for fuller outlines; max 40)."
+            items: { type: "string" }
           },
           slices: {
             type: "array",
             maxItems: 30,
-            description: "Optional tiny 1-based inclusive [startLine, endLine] ranges to piggyback (total response hard-capped <= 8800 UTF-8 bytes). For flat shorthand, you may also pass 'lineRanges'.",
             items: {
               type: "object",
               properties: {
@@ -9823,15 +9745,9 @@ function createAgyFastServer(options = {}) {
           lineRanges: {
             type: "array",
             maxItems: 30,
-            items: { type: "string" },
-            description: "Flat shorthand for tiny slices: 'path:start-end' or 'path:start1-end1,start2-end2' (e.g. 'src/server.ts:1-50,120-160')."
+            items: { type: "string" }
           },
-          maxChars: {
-            type: "integer",
-            minimum: 1e3,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes to prevent output.txt spills)."
-          }
+          maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         }
       }
     },
@@ -9844,27 +9760,18 @@ function createAgyFastServer(options = {}) {
   server.registerTool(
     {
       name: "quick_outline",
-      description: "Fast symbol/section outline extractor for unknown large files (TS/JS/HTML/Vue/Svelte/CSS/Python/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20 files/batch, max 40). Flat paths-only schema for mapping line ranges before parallel built-in read_file(StartLine, EndLine).",
+      description: "Fast symbol/section line-range outlines for large files (TS/JS/HTML/Vue/Svelte/CSS/Py/GDScript/Go/Rust/Java/MD/JSON/YAML; prefer 10-20, max 40) before parallel ranged read_file(StartLine, EndLine). Flat paths-only schema. Absolute cwd if no roots/list (Desktop 2.0 Hub). maxChars default 8500; 8800 UTF-8 bytes total.",
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-          },
+          cwd: { type: "string" },
           paths: {
             type: "array",
             minItems: 1,
             maxItems: 40,
-            items: { type: "string" },
-            description: "File paths to extract top-level symbol/section line ranges from (prefer 10-20 per batch; max 40)."
+            items: { type: "string" }
           },
-          maxChars: {
-            type: "integer",
-            minimum: 1e3,
-            maximum: 8800,
-            description: "Total character cap (default 8500; hard inline UTF-8 cap <= 8800 bytes)."
-          }
+          maxChars: { type: "integer", minimum: 1e3, maximum: 8800 }
         },
         required: ["paths"]
       }
@@ -9878,53 +9785,30 @@ function createAgyFastServer(options = {}) {
   server.registerTool(
     {
       name: "run_checks",
-      description: "Batch >=2 independent non-interactive shell commands concurrently under one check (for a single lightweight command, prefer native run_command). Defaults to outputMode 'compact' for pass/fail checks (build/typecheck/lint/test); use 'full' only when you need passing stdout (diagnostic/inspection scripts).",
+      description: `Batch >=2 independent non-interactive shell commands concurrently (for 1 lightweight command, prefer run_command). outputMode 'compact' (default) hides pass logs, keeps failures; 'full' keeps passing stdout. concurrency default 4. Per-cmd timeoutSec default 60; shared ${MCP_CALL_BUDGET_SEC}s budget (agy drops results at 180s; commands that cannot start are marked not run). Absolute cwd if no roots/list (Desktop 2.0 Hub); command.cwd overrides; name is label. maxChars default 8000; 8800 UTF-8 bytes total.`,
       inputSchema: {
         type: "object",
         properties: {
-          cwd: {
-            type: "string",
-            description: "Workspace root directory for relative paths (required if the host does not report MCP roots/list, e.g. Desktop 2.0 Hub)."
-          },
+          cwd: { type: "string" },
           commands: {
             type: "array",
             minItems: 1,
             maxItems: 12,
-            description: "Commands to execute concurrently.",
             items: {
               type: "object",
               properties: {
-                name: { type: "string", description: "Short label (e.g. 'typecheck')." },
-                command: { type: "string", description: "Shell command to run." },
-                cwd: { type: "string", description: "Optional working directory override." },
+                name: { type: "string" },
+                command: { type: "string" },
+                cwd: { type: "string" },
                 timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC }
               },
               required: ["command"]
             }
           },
-          concurrency: {
-            type: "integer",
-            minimum: 1,
-            maximum: 8,
-            description: "Max parallel commands (default 4)."
-          },
-          timeoutSec: {
-            type: "integer",
-            minimum: 1,
-            maximum: MCP_CALL_BUDGET_SEC,
-            description: `Default per-command timeout in seconds (default 60). All commands of one call share a ${MCP_CALL_BUDGET_SEC}s budget because agy drops MCP results after 180s; commands that cannot start within it are reported as not run.`
-          },
-          outputMode: {
-            type: "string",
-            enum: ["compact", "full"],
-            description: "Default 'compact' hides verbose pass logs while keeping failure details\u2014prefer 'compact' whenever you only need pass/fail; use 'full' only when you specifically need passing stdout (e.g. diagnostic/inspection scripts)."
-          },
-          maxChars: {
-            type: "integer",
-            minimum: 500,
-            maximum: 8800,
-            description: "Total character cap (default 8000; hard inline UTF-8 cap <= 8800 bytes)."
-          }
+          concurrency: { type: "integer", minimum: 1, maximum: 8 },
+          timeoutSec: { type: "integer", minimum: 1, maximum: MCP_CALL_BUDGET_SEC },
+          outputMode: { type: "string", enum: ["compact", "full"] },
+          maxChars: { type: "integer", minimum: 500, maximum: 8800 }
         },
         required: ["commands"]
       }
