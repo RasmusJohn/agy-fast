@@ -92,6 +92,20 @@ function offsetToLine(lineStarts: number[], offset: number): number {
   return Math.max(1, hi + 1);
 }
 
+function formatMatchLineRange(
+  lineStarts: number[],
+  offset: number,
+  length: number,
+  prefix = "L",
+): string {
+  const startLine = offsetToLine(lineStarts, offset);
+  const endOffset = length > 0 ? offset + length - 1 : offset;
+  const endLine = offsetToLine(lineStarts, endOffset);
+  return startLine === endLine
+    ? `${prefix}${startLine}`
+    : `${prefix}${startLine}-${prefix}${endLine}`;
+}
+
 function getLineWindowOffsets(
   text: string,
   lineStarts: number[],
@@ -353,7 +367,7 @@ function planHunksForContent(
         }
         if (globalOffsets.length > 0) {
           const hitLines = globalOffsets
-            .map((o) => `L${offsetToLine(lineStarts, o)}`)
+            .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length))
             .join(", ");
           hint = ` Exact match found outside range at ${hitLines} — adjust startLine/endLine or omit them.`;
         } else {
@@ -380,7 +394,7 @@ function planHunksForContent(
     if (foundOffsets.length > 1 && !hunk.replaceAll) {
       const lines = foundOffsets
         .slice(0, 10)
-        .map((o) => offsetToLine(lineStarts, o))
+        .map((o) => formatMatchLineRange(lineStarts, o, normTarget.length, ""))
         .join(", ");
       errors.push(
         `${displayPath} hunk #${idx + 1}: target matched ${foundOffsets.length} times (lines: ${lines}). Provide startLine/endLine, more surrounding context, or set replaceAll: true.`,
@@ -534,6 +548,95 @@ function corruptedEditsError(items: CorruptedItem[]): { text: string; isError: b
     }),
     isError: true,
   };
+}
+
+function formatBestEffortPartialResult(params: {
+  partialHeader: string;
+  errors: string[];
+  summaryLines: string[];
+  dryRun: boolean;
+  verifySkipped: boolean;
+  maxBytes: number;
+}): string {
+  const { partialHeader, errors, summaryLines, dryRun, verifySkipped, maxBytes } = params;
+  const failedHeading = dryRun
+    ? "Failed (fix only these):"
+    : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
+  const failedFull = `${failedHeading}\n- ${errors.join("\n- ")}`;
+  const appliedFull = `Applied:\n${summaryLines.join("\n")}`;
+  const verifyNote = verifySkipped
+    ? "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify."
+    : "";
+
+  const joinSections = (failedText: string, appliedText: string): string => {
+    const parts = [partialHeader, failedText, appliedText];
+    if (verifyNote) parts.push(verifyNote);
+    return parts.join("\n\n");
+  };
+
+  const fullText = joinSections(failedFull, appliedFull);
+  if (Buffer.byteLength(fullText, "utf8") <= maxBytes) {
+    return fullText;
+  }
+
+  const appliedVerb = dryRun ? "valid" : "written";
+  const minimalApplied = `Applied: ${summaryLines.length} file(s) ${appliedVerb} (list omitted to preserve failure diagnostics).`;
+
+  const fixedBytes =
+    Buffer.byteLength(partialHeader, "utf8") +
+    4 + // "\n\n" before failed + "\n\n" before applied
+    (verifyNote ? 2 + Buffer.byteLength(verifyNote, "utf8") : 0);
+
+  // Protect failure diagnostics first while reserving minimal space for the Applied summary
+  const minAppliedBytes = Math.min(
+    Buffer.byteLength(appliedFull, "utf8"),
+    Buffer.byteLength(minimalApplied, "utf8"),
+  );
+  const maxFailedBytes = Math.max(256, maxBytes - fixedBytes - minAppliedBytes);
+  const failedSection =
+    Buffer.byteLength(failedFull, "utf8") <= maxFailedBytes
+      ? failedFull
+      : truncateWithByteNotice(failedFull, maxFailedBytes);
+
+  const remainingForApplied =
+    maxBytes - fixedBytes - Buffer.byteLength(failedSection, "utf8");
+
+  let appliedSection = minimalApplied;
+  if (remainingForApplied >= Buffer.byteLength(appliedFull, "utf8")) {
+    appliedSection = appliedFull;
+  } else {
+    const appliedPrefix = "Applied:\n";
+    const keptLines: string[] = [];
+    let usedBytes = Buffer.byteLength(appliedPrefix, "utf8");
+
+    for (let i = 0; i < summaryLines.length; i++) {
+      const line = summaryLines[i]!;
+      const remainingCount = summaryLines.length - (i + 1);
+      const omitNotice =
+        remainingCount > 0
+          ? `\n... (+${remainingCount} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})`
+          : "";
+      const lineBytes = (keptLines.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+      if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > remainingForApplied) {
+        break;
+      }
+      keptLines.push(line);
+      usedBytes += lineBytes;
+    }
+
+    if (keptLines.length > 0) {
+      const omitted = summaryLines.length - keptLines.length;
+      appliedSection =
+        omitted > 0
+          ? `${appliedPrefix}${keptLines.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})`
+          : `${appliedPrefix}${keptLines.join("\n")}`;
+    }
+  }
+
+  const assembled = joinSections(failedSection, appliedSection);
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes
+    ? assembled
+    : truncateWithByteNotice(assembled, maxBytes);
 }
 
 export async function runApplyEdits(
@@ -918,21 +1021,15 @@ export async function runApplyEdits(
     const partialHeader = input.dryRun
       ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):`
       : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed — do NOT re-send applied files):`;
-    const partialParts = [
-      partialHeader,
-      `Applied:\n${summaryLines.join("\n")}`,
-      `Failed (fix only these):\n- ${errors.join("\n- ")}`,
-    ];
-    if (!input.dryRun && input.verify) {
-      partialParts.push(
-        "Verify skipped because failed file(s) remain; fix only the failed file(s) and re-run verify.",
-      );
-    }
     return {
-      text: truncateWithByteNotice(
-        partialParts.join("\n\n"),
-        DEFAULT_INLINE_MAX_BYTES,
-      ),
+      text: formatBestEffortPartialResult({
+        partialHeader,
+        errors,
+        summaryLines,
+        dryRun: Boolean(input.dryRun),
+        verifySkipped: Boolean(!input.dryRun && input.verify),
+        maxBytes: DEFAULT_INLINE_MAX_BYTES,
+      }),
       isError: true,
     };
   }

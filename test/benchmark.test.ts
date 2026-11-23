@@ -10,7 +10,9 @@ import {
   analyzeTranscriptSessions,
   collectTranscriptFiles,
   filterStepsByTime,
+  formatCompareMarkdown,
   formatMetricsMarkdown,
+  formatUsageSplitMarkdown,
   parseTranscriptJsonl,
 } from "../src/benchmark-core.js";
 
@@ -1064,7 +1066,8 @@ describe("benchmark analyzer & CLI", () => {
     const edgeMetrics = analyzeTranscriptSessions([edgeSteps]);
     assert.equal(edgeMetrics.readonlySearchRunCommandCalls, 5);
     assert.equal(edgeMetrics.agyCorruptedArgCalls, 2); // read_slices ranges:true + direct stringified edits:[false, true]
-    assert.equal(edgeMetrics.agyTruncatedCalls, 1); // `[truncated; showing 30 files]`
+    assert.equal(edgeMetrics.agyTruncatedCalls, 0);
+    assert.equal(edgeMetrics.agyMaxResultsCappedCalls, 1); // `[truncated; showing 30 files]`
     assert.equal(edgeMetrics.consecutiveSingleChainsExtraTurns, 0); // read_slices -> apply_edits are different tools
 
     // 3. --since slicing after coordinator's initial USER_INPUT must NOT misclassify coordinator as a swarm worker,
@@ -1119,12 +1122,358 @@ describe("benchmark analyzer & CLI", () => {
           created_at: "2026-11-20T11:00:02Z",
           content: "HEAD\n... [truncated: folded 1200 middle chars; total 2000 chars] ...\nTAIL",
         }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-20T11:00:02Z",
+          status: "ERROR",
+          content: "Encountered error in step execution: Validation failed",
+        }),
       ].join("\n"),
     );
     const outlineMetrics = analyzeTranscriptSessions([outlineSteps]);
     assert.equal(outlineMetrics.agyFastToolCalls.quick_outline, 2);
+    assert.equal(outlineMetrics.agyEagerCalls, 1);
+    assert.equal(outlineMetrics.agyLazyCalls, 1);
     assert.equal(outlineMetrics.agyCorruptedArgCalls, 1);
     assert.equal(outlineMetrics.agyTruncatedCalls, 1);
+    assert.equal(outlineMetrics.agyErrorCalls, 1);
+    assert.equal(outlineMetrics.multiSameMcpTurns, 1);
+    assert.equal(outlineMetrics.multiDiffMcpTurns, 0);
+    assert.equal(outlineMetrics.multiMcpTurns, 1);
     assert.match(formatMetricsMarkdown(outlineMetrics), /outline:2/);
+  });
+
+  it("pairs out-of-order parallel tool results deterministically and prevents false spills/truncs/errors", () => {
+    // 1. Out-of-order parallel GENERIC steps: planner 1227 with 4 calls finishes as [1231 (INVALID MCP), 1228, 1229, 1230]
+    const outOfOrderSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1227,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T03:49:42Z",
+          output_tokens: 200,
+          tool_calls: [
+            { name: "read_file", args: { Path: "/repo/a.ts" } },
+            { name: "read_file", args: { Path: "/repo/b.ts" } },
+            { name: "read_file", args: { Path: "/repo/c.ts" } },
+            {
+              name: "call_mcp_tool",
+              args: { ServerName: '"agy-fast_fast"', ToolName: '"batch_search"', Arguments: "{}" },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 1231,
+          type: "GENERIC",
+          status: "INVALID",
+          error: 'unknown tool: "call_mcp_tool" — check spelling',
+          created_at: "2026-11-22T03:49:51Z",
+          content:
+            'Created At: 2026-11-22T11:49:51+08:00\nCompleted At: 2026-11-22T11:49:52+08:00\nError invalid tool call: unknown tool: "call_mcp_tool" — check spelling',
+        }),
+        JSON.stringify({
+          step_index: 1228,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T03:49:50Z",
+          content: "Showing lines 1-50 of 50\n1: export const a = 1;",
+        }),
+        JSON.stringify({
+          step_index: 1229,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T03:49:50Z",
+          content: "Showing lines 1-50 of 50\n1: export const b = 2;",
+        }),
+        JSON.stringify({
+          step_index: 1230,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T03:49:50Z",
+          content: "Showing lines 1-50 of 50\n1: export const c = 3;",
+        }),
+        JSON.stringify({
+          step_index: 1232,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T03:49:53Z",
+          output_tokens: 100,
+          tool_calls: [],
+        }),
+      ].join("\n"),
+    );
+
+    const oooMetrics = analyzeTranscriptSessions([outOfOrderSteps]);
+    assert.equal(oooMetrics.agyErrorCalls, 1);
+    assert.equal(oooMetrics.agyUnpairedResultCalls, 0);
+    assert.equal(oooMetrics.agyLazyCalls, 1);
+    assert.equal(oooMetrics.agyEagerCalls, 0);
+    // Min/max generic timestamps: min=03:49:50 (+8s llm), max=03:49:51 (+1s spread), nextPlanner=03:49:53 (+2s exec)
+    assert.equal(oooMetrics.llmTimeSec, 8);
+    assert.equal(oooMetrics.streamWaitSec, 1);
+    assert.equal(oooMetrics.toolExecTimeSec, 2);
+    assert.equal(oooMetrics.activeTimeSec, 11);
+
+    // 2. Unpaired step_index must never silently misattribute another tool's result
+    const unpairedSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 50,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T04:00:00Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "read_file", args: { Path: "/repo/a.ts" } },
+            { name: "mcp_agy-fast_fast_batch_search", args: { queries: [] } },
+          ],
+        }),
+        // Only step_index 51 (read_file) exists; step_index 52 (batch_search) is missing!
+        // Even though step 51 contains a spill banner, it must NOT be attributed to callIdx 1.
+        JSON.stringify({
+          step_index: 51,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T04:00:01Z",
+          content: "The output was large and was saved to: file:///tmp/output.txt",
+        }),
+      ].join("\n"),
+    );
+    const unpairedMetrics = analyzeTranscriptSessions([unpairedSteps]);
+    assert.equal(unpairedMetrics.mcpSpillCalls, 0);
+    assert.equal(unpairedMetrics.agyErrorCalls, 0);
+    assert.equal(unpairedMetrics.agyUnpairedResultCalls, 1);
+
+    // 3. Explicit tool call ID pairing overrides JSONL append order
+    const idPairedSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T04:05:00Z",
+          output_tokens: 100,
+          tool_calls: [
+            { id: "call-read", name: "read_file", args: { Path: "/repo/a.ts" } },
+            { id: "call-fast", name: "mcp_agy-fast_fast_batch_search", args: { queries: [] } },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          tool_call_id: "call-fast",
+          status: "DONE",
+          created_at: "2026-11-22T04:05:02Z",
+          content:
+            "Created At: 2026-11-22T12:05:02+08:00\nCompleted At: 2026-11-22T12:05:02+08:00\nThe tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/steps/2/output.txt.\n\nHere is a preview...",
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          tool_call_id: "call-read",
+          status: "DONE",
+          created_at: "2026-11-22T04:05:01Z",
+          content: "Showing lines 1-5 of 5\n1: ok",
+        }),
+      ].join("\n"),
+    );
+    const idPairedMetrics = analyzeTranscriptSessions([idPairedSteps]);
+    assert.equal(idPairedMetrics.mcpSpillCalls, 1);
+    assert.equal(idPairedMetrics.agyTruncatedCalls, 0);
+    assert.equal(idPairedMetrics.agyUnpairedResultCalls, 0);
+
+    // 4. Searching benchmark-core.ts source code & run_checks test names must produce 0 false spills/truncs/errors
+    const noFalsePositivesSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 10,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T04:10:00Z",
+          output_tokens: 150,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_batch_search", args: { queries: [{ type: "regex", pattern: "truncated" }] } },
+            { name: "mcp_agy-fast_fast_run_checks", args: { commands: [{ name: "test", command: "npm test" }] } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 11,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T04:10:01Z",
+          content: [
+            "Created At: 2026-11-22T12:10:01+08:00",
+            "Completed At: 2026-11-22T12:10:02+08:00",
+            "## Query 1 [text] The output was large and was saved to:",
+            "src/benchmark-core.ts",
+            '  1298:           resText.includes("The output was large and was saved to:") ||',
+            '  1299:           (/output was truncated/i.test(resText) && resText.includes("output.txt"));',
+            '  1303:           resText.includes("[truncated:") ||',
+            '  1304:           resText.includes("[truncated at ") ||',
+            '  1305:           resText.includes("[truncated; showing ")',
+            '  1311:           resText.includes("Encountered error in step execution") ||',
+            '  1312:           resText.includes("Partial edit applied") ||',
+            '  1313:           resText.includes("Atomic edit aborted")',
+          ].join("\n"),
+        }),
+        JSON.stringify({
+          step_index: 12,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T04:10:02Z",
+          content: [
+            "Created At: 2026-11-22T12:10:02+08:00",
+            "Completed At: 2026-11-22T12:10:03+08:00",
+            "Checks: 1/1 passed (wall: 250ms)",
+            "",
+            "[PASS] test (240ms): ✔ handles [truncated: showed 10 of 20 bytes] and output was truncated -> output.txt",
+          ].join("\n"),
+        }),
+      ].join("\n"),
+    );
+    const cleanMetrics = analyzeTranscriptSessions([noFalsePositivesSteps]);
+    assert.equal(cleanMetrics.mcpSpillCalls, 0);
+    assert.equal(cleanMetrics.agyTruncatedCalls, 0);
+    assert.equal(cleanMetrics.agyMaxResultsCappedCalls, 0);
+    assert.equal(cleanMetrics.agyErrorCalls, 0);
+    assert.equal(cleanMetrics.agyVerifyFailedCalls, 0);
+    // batch_search + run_checks in one turn is a valid diff-MCP turn, NOT a same-MCP leak
+    assert.equal(cleanMetrics.multiSameMcpTurns, 0);
+    assert.equal(cleanMetrics.multiDiffMcpTurns, 1);
+    assert.equal(cleanMetrics.multiMcpTurns, 1);
+    assert.equal(cleanMetrics.agyEagerCalls, 2);
+    assert.equal(cleanMetrics.agyLazyCalls, 0);
+
+    // 5. Split budget truncation vs maxResults caps, apply_edits Verify FAIL/TIMEOUT,
+    //    same-MCP vs diff-MCP parallel turns, eager vs lazy dispatch, and markdown formatting
+    const splitMetricsSteps = parseTranscriptJsonl(
+      [
+        // Turn 1: same-MCP parallel leak (2 eager batch_search calls: 1 budget-truncated, 1 maxResults-capped)
+        JSON.stringify({
+          step_index: 20,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T05:00:00Z",
+          output_tokens: 200,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_batch_search", args: { queries: [{ type: "text", pattern: "a" }] } },
+            { name: "mcp_agy-fast_fast_batch_search", args: { queries: [{ type: "text", pattern: "b" }] } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 21,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:01Z",
+          content: "## Query 1\nfile.ts\n  1: a\n... [truncated: showed 4000 of 9000 bytes]",
+        }),
+        JSON.stringify({
+          step_index: 22,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:01Z",
+          content: "## Query 1\nfile.ts\n  1: b\n... [truncated at 40 matches]",
+        }),
+        // Turn 2: diff-MCP turn (lazy batch_search with showing-cap + eager apply_edits with Verify FAIL)
+        JSON.stringify({
+          step_index: 23,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T05:00:05Z",
+          output_tokens: 200,
+          tool_calls: [
+            { name: "call_mcp_tool", args: { ServerName: '"agy-fast_fast"', ToolName: '"batch_search"', Arguments: "{}" } },
+            { name: "mcp_agy-fast_fast_apply_edits", args: { edits: [{ path: "a.ts", hunks: [{ target: "a", replacement: "b" }] }] } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 24,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:06Z",
+          content: "## Query 1\na.ts\n... [truncated; showing 40 files]",
+        }),
+        JSON.stringify({
+          step_index: 25,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:07Z",
+          content:
+            "Created At: 2026-11-22T13:00:06+08:00\nCompleted At: 2026-11-22T13:00:07+08:00\nApplied edits to 1 file(s):\n- a.ts: updated (1 match), lines +0\n\nVerify [FAIL (exit 1) in 420ms] `npm run typecheck`:\nsrc/a.ts(1,1): error TS2322",
+        }),
+        // Turn 3: lazy apply_edits with Verify TIMEOUT
+        JSON.stringify({
+          step_index: 26,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T05:00:10Z",
+          output_tokens: 150,
+          tool_calls: [
+            { name: "call_mcp_tool", args: { ServerName: '"agy-fast_fast"', ToolName: '"apply_edits"', Arguments: "{}" } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 27,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:12Z",
+          content:
+            "Applied edits to 1 file(s):\n- a.ts: updated (1 match), lines +0\n\nVerify [TIMEOUT in 60000ms] `npm test`:\nTIMED OUT",
+        }),
+        // Turn 4: eager apply_edits with Verify PASS (must NOT increment agyVerifyFailedCalls or agyErrorCalls)
+        JSON.stringify({
+          step_index: 28,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-22T05:00:15Z",
+          output_tokens: 100,
+          tool_calls: [
+            { name: "mcp_agy-fast_fast_apply_edits", args: { edits: [{ path: "a.ts", hunks: [{ target: "b", replacement: "c" }] }] } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 29,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-22T05:00:16Z",
+          content:
+            "Applied edits to 1 file(s):\n- a.ts: updated (1 match), lines +0\n\nVerify [PASS in 180ms] `npm run typecheck`:\nOK",
+        }),
+      ].join("\n"),
+    );
+
+    const sm = analyzeTranscriptSessions([splitMetricsSteps]);
+    assert.equal(sm.mcpSpillCalls, 0);
+    assert.equal(sm.agyTruncatedCalls, 1);
+    assert.equal(sm.agyMaxResultsCappedCalls, 2); // `[truncated at 40 matches]` + `[truncated; showing 40 files]`
+    assert.equal(sm.agyErrorCalls, 0);
+    assert.equal(sm.agyVerifyFailedCalls, 2); // Verify FAIL + Verify TIMEOUT
+    assert.equal(sm.agyUnpairedResultCalls, 0);
+    assert.equal(sm.multiSameMcpTurns, 1);
+    assert.equal(sm.multiDiffMcpTurns, 1);
+    assert.equal(sm.multiMcpTurns, 2);
+    assert.equal(sm.agyEagerCalls, 4);
+    assert.equal(sm.agyLazyCalls, 2);
+
+    const md = formatMetricsMarkdown(sm);
+    assert.match(md, /eager:4, lazy:2/);
+    assert.match(
+      md,
+      /agy-fast health \(spills \/ budget-truncs \/ max-results \/ errs \/ verify-fails\) \| 0 \/ 1 \/ 2 \/ 0 \/ 2 \|/,
+    );
+    assert.match(
+      md,
+      /Parallel batching leaks \(same-MCP \(diff-MCP\) \/ multi-run_command\) \| 1 \(1\) \/ 0 \|/,
+    );
+
+    const cmpMd = formatCompareMarkdown(cleanMetrics, sm);
+    assert.match(cmpMd, /agy-fast budget truncations \| 0 \| 1 \|/);
+    assert.match(cmpMd, /agy-fast maxResults caps \| 0 \| 2 \|/);
+    assert.match(cmpMd, /agy-fast verify failures \| 0 \| 2 \|/);
+    assert.match(cmpMd, /agy-fast dispatch \(eager \/ lazy\) \| 2 \/ 0 \| 4 \/ 2 \|/);
+    assert.match(cmpMd, /Parallel leaks \(same-MCP \(diff-MCP\) \/ multi-run_command\) \| 0 \(1\) \/ 0 \| 1 \(1\) \/ 0 \|/);
+
+    const splitUsageMd = formatUsageSplitMarkdown({
+      overall: sm,
+      withAgyFast: sm,
+      withoutAgyFast: analyzeTranscriptSessions([]),
+    });
+    assert.match(
+      splitUsageMd,
+      /agy-fast health \(spills \/ budget-truncs \/ max-results \/ errs \/ verify-fails\) \| 0 \/ 1 \/ 2 \/ 0 \/ 2 \| 0 \/ 0 \/ 0 \/ 0 \/ 0 \| 0 \/ 1 \/ 2 \/ 0 \/ 2 \|/,
+    );
+    assert.match(
+      splitUsageMd,
+      /Parallel leaks \(same-MCP \(diff-MCP\) \/ multi-run_command\) \| 1 \(1\) \/ 0 \| 0 \(0\) \/ 0 \| 1 \(1\) \/ 0 \|/,
+    );
   });
 });

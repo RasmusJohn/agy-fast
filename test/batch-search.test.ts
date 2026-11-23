@@ -952,4 +952,312 @@ describe("batch_search", () => {
       await fs.rm(edgeDir, { recursive: true, force: true });
     }
   });
+
+  it("windows long-line matches past col 240 with accurate CJK/emoji offsets and surrogate safety (rg and Node fallback parity)", async () => {
+    const longDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-longline-"));
+    try {
+      const longLines = [
+        `# Doc ${"alpha ".repeat(110)}EXACT_COL650_PHRASE${" tail".repeat(40)}`,
+        `prefix ${"beta ".repeat(60)}CaseMixed_Regex_777${" end".repeat(50)}`,
+        `short_prefix_NEEDLE_EARLY ${"pad".repeat(120)}`,
+        `${"x".repeat(520)}END_OF_LINE_ANCHOR`,
+        `a${"🚀".repeat(160)}a${"中文前缀".repeat(30)}🎯CJK_EMOJI_TARGET🎉${"🎉".repeat(160)}`,
+        `ctx_long_line_${"c".repeat(300)}`,
+        `${"m".repeat(300)}MULTI_LINE_START`,
+        `MULTI_LINE_END${"n".repeat(300)}`,
+      ];
+      await fs.writeFile(path.join(longDir, "long-md.md"), `${longLines.join("\n")}\n`, "utf8");
+
+      const queries = [
+        { type: "text" as const, pattern: "EXACT_COL650_PHRASE", path: "long-md.md" },
+        { type: "regex" as const, pattern: "casemixed_regex_\\d+", caseSensitive: false, path: "long-md.md" },
+        { type: "text" as const, pattern: "NEEDLE_EARLY", path: "long-md.md" },
+        { type: "text" as const, pattern: "END_OF_LINE_ANCHOR", path: "long-md.md" },
+        { type: "text" as const, pattern: "🎯CJK_EMOJI_TARGET🎉", path: "long-md.md", contextLines: 1 },
+        { type: "regex" as const, pattern: "MULTI_LINE_START\\nMULTI_LINE_END", multiline: true, path: "long-md.md" },
+      ];
+
+      const rgRes = await runBatchSearch({ cwd: longDir, queries });
+      const nodeRes = await runBatchSearch({ cwd: longDir, queries }, { forceNodeFallback: true });
+
+      assert.equal(rgRes.isError, false);
+      assert.equal(nodeRes.isError, false);
+      assert.equal(rgRes.text, nodeRes.text, "rg and Node fallback long-line windowing must match exactly");
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(rgRes.text),
+        false,
+        "windowed output must not contain lone UTF-16 surrogates",
+      );
+
+      const sections = rgRes.text.split("\n\n");
+      assert.equal(sections.length, 6);
+
+      // Q1: match past col 650 is windowed with leading + trailing "..." and visible
+      const q1Line = sections[0]!.split("\n").find((l) => l.startsWith("  1: "));
+      assert.ok(q1Line, sections[0]);
+      assert.match(q1Line, /^  1: \.\.\..*EXACT_COL650_PHRASE.*\.\.\.$/);
+      assert.ok(q1Line.length <= 260, `Expected compact window, got ${q1Line.length} chars`);
+
+      // Q2: case-insensitive regex past col 300 is visible
+      const q2Line = sections[1]!.split("\n").find((l) => l.startsWith("  2: "));
+      assert.ok(q2Line, sections[1]);
+      assert.match(q2Line, /^  2: \.\.\..*CaseMixed_Regex_777.*\.\.\.$/);
+
+      // Q3: match inside [0, 240] preserves exact prefix truncation (no leading "...")
+      const q3Line = sections[2]!.split("\n").find((l) => l.startsWith("  3: "));
+      assert.ok(q3Line, sections[2]);
+      assert.match(q3Line, /^  3: short_prefix_NEEDLE_EARLY .*\.\.\.$/);
+      assert.doesNotMatch(q3Line, /^  3: \.\.\./);
+
+      // Q4: match at end of long line has leading "..." and no trailing "..."
+      const q4Line = sections[3]!.split("\n").find((l) => l.startsWith("  4: "));
+      assert.ok(q4Line, sections[3]);
+      assert.match(q4Line, /^  4: \.\.\..*END_OF_LINE_ANCHOR$/);
+      assert.doesNotMatch(q4Line, /\.\.\.$/);
+
+      // Q5: CJK + 4-byte emoji UTF-8 byte-to-UTF-16 conversion accuracy + context line prefix trimming
+      const q5MatchLine = sections[4]!.split("\n").find((l) => l.startsWith("  5: "));
+      const q5CtxLine = sections[4]!.split("\n").find((l) => l.startsWith("  6- "));
+      assert.ok(q5MatchLine, sections[4]);
+      assert.match(q5MatchLine, /^  5: \.\.\..*🎯CJK_EMOJI_TARGET🎉.*\.\.\.$/);
+      assert.ok(q5CtxLine, sections[4]);
+      assert.match(q5CtxLine, /^  6- ctx_long_line_c+\.\.\.$/);
+      assert.ok(q5CtxLine.length <= 255, `Expected context prefix trim <= 255, got ${q5CtxLine.length}`);
+
+      // Q6: multiline match across two long lines windows line 7 around MULTI_LINE_START and keeps line 8 prefix
+      const q6Line7 = sections[5]!.split("\n").find((l) => l.startsWith("  7: "));
+      const q6Line8 = sections[5]!.split("\n").find((l) => l.startsWith("  8: "));
+      assert.ok(q6Line7, sections[5]);
+      assert.ok(q6Line8, sections[5]);
+      assert.match(q6Line7, /^  7: \.\.\..*MULTI_LINE_START$/);
+      assert.match(q6Line8, /^  8: MULTI_LINE_ENDn+\.\.\.$/);
+    } finally {
+      await fs.rm(longDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prevents multi-file starvation under tight budgets, avoids orphan context, and reports omitted files cleanly", async () => {
+    const budgetDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-budget-fair-"));
+    try {
+      // Helper to verify every rendered file block has >=1 real match and zero orphan context lines
+      const assertNoOrphanContext = (sectionText: string, ctxRadius: number) => {
+        const lines = sectionText.split("\n").slice(1); // skip "## Query ..."
+        let currentFile: string | null = null;
+        let matchNums: number[] = [];
+        let ctxNums: number[] = [];
+        const flush = () => {
+          if (!currentFile) return;
+          assert.ok(
+            matchNums.length > 0,
+            `File ${currentFile} rendered with 0 real match lines:\n${sectionText}`,
+          );
+          for (const cLn of ctxNums) {
+            const attached = matchNums.some((mLn) => Math.abs(cLn - mLn) <= ctxRadius);
+            assert.ok(
+              attached,
+              `Orphan context line ${cLn} in ${currentFile} (matches: ${matchNums.join(",")}):\n${sectionText}`,
+            );
+          }
+        };
+        for (const line of lines) {
+          if (line.startsWith("... [")) {
+            flush();
+            currentFile = null;
+            matchNums = [];
+            ctxNums = [];
+            continue;
+          }
+          if (line.startsWith("  ... (+")) continue;
+          const m = /^  (\d+)([:-]) /.exec(line);
+          if (m) {
+            const ln = Number(m[1]);
+            if (m[2] === ":") matchNums.push(ln);
+            else ctxNums.push(ln);
+          } else if (line.trim().length > 0) {
+            flush();
+            currentFile = line.trim();
+            matchNums = [];
+            ctxNums = [];
+          }
+        }
+        flush();
+      };
+
+      // 1. Exact 4-file `return ` with contextLines: 2 under tight maxChars (repro of file starvation bug)
+      const fourDir = path.join(budgetDir, "four");
+      await fs.mkdir(fourDir, { recursive: true });
+      for (const name of ["a.ts", "b.ts", "c.ts", "d.ts"]) {
+        const chunks: string[] = [];
+        for (let k = 1; k <= 8; k++) {
+          chunks.push(
+            `// ${name} fn${k} before-2 padding-text-for-context`,
+            `function ${name[0]}Fn${k}(arg: string) {`,
+            `  return "${name}_val_${k}_" + arg;`,
+            `}`,
+            `// ${name} fn${k} after-2 padding-text-for-context`,
+            `// separator ${k}`,
+          );
+        }
+        await fs.writeFile(path.join(fourDir, name), `${chunks.join("\n")}\n`, "utf8");
+      }
+
+      const fourQuery = [{ type: "text" as const, pattern: "return ", contextLines: 2, maxResults: 40 }];
+      const rgFour = await runBatchSearch({ cwd: fourDir, maxChars: 1200, queries: fourQuery });
+      const nodeFour = await runBatchSearch(
+        { cwd: fourDir, maxChars: 1200, queries: fourQuery },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgFour.isError, false);
+      assert.equal(rgFour.text, nodeFour.text, "4-file budgeted output must match between rg and Node fallback");
+      assert.ok(rgFour.text.length <= 1200, `Expected <= 1200 chars, got ${rgFour.text.length}`);
+      for (const name of ["a.ts", "b.ts", "c.ts", "d.ts"]) {
+        assert.ok(rgFour.text.includes(`\n${name}\n`), `Expected ${name} to be shown:\n${rgFour.text}`);
+        assert.ok(rgFour.text.includes(`${name}_val_1_`), `Expected first match of ${name}:\n${rgFour.text}`);
+      }
+      assert.match(rgFour.text, /\(\+\d+ more match/);
+      assert.match(rgFour.text, /\.\.\. \[truncated: showed \d+ of 32 matches across 4 files\]/);
+      assertNoOrphanContext(rgFour.text, 2);
+
+      // 2. All matches fit, only context lines omitted (verifies context-after-matches priority + zero orphans)
+      const ctxOnlyDir = path.join(budgetDir, "ctx-only");
+      await fs.mkdir(ctxOnlyDir, { recursive: true });
+      for (const name of ["f1.ts", "f2.ts", "f3.ts", "f4.ts"]) {
+        const lines = [
+          `// ${name} pre2 ${"p".repeat(90)}`,
+          `// ${name} pre1 ${"q".repeat(90)}`,
+          `return "${name}_m1";`,
+          `// ${name} post1 ${"r".repeat(90)}`,
+          `// ${name} post2 ${"s".repeat(90)}`,
+          `// gap`,
+          `// ${name} pre2b ${"t".repeat(90)}`,
+          `// ${name} pre1b ${"u".repeat(90)}`,
+          `return "${name}_m2";`,
+          `// ${name} post1b ${"v".repeat(90)}`,
+          `// ${name} post2b ${"w".repeat(90)}`,
+        ];
+        await fs.writeFile(path.join(ctxOnlyDir, name), `${lines.join("\n")}\n`, "utf8");
+      }
+      const ctxOnlyQuery = [{ type: "text" as const, pattern: "return ", contextLines: 2 }];
+      const rgCtxOnly = await runBatchSearch({ cwd: ctxOnlyDir, maxChars: 900, queries: ctxOnlyQuery });
+      const nodeCtxOnly = await runBatchSearch(
+        { cwd: ctxOnlyDir, maxChars: 900, queries: ctxOnlyQuery },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgCtxOnly.text, nodeCtxOnly.text);
+      assert.ok(rgCtxOnly.text.length <= 900);
+      for (const name of ["f1.ts", "f2.ts", "f3.ts", "f4.ts"]) {
+        assert.ok(rgCtxOnly.text.includes(`${name}_m1`), rgCtxOnly.text);
+        assert.ok(rgCtxOnly.text.includes(`${name}_m2`), rgCtxOnly.text);
+      }
+      assert.match(rgCtxOnly.text, /showed all 8 matches across 4 files; omitted context lines/);
+      assertNoOrphanContext(rgCtxOnly.text, 2);
+
+      // 3. Extreme many-file truncation where not all files fit 1 match line (including CJK UTF-8 byte ceiling)
+      const manyFilesDir = path.join(budgetDir, "many-files");
+      await fs.mkdir(manyFilesDir, { recursive: true });
+      for (let i = 0; i < 65; i++) {
+        const file = `mod_${String(i).padStart(2, "0")}.ts`;
+        const content = [
+          `export const v1_${i} = "MANY_FILE_TOKEN_中文测试数据_${i}_a_${"填充".repeat(20)}";`,
+          `export const v2_${i} = "MANY_FILE_TOKEN_中文测试数据_${i}_b_${"填充".repeat(20)}";`,
+          `export const v3_${i} = "MANY_FILE_TOKEN_中文测试数据_${i}_c_${"填充".repeat(20)}";`,
+        ].join("\n");
+        await fs.writeFile(path.join(manyFilesDir, file), `${content}\n`, "utf8");
+      }
+      const manyQuery = [{ type: "text" as const, pattern: "MANY_FILE_TOKEN", maxResults: 200 }];
+      const rgManyTight = await runBatchSearch({ cwd: manyFilesDir, maxChars: 1400, queries: manyQuery });
+      const nodeManyTight = await runBatchSearch(
+        { cwd: manyFilesDir, maxChars: 1400, queries: manyQuery },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgManyTight.text, nodeManyTight.text);
+      assert.ok(rgManyTight.text.length <= 1400);
+      assert.ok(Buffer.byteLength(rgManyTight.text, "utf8") <= 8_800);
+      assert.match(rgManyTight.text, /more files: mod_\d+\.ts \(3\)/);
+      assert.match(rgManyTight.text, /\+\d+ more files; use outputMode: "files_with_matches"/);
+      assert.match(rgManyTight.text, /\.\.\. \[truncated: showed \d+ of 195 matches across \d+ of 65 files\]/);
+      assertNoOrphanContext(rgManyTight.text, 0);
+
+      // Default maxChars (8500) with heavy CJK multi-byte payload across 65 files must stay <= 8800 UTF-8 bytes and report omitted files
+      const rgManyDefault = await runBatchSearch({ cwd: manyFilesDir, queries: manyQuery });
+      const nodeManyDefault = await runBatchSearch(
+        { cwd: manyFilesDir, queries: manyQuery },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgManyDefault.text, nodeManyDefault.text);
+      assert.ok(
+        Buffer.byteLength(rgManyDefault.text, "utf8") <= 8_800,
+        `Expected <= 8800 UTF-8 bytes, got ${Buffer.byteLength(rgManyDefault.text, "utf8")}`,
+      );
+      assert.match(rgManyDefault.text, /more files: mod_\d+\.ts \(3\)/);
+      assert.match(rgManyDefault.text, /use outputMode: "files_with_matches"/);
+      assert.match(rgManyDefault.text, /\.\.\. \[truncated: showed \d+ of 195 matches across \d+ of 65 files\]/);
+      assertNoOrphanContext(rgManyDefault.text, 0);
+
+      // 4. Mixed short + long multi-query water-filling, single-file many-match, multiline match, and exact-fit preservation
+      const mixedDir = path.join(budgetDir, "mixed");
+      await fs.mkdir(mixedDir, { recursive: true });
+      await fs.writeFile(path.join(mixedDir, "exact.ts"), "export const EXACT_SHORT_HIT = 42;\n", "utf8");
+      await fs.writeFile(
+        path.join(mixedDir, "single.ts"),
+        Array.from({ length: 40 }, (_, i) => `const singleRow${i + 1} = "SINGLE_MANY_HIT_${i + 1}_payload_text";`).join("\n") + "\n",
+        "utf8",
+      );
+      for (const name of ["m1.ts", "m2.ts", "m3.ts"]) {
+        const blocks = Array.from(
+          { length: 6 },
+          (_, k) => `MULTI_START_${name}_${k}\nMULTI_END_${name}_${k}_${"z".repeat(40)}\n`,
+        ).join("\n");
+        await fs.writeFile(path.join(mixedDir, name), blocks, "utf8");
+      }
+
+      const mixedQueries = [
+        { type: "text" as const, pattern: "EXACT_SHORT_HIT", path: "exact.ts" },
+        { type: "text" as const, pattern: "return ", path: "../four", contextLines: 2, maxResults: 40 },
+        { type: "text" as const, pattern: "SINGLE_MANY_HIT", path: "single.ts", maxResults: 40 },
+        { type: "regex" as const, pattern: "MULTI_START_\\S+\\nMULTI_END_\\S+", multiline: true, maxResults: 40 },
+      ];
+      const rgMixed = await runBatchSearch({ cwd: mixedDir, maxChars: 2400, queries: mixedQueries });
+      const nodeMixed = await runBatchSearch(
+        { cwd: mixedDir, maxChars: 2400, queries: mixedQueries },
+        { forceNodeFallback: true },
+      );
+      assert.equal(rgMixed.isError, false);
+      assert.equal(rgMixed.text, nodeMixed.text, "mixed multi-query budgeted output must match between rg and Node fallback");
+      assert.ok(rgMixed.text.length <= 2400, `Expected <= 2400 chars, got ${rgMixed.text.length}`);
+      assert.ok(Buffer.byteLength(rgMixed.text, "utf8") <= 8_800);
+
+      const mixedSections = rgMixed.text.split("\n\n");
+      assert.equal(mixedSections.length, 4);
+      // Q1 fits completely -> exact untouched output (no truncation notice)
+      assert.equal(
+        mixedSections[0],
+        "## Query 1 [text] EXACT_SHORT_HIT (in exact.ts)\nexact.ts\n  1: export const EXACT_SHORT_HIT = 42;",
+      );
+      // Q2 covers all 4 files instead of starving later files
+      for (const name of ["a.ts", "b.ts", "c.ts", "d.ts"]) {
+        assert.ok(mixedSections[1]!.includes(name), `Expected ${name} in Q2:\n${mixedSections[1]}`);
+      }
+      assertNoOrphanContext(mixedSections[1]!, 2);
+      // Q3 single-file many-match shows clean omission count + "in 1 file"
+      assert.match(mixedSections[2]!, /\(\+\d+ more matches\)/);
+      assert.match(mixedSections[2]!, /showed \d+ of 40 matches in 1 file/);
+      // Q4 multiline query covers all 3 files fairly
+      for (const name of ["m1.ts", "m2.ts", "m3.ts"]) {
+        assert.ok(mixedSections[3]!.includes(`\n${name}\n`), `Expected ${name} in Q4:\n${mixedSections[3]}`);
+      }
+
+      // 5. Fitting query preserves exact existing format without budget-truncation notices
+      const fitRes = await runBatchSearch({
+        cwd: fourDir,
+        maxChars: 8500,
+        queries: [{ type: "text", pattern: "return ", contextLines: 1, maxResults: 10 }],
+      });
+      assert.equal(fitRes.isError, false);
+      assert.doesNotMatch(fitRes.text, /\(\+\d+ more match/);
+      assert.match(fitRes.text, /\.\.\. \[truncated at 10 matches\]$/);
+    } finally {
+      await fs.rm(budgetDir, { recursive: true, force: true });
+    }
+  });
 });

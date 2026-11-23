@@ -423,7 +423,7 @@ describe("apply_edits", () => {
       ],
     });
     assert.equal(driftRes.isError, true);
-    assert.match(driftRes.text, /Exact match found outside range at L86/);
+    assert.match(driftRes.text, /Exact match found outside range at L86-L87/);
 
     // 2. Wide range (>26 lines) mismatch uses closest-region snippet instead of dumping 85 lines
     const wideRes = await runApplyEdits({
@@ -952,5 +952,194 @@ describe("apply_edits", () => {
     assert.doesNotMatch(res.text, /dist\/shared\.js/);
     assert.match(res.text, /src\/Table\.tsx\(42,11\): error TS2322/);
     assert.match(res.text, /Found 1 error in src\/Table\.tsx:42/);
+  });
+
+  it("reports full Lstart-Lend ranges on drifted multi-line targets (with/without trailing LF) and single Lstart on single-line targets", async () => {
+    const rangeFile = path.join(tmpDir, "drift-ranges.ts");
+    const lines = [
+      ...Array.from({ length: 9 }, (_, i) => `const pad_${i + 1} = ${i + 1};`),
+      "const blockA = 1;", // L10
+      "const blockB = 2;", // L11
+      "const blockC = 3;", // L12
+      ...Array.from({ length: 7 }, (_, i) => `const mid_${i + 1} = ${i + 1};`),
+      "const blockA = 1;", // L20
+      "const blockB = 2;", // L21
+      "const blockC = 3;", // L22
+    ];
+    await fs.writeFile(rangeFile, lines.join("\n") + "\n", "utf8");
+
+    // 1. Multi-line target WITHOUT trailing newline drifted outside window -> L10-L12, L20-L22
+    const multiNoNl = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift-ranges.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 5,
+              target: "const blockA = 1;\nconst blockB = 2;\nconst blockC = 3;",
+              replacement: "const blockA = 10;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(multiNoNl.isError, true);
+    assert.match(multiNoNl.text, /Exact match found outside range at L10-L12, L20-L22 —/);
+
+    // 2. Multi-line target WITH trailing newline -> still L10-L12 (NOT L10-L13)
+    const multiWithNl = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift-ranges.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 5,
+              target: "const blockA = 1;\nconst blockB = 2;\nconst blockC = 3;\n",
+              replacement: "const blockA = 10;\n",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(multiWithNl.isError, true);
+    assert.match(multiWithNl.text, /Exact match found outside range at L10-L12, L20-L22 —/);
+    assert.doesNotMatch(multiWithNl.text, /L10-L13/);
+
+    // 3. Single-line target WITHOUT trailing newline -> L10 (NOT L10-L10)
+    const singleNoNl = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift-ranges.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 5,
+              target: "const mid_1 = 1;",
+              replacement: "const mid_1 = 99;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(singleNoNl.isError, true);
+    assert.match(singleNoNl.text, /Exact match found outside range at L13 —/);
+    assert.doesNotMatch(singleNoNl.text, /L13-L13/);
+
+    // 4. Single-line target WITH trailing newline -> L13 (NOT L13-L14)
+    const singleWithNl = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift-ranges.ts",
+          hunks: [
+            {
+              startLine: 1,
+              endLine: 5,
+              target: "const mid_1 = 1;\n",
+              replacement: "const mid_1 = 99;\n",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(singleWithNl.isError, true);
+    assert.match(singleWithNl.text, /Exact match found outside range at L13 —/);
+    assert.doesNotMatch(singleWithNl.text, /L13-L14/);
+
+    // 5. Ambiguous multi-line match without startLine/endLine reports full ranges
+    const ambigMulti = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "drift-ranges.ts",
+          hunks: [
+            {
+              target: "const blockA = 1;\nconst blockB = 2;\nconst blockC = 3;",
+              replacement: "const blockA = 10;",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(ambigMulti.isError, true);
+    assert.match(ambigMulti.text, /matched 2 times \(lines: 10-12, 20-22\)/);
+  });
+
+  it("prioritizes Failed diagnostics before Applied in bestEffort partial apply and keeps output <= 8800 bytes", async () => {
+    const batchDir = path.join(tmpDir, "best-effort-many");
+    await fs.mkdir(batchDir, { recursive: true });
+
+    const longSegment = "packages/very-long-workspace-module-name/src/components/deeply-nested-feature-directory/sub-module-layer";
+    const okCount = 48;
+    const edits: Array<{ path: string; hunks: Array<{ target: string; replacement: string; startLine?: number; endLine?: number }> }> = [];
+    const okAbsPaths: string[] = [];
+
+    for (let i = 1; i <= okCount; i++) {
+      const rel = `${longSegment}/feature_component_module_number_${String(i).padStart(2, "0")}_implementation_details_handler.ts`;
+      const abs = path.join(batchDir, rel);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, `export const item_${i} = 1;\n`, "utf8");
+      okAbsPaths.push(abs);
+      edits.push({
+        path: rel,
+        hunks: [{ target: `item_${i} = 1;`, replacement: `item_${i} = 2;` }],
+      });
+    }
+
+    const failRel = `${longSegment}/failing_target_component.ts`;
+    const failAbs = path.join(batchDir, failRel);
+    const failLines = [
+      ...Array.from({ length: 30 }, (_, i) => `const header_${i + 1} = ${i + 1};`),
+      "export function criticalWidget() {",
+      "  const mode = 'production';",
+      "  return mode;",
+      "}",
+    ];
+    await fs.writeFile(failAbs, failLines.join("\n") + "\n", "utf8");
+    edits.push({
+      path: failRel,
+      hunks: [
+        {
+          startLine: 1,
+          endLine: 10,
+          target: "export function criticalWidget() {\n  const mode = 'production';\n  return mode;\n}",
+          replacement: "export function criticalWidget() {\n  return 'updated';\n}",
+        },
+      ],
+    });
+
+    const res = await runApplyEdits({
+      cwd: batchDir,
+      bestEffort: true,
+      verify: `${JSON.stringify(process.execPath)} -e "console.log('SHOULD_NOT_RUN')"`,
+      edits,
+    });
+
+    assert.equal(res.isError, true);
+    assert.ok(
+      Buffer.byteLength(res.text, "utf8") <= 8_800,
+      `Expected <= 8800 bytes, got ${Buffer.byteLength(res.text, "utf8")}`,
+    );
+    assert.match(res.text, /Partial edit applied \(48\/49 file\(s\) written; 1 file\(s\) failed/);
+    assert.match(res.text, /Failed \(retry ONLY these failed file\(s\); do NOT re-send applied files\):/);
+    assert.match(res.text, /Exact match found outside range at L31-L34/);
+    assert.match(res.text, /\.\.\. \(\+\d+ more applied file\(s\) omitted; total 48 written\)/);
+    assert.match(res.text, /Verify skipped/);
+    assert.doesNotMatch(res.text, /SHOULD_NOT_RUN/);
+
+    const failedIdx = res.text.indexOf("Failed (retry ONLY these failed file(s)");
+    const appliedIdx = res.text.indexOf("\nApplied:");
+    assert.ok(failedIdx > 0, "Expected Failed section");
+    assert.ok(appliedIdx > failedIdx, `Expected Failed (${failedIdx}) before Applied (${appliedIdx})`);
+
+    // Spot-check disk state: valid files updated, failed file untouched
+    assert.equal(await fs.readFile(okAbsPaths[0]!, "utf8"), "export const item_1 = 2;\n");
+    assert.equal(await fs.readFile(okAbsPaths[okCount - 1]!, "utf8"), `export const item_${okCount} = 2;\n`);
+    assert.match(await fs.readFile(failAbs, "utf8"), /const mode = 'production';/);
   });
 });

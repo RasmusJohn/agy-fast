@@ -509,7 +509,7 @@ export function createAgyFastServer(
     {
       name: "run_checks",
       description:
-        "Run multiple independent non-interactive shell commands concurrently under one check (build/typecheck/lint/test with outputMode 'compact', or diagnostic/audit scripts with outputMode 'full').",
+        "Batch >=2 independent non-interactive shell commands concurrently under one check (for a single lightweight command, prefer native run_command). Defaults to outputMode 'compact' for pass/fail checks (build/typecheck/lint/test); use 'full' only when you need passing stdout (diagnostic/inspection scripts).",
       inputSchema: {
         type: "object",
         properties: {
@@ -548,7 +548,7 @@ export function createAgyFastServer(
           outputMode: {
             type: "string",
             enum: ["compact", "full"],
-            description: "'compact' hides verbose pass logs (default); 'full' preserves stdout for diagnostic/inspection commands.",
+            description: "Default 'compact' hides verbose pass logs while keeping failure details—prefer 'compact' whenever you only need pass/fail; use 'full' only when you specifically need passing stdout (e.g. diagnostic/inspection scripts).",
           },
           maxChars: {
             type: "integer",
