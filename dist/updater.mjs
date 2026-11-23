@@ -106,16 +106,36 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(10) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(10, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate = truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
 function killChildTree(pid, detached) {

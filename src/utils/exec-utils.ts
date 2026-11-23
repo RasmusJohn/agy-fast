@@ -110,8 +110,9 @@ function getWindowsFallbackEncoding(): string | null {
 
 /**
  * Decodes child-process stdout/stderr buffers as UTF-8 first, falling back to
- * the Windows active console codepage (e.g. `gb18030` for CP936) only when
- * non-UTF-8 bytes are present.
+ * the Windows active console codepage (e.g. `gb18030` for CP936) per line when
+ * non-UTF-8 bytes are present so valid UTF-8 lines in mixed-encoding output do
+ * not turn into mojibake.
  */
 export function decodeProcessOutput(
   buf: Buffer,
@@ -129,16 +130,37 @@ export function decodeProcessOutput(
     if (!label || label === "utf-8") {
       return buf.toString("utf8");
     }
+    let decoder: TextDecoder;
     try {
-      let decoder = fallbackDecoderCache.get(label);
-      if (!decoder) {
+      const cached = fallbackDecoderCache.get(label);
+      if (cached) {
+        decoder = cached;
+      } else {
         decoder = new TextDecoder(label);
         fallbackDecoderCache.set(label, decoder);
       }
-      return decoder.decode(buf);
     } catch {
       return buf.toString("utf8");
     }
+    if (buf.indexOf(0x0a) === -1) {
+      return decoder.decode(buf);
+    }
+    const parts: string[] = [];
+    let offset = 0;
+    while (offset < buf.length) {
+      const nl = buf.indexOf(0x0a, offset);
+      const end = nl === -1 ? buf.length : nl + 1;
+      const line = buf.subarray(offset, end);
+      const lineCandidate =
+        truncated && end === buf.length ? stripTrailingIncompleteUtf8(line) : line;
+      try {
+        parts.push(strictUtf8Decoder.decode(lineCandidate));
+      } catch {
+        parts.push(decoder.decode(line));
+      }
+      offset = end;
+    }
+    return parts.join("");
   }
 }
 
