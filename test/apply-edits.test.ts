@@ -603,7 +603,7 @@ describe("apply_edits", () => {
     let directWriteAttempted = false;
     fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
       const p = String(args[0]);
-      if (p.startsWith(`${targetFile}.agy-fast-tmp-`)) {
+      if (path.basename(p).startsWith(".agy-tmp-") && String(args[1]).includes("target mod")) {
         await origWriteFile(p, "partial");
         throw makeErrnoError("ENOSPC", "ENOSPC: no space left on device");
       }
@@ -633,7 +633,7 @@ describe("apply_edits", () => {
 
     assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
     assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
-    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
   it("rolls back target file and removes partial created file when rename and fallback direct write both fail", async () => {
@@ -698,7 +698,7 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
     assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
     await assert.rejects(() => fs.stat(newFile), { code: "ENOENT" });
-    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
   it("fails fast on non-ENOENT errors in create without overwriting or deleting existing files", async () => {
@@ -1565,5 +1565,53 @@ describe("apply_edits", () => {
       fs.readFile = origReadFile;
     }
     assert.deepEqual(await fs.readFile(largeBinPath), largeBinBytes);
+  });
+
+  it("edits long 228-byte CJK filenames without ENAMETOOLONG and removes orphaned parent dirs on rollback", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "af-tmp-"));
+    try {
+      // 1. 75 CJK chars + ".ts" = 228 UTF-8 bytes (previously failed ENAMETOOLONG with target-prefixed temp name)
+      const longCjkName = `${"测".repeat(75)}.ts`;
+      const longCjkPath = path.join(workDir, longCjkName);
+      await fs.writeFile(longCjkPath, "export const count = 1;\n", "utf8");
+
+      const editRes = await runApplyEdits({
+        cwd: workDir,
+        edits: [
+          {
+            path: longCjkName,
+            hunks: [{ target: "count = 1;", replacement: "count = 2;" }],
+          },
+        ],
+      });
+      assert.equal(editRes.isError, false, `Expected long CJK edit to succeed, got:\n${editRes.text}`);
+      assert.equal(await fs.readFile(longCjkPath, "utf8"), "export const count = 2;\n");
+
+      // 2. Atomic rollback cleans up newly created nested directories while preserving pre-existing ancestors
+      const keepDir = path.join(workDir, "existing-root");
+      await fs.mkdir(keepDir, { recursive: true });
+      await fs.writeFile(path.join(keepDir, "keep.txt"), "stay\n", "utf8");
+
+      const rollbackRes = await runApplyEdits({
+        cwd: keepDir,
+        edits: [
+          { path: "nested/deep/dir/a.ts", create: "export const a = 1;\n" },
+          // After plan #1 creates nested/deep/dir/, writing a regular file at that exact directory path fails in Phase 2
+          { path: "nested/deep/dir", create: "should fail as EISDIR\n" },
+        ],
+      });
+      assert.equal(rollbackRes.isError, true);
+      assert.match(rollbackRes.text, /Write failed \(changes rolled back\)/);
+
+      const nestedExists = await fs
+        .lstat(path.join(keepDir, "nested"))
+        .then(() => true, () => false);
+      assert.equal(nestedExists, false, "Expected orphaned nested/deep/dir directories to be removed on rollback");
+      assert.equal(await fs.readFile(path.join(keepDir, "keep.txt"), "utf8"), "stay\n");
+      const remainingEntries = await fs.readdir(keepDir);
+      assert.deepEqual(remainingEntries, ["keep.txt"]);
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
   });
 });

@@ -3275,14 +3275,46 @@ async function canonicalizeTargetPath(absPath) {
     }
   }
 }
+async function findMissingAncestorDirs(dir) {
+  const missing = [];
+  let current = path4.resolve(dir);
+  while (true) {
+    try {
+      await fs3.lstat(current);
+      break;
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        break;
+      }
+      missing.push(current);
+      const parent = path4.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return missing;
+}
 async function commitPlannedWrites(plans) {
   const written = [];
+  const createdDirs = [];
+  const createdDirSet = /* @__PURE__ */ new Set();
   try {
     for (const plan of plans) {
       const target = plan.writeTargetPath;
       const dir = path4.dirname(target);
+      const missingDirs = await findMissingAncestorDirs(dir);
+      for (let i = missingDirs.length - 1; i >= 0; i--) {
+        const d = missingDirs[i];
+        if (!createdDirSet.has(d)) {
+          createdDirSet.add(d);
+          createdDirs.push(d);
+        }
+      }
       await fs3.mkdir(dir, { recursive: true });
-      const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const tmpPath = path4.join(
+        dir,
+        `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+      );
       try {
         await fs3.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
@@ -3337,6 +3369,12 @@ async function commitPlannedWrites(plans) {
         } else if (!item.existed) {
           await fs3.unlink(target);
         }
+      } catch {
+      }
+    }
+    for (let i = createdDirs.length - 1; i >= 0; i--) {
+      try {
+        await fs3.rmdir(createdDirs[i]);
       } catch {
       }
     }
