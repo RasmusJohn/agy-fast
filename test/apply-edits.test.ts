@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { runApplyEdits } from "../src/tools/apply-edits.js";
+import { runApplyEdits, type FileEdit } from "../src/tools/apply-edits.js";
 
 describe("apply_edits", () => {
   let tmpDir: string;
@@ -1141,5 +1141,111 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(okAbsPaths[0]!, "utf8"), "export const item_1 = 2;\n");
     assert.equal(await fs.readFile(okAbsPaths[okCount - 1]!, "utf8"), `export const item_${okCount} = 2;\n`);
     assert.match(await fs.readFile(failAbs, "utf8"), /const mode = 'production';/);
+  });
+
+  it("ranks high-entropy longest anchors above boilerplate headers, preserves Verify [FAIL] tails on large batches, water-fills multi-file errors, and validates verify.cwd pre-write", async () => {
+    const subDir = path.join(tmpDir, "precision-and-verify");
+    await fs.mkdir(subDir, { recursive: true });
+
+    // 1. Closest-match prefers high-entropy longestAnchor over generic boilerplate `if (errors.length > 0) {`
+    const anchorFile = path.join(subDir, "anchor.ts");
+    const anchorLines = [
+      ...Array.from({ length: 10 }, (_, i) => `const top_${i} = ${i};`),
+      "if (errors.length > 0) {",
+      "  return earlyExit();",
+      "}",
+      ...Array.from({ length: 40 }, (_, i) => `const mid_${i} = ${i};`),
+      "if (validationProblems.length > 0) {",
+      "  const formatted = renderStructuredDiagnosticReport(validationProblems, DEFAULT_MAX_REPORT_BYTES);",
+      "  return { ok: false, report: formatted };",
+      "}",
+    ];
+    await fs.writeFile(anchorFile, anchorLines.join("\n") + "\n", "utf8");
+
+    const missRes = await runApplyEdits({
+      cwd: subDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "anchor.ts",
+          hunks: [
+            {
+              target: [
+                "if (errors.length > 0) {",
+                "  const formatted = renderStructuredDiagnosticReport(validationProblems, DEFAULT_MAX_REPORT_BYTES);",
+                "  return { ok: false, report: formatted };",
+                "}",
+              ].join("\n"),
+              replacement: "// replaced",
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(missRes.isError, true);
+    assert.match(missRes.text, /Closest match near line 54/);
+    assert.match(missRes.text, /54: if \(validationProblems\.length > 0\) \{/);
+    assert.match(missRes.text, /55:   const formatted = renderStructuredDiagnosticReport/);
+
+    // 2. Non-existent verify.cwd fails BEFORE modifying any files on disk
+    const safeFile = path.join(subDir, "safe.ts");
+    await fs.writeFile(safeFile, "export const safe = 1;\n", "utf8");
+    const badVerifyCwd = await runApplyEdits({
+      cwd: subDir,
+      verify: { command: "echo hi", cwd: "does-not-exist-subdir" },
+      edits: [{ path: "safe.ts", hunks: [{ target: "safe = 1;", replacement: "safe = 2;" }] }],
+    });
+    assert.equal(badVerifyCwd.isError, true);
+    assert.match(badVerifyCwd.text, /'verify\.cwd' directory not found/);
+    assert.equal(await fs.readFile(safeFile, "utf8"), "export const safe = 1;\n");
+
+    // 3. Multi-file atomic abort water-fills errors so later failing files are not starved off the bottom
+    const multiFailEdits: FileEdit[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const f = path.join(subDir, `fail_${i}.ts`);
+      const body = Array.from({ length: 25 }, (_, k) => `export const uniqueSymbolFile${i}_Line${k} = "${"x".repeat(90)}";`).join("\n") + "\n";
+      await fs.writeFile(f, body, "utf8");
+      multiFailEdits.push({
+        path: `fail_${i}.ts`,
+        hunks: [{ target: `export const uniqueSymbolFile${i}_Line12 = "MISMATCH";`, replacement: "y" }],
+      });
+    }
+    const multiAbort = await runApplyEdits({ cwd: subDir, edits: multiFailEdits });
+    assert.equal(multiAbort.isError, true);
+    assert.ok(Buffer.byteLength(multiAbort.text, "utf8") <= 8_800);
+    for (let i = 1; i <= 6; i++) {
+      assert.match(multiAbort.text, new RegExp(`- fail_${i}\\.ts hunk #1:`));
+    }
+
+    // 4. Large 40-file edit + failing CJK/Vitest verify compacts Applied list instead of slicing off Verify [FAIL] tail
+    const manyDir = path.join(subDir, "packages/deeply-nested-workspace-package-name/src/modules");
+    await fs.mkdir(manyDir, { recursive: true });
+    const manyEdits: FileEdit[] = [];
+    for (let i = 1; i <= 40; i++) {
+      const rel = `packages/deeply-nested-workspace-package-name/src/modules/component_handler_service_item_${String(i).padStart(2, "0")}.ts`;
+      await fs.writeFile(path.join(subDir, rel), `export const v_${i} = 1;\n`, "utf8");
+      manyEdits.push({
+        path: rel,
+        hunks: [{ target: `v_${i} = 1;`, replacement: `v_${i} = 2;` }],
+      });
+    }
+    const verifyScript = [
+      "console.error('error TS2322: 首条核心类型错误根因诊断');",
+      "for (let i = 0; i < 60; i++) console.error('  at middleFrame_' + i + ' (中文路径模块文件_' + i + '.ts:' + i + ':5)');",
+      "console.error('FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file.');",
+      "process.exit(1);",
+    ].join(" ");
+    const verifyFailRes = await runApplyEdits({
+      cwd: subDir,
+      maxVerifyChars: 6500,
+      verify: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(verifyScript)}`,
+      edits: manyEdits,
+    });
+    assert.equal(verifyFailRes.isError, false);
+    assert.ok(Buffer.byteLength(verifyFailRes.text, "utf8") <= 8_800);
+    assert.match(verifyFailRes.text, /more applied file\(s\) omitted; total 40 written/);
+    assert.match(verifyFailRes.text, /Verify \[FAIL/);
+    assert.match(verifyFailRes.text, /error TS2322: 首条核心类型错误根因诊断/);
+    assert.match(verifyFailRes.text, /FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file\./);
   });
 });

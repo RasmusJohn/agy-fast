@@ -2737,80 +2737,100 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
   if (fileLines.length === 0) return "";
   const targetLines = normTarget.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
   if (targetLines.length === 0) return "";
-  const firstAnchor = targetLines.find((l) => l.length >= 6) ?? targetLines[0];
-  let longestAnchor = targetLines[0];
-  for (const tl of targetLines) {
-    if (tl.length > longestAnchor.length) longestAnchor = tl;
+  let firstAnchorIdx = 0;
+  for (let idx = 0; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length >= 6) {
+      firstAnchorIdx = idx;
+      break;
+    }
   }
-  const anchors = [firstAnchor];
-  if (longestAnchor !== firstAnchor) anchors.push(longestAnchor);
-  const lastAnchor = targetLines[targetLines.length - 1];
-  if (lastAnchor.length >= 6 && !anchors.includes(lastAnchor)) {
-    anchors.push(lastAnchor);
+  let longestAnchorIdx = 0;
+  for (let idx = 1; idx < targetLines.length; idx++) {
+    if (targetLines[idx].length > targetLines[longestAnchorIdx].length) {
+      longestAnchorIdx = idx;
+    }
   }
-  const primaryTokens = new Set(extractLineTokens(firstAnchor));
-  const longestTokens = new Set(extractLineTokens(longestAnchor));
+  const lastAnchorIdx = targetLines.length - 1;
+  const anchorIndices = /* @__PURE__ */ new Set([firstAnchorIdx, longestAnchorIdx]);
+  if (targetLines[lastAnchorIdx].length >= 8) {
+    anchorIndices.add(lastAnchorIdx);
+  }
+  const anchors = [...anchorIndices].map((idx) => ({
+    text: targetLines[idx],
+    idx,
+    tokens: new Set(extractLineTokens(targetLines[idx]))
+  }));
+  const targetTokenSets = targetLines.map((tl) => new Set(extractLineTokens(tl)));
   const trimmedFileLines = fileLines.map((l) => l.trim());
-  let bestIdx = -1;
-  let bestScore = 0;
   const scanStart = Math.max(0, (rangeStartLine ?? 1) - 1);
   const scanEnd = Math.min(
     trimmedFileLines.length - 1,
     (rangeEndLine ?? trimmedFileLines.length) - 1
   );
+  if (scanStart > scanEnd) return "";
+  const evaluatedStarts = /* @__PURE__ */ new Set();
+  let bestStart = -1;
+  let bestScore = 0;
+  const scoreCandidateStart = (candStart) => {
+    const windowLen = Math.min(targetLines.length, 10);
+    let total = 0;
+    for (let k = 0; k < windowLen; k++) {
+      const fIdx = candStart + k;
+      if (fIdx > scanEnd || fIdx >= trimmedFileLines.length) break;
+      const fLine = trimmedFileLines[fIdx];
+      const tLine = targetLines[k];
+      if (!fLine || !tLine) continue;
+      const tTokens = targetTokenSets[k];
+      const isHighEntropy = tLine.length >= 12 && tTokens.size >= 2;
+      if (fLine === tLine) {
+        total += isHighEntropy ? 8 + Math.min(6, tLine.length / 14) : 4;
+      } else if (tLine.length >= 8 && (fLine.includes(tLine) || tLine.includes(fLine))) {
+        total += isHighEntropy ? 6 : 3.5;
+      } else if (tTokens.size > 0) {
+        const lineTokens = extractLineTokens(fLine);
+        let hits = 0;
+        for (const tok of lineTokens) {
+          if (tTokens.has(tok)) hits += 1;
+        }
+        if (hits >= 2 || hits >= 1 && tTokens.size <= 2 && hits === tTokens.size) {
+          total += (isHighEntropy ? 4.5 : 3) * (hits / tTokens.size);
+        }
+      }
+    }
+    return total;
+  };
   for (let i = scanStart; i <= scanEnd; i++) {
     const line = trimmedFileLines[i];
     if (!line) continue;
-    let score = 0;
-    if (line === firstAnchor) {
-      score += 10;
-    } else if (firstAnchor.length >= 8 && (line.includes(firstAnchor) || firstAnchor.includes(line))) {
-      score += 6;
-    } else if (primaryTokens.size > 0) {
-      const lineTokens = extractLineTokens(line);
-      let hits = 0;
-      for (const tok of lineTokens) {
-        if (primaryTokens.has(tok)) hits += 1;
-      }
-      if (hits >= 2 || hits >= 1 && primaryTokens.size <= 2 && hits === primaryTokens.size) {
-        score += 4 * (hits / primaryTokens.size);
-      }
-    }
-    if (longestAnchor !== firstAnchor) {
-      if (line === longestAnchor) {
-        score += 8;
-      } else if (longestAnchor.length >= 10 && line.includes(longestAnchor)) {
-        score += 5;
-      } else if (longestTokens.size >= 2) {
+    for (const anchor of anchors) {
+      let matchedAnchor = false;
+      if (line === anchor.text || anchor.text.length >= 8 && (line.includes(anchor.text) || anchor.text.includes(line))) {
+        matchedAnchor = true;
+      } else if (anchor.tokens.size > 0) {
         const lineTokens = extractLineTokens(line);
         let hits = 0;
         for (const tok of lineTokens) {
-          if (longestTokens.has(tok)) hits += 1;
+          if (anchor.tokens.has(tok)) hits += 1;
         }
-        if (hits >= 2) {
-          score += 3 * (hits / longestTokens.size);
-        }
-      }
-    }
-    if (score >= 2 && targetLines.length > 1) {
-      const lookahead = Math.min(targetLines.length, 6);
-      for (let k = 1; k < lookahead && i + k < trimmedFileLines.length; k++) {
-        const nextLine = trimmedFileLines[i + k];
-        const tgtLine = targetLines[k];
-        if (nextLine && tgtLine && (nextLine === tgtLine || tgtLine.length >= 8 && nextLine.includes(tgtLine))) {
-          score += 3;
+        if (hits >= 2 || hits >= 1 && anchor.tokens.size <= 2 && hits === anchor.tokens.size) {
+          matchedAnchor = true;
         }
       }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
+      if (!matchedAnchor) continue;
+      const candStart = Math.max(scanStart, Math.min(scanEnd, i - anchor.idx));
+      if (evaluatedStarts.has(candStart)) continue;
+      evaluatedStarts.add(candStart);
+      const score = scoreCandidateStart(candStart);
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = candStart;
+      }
     }
   }
-  if (bestIdx < 0 || bestScore < 2.5) return "";
+  if (bestStart < 0 || bestScore < 2.5) return "";
   const span = Math.min(Math.max(targetLines.length, 4), 8);
-  const from = Math.max(1, bestIdx + 1 - 2);
-  const to = Math.min(fileLines.length, Math.min(from + 13, bestIdx + 1 + span + 2));
+  const from = Math.max(1, bestStart + 1 - 2);
+  const to = Math.min(fileLines.length, Math.min(from + 13, bestStart + 1 + span + 2));
   const snippet = [];
   for (let ln = from; ln <= to; ln++) {
     const lineText = fileLines[ln - 1] ?? "";
@@ -2819,7 +2839,7 @@ function findClosestRegionSnippet(normalizedContent, normTarget, rangeStartLine,
     );
   }
   return `
-  Closest match near line ${bestIdx + 1} (lines ${from}-${to}):
+  Closest match near line ${bestStart + 1} (lines ${from}-${to}):
 ${snippet.join("\n")}`;
 }
 function planHunksForContent(normalizedContent, hunks, displayPath) {
@@ -3036,6 +3056,57 @@ function corruptedEditsError(items) {
     isError: true
   };
 }
+function formatErrorBulletsWithinBytes(heading, errors, maxBytes) {
+  const full = `${heading}
+- ${errors.join("\n- ")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const headingPrefix = `${heading}
+`;
+  const availBytes = maxBytes - Buffer.byteLength(headingPrefix, "utf8");
+  if (availBytes <= 64 || errors.length <= 1) {
+    return truncateWithByteNotice(full, maxBytes);
+  }
+  const fittedBullets = fitSectionsToByteBudget(
+    errors.map((e) => `- ${e}`),
+    availBytes,
+    availBytes,
+    "\n"
+  );
+  const assembled = `${headingPrefix}${fittedBullets}`;
+  return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
+}
+function compactSummaryLinesToBytes(header, summaryLines, verb, maxBytes) {
+  const full = `${header}
+${summaryLines.join("\n")}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+  const minimal = `${header} (${summaryLines.length} file(s) ${verb}; list omitted to preserve verify diagnostics)`;
+  const headerPrefix = `${header}
+`;
+  const kept = [];
+  let usedBytes = Buffer.byteLength(headerPrefix, "utf8");
+  for (let i = 0; i < summaryLines.length; i++) {
+    const line = summaryLines[i];
+    const remaining = summaryLines.length - (i + 1);
+    const omitNotice = remaining > 0 ? `
+... (+${remaining} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : "";
+    const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
+    if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
+      break;
+    }
+    kept.push(line);
+    usedBytes += lineBytes;
+  }
+  if (kept.length > 0) {
+    const omitted = summaryLines.length - kept.length;
+    return omitted > 0 ? `${headerPrefix}${kept.join("\n")}
+... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : `${headerPrefix}${kept.join("\n")}`;
+  }
+  return Buffer.byteLength(minimal, "utf8") <= maxBytes ? minimal : truncateWithByteNotice(minimal, maxBytes);
+}
 function formatBestEffortPartialResult(params) {
   const { partialHeader, errors, summaryLines, dryRun, verifySkipped, maxBytes } = params;
   const failedHeading = dryRun ? "Failed (fix only these):" : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
@@ -3062,7 +3133,11 @@ ${summaryLines.join("\n")}`;
     Buffer.byteLength(minimalApplied, "utf8")
   );
   const maxFailedBytes = Math.max(256, maxBytes - fixedBytes - minAppliedBytes);
-  const failedSection = Buffer.byteLength(failedFull, "utf8") <= maxFailedBytes ? failedFull : truncateWithByteNotice(failedFull, maxFailedBytes);
+  const failedSection = formatErrorBulletsWithinBytes(
+    failedHeading,
+    errors,
+    maxFailedBytes
+  );
   const remainingForApplied = maxBytes - fixedBytes - Buffer.byteLength(failedSection, "utf8");
   let appliedSection = minimalApplied;
   if (remainingForApplied >= Buffer.byteLength(appliedFull, "utf8")) {
@@ -3205,6 +3280,25 @@ async function runApplyEdits(input) {
     }
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
+  if (!input.dryRun && validatedVerify?.cwd) {
+    const resolvedVerifyCwd = resolvePath(validatedVerify.cwd, baseCwd);
+    try {
+      const st = await fs3.stat(resolvedVerifyCwd);
+      if (!st.isDirectory()) {
+        return {
+          text: `Validation failed (0 files modified):
+- 'verify.cwd' is not a directory: ${validatedVerify.cwd}`,
+          isError: true
+        };
+      }
+    } catch {
+      return {
+        text: `Validation failed (0 files modified):
+- 'verify.cwd' directory not found: ${validatedVerify.cwd}`,
+        isError: true
+      };
+    }
+  }
   const mergedByPath = /* @__PURE__ */ new Map();
   const errors = [];
   for (let i = 0; i < normalizedEdits.length; i++) {
@@ -3381,11 +3475,7 @@ async function runApplyEdits(input) {
   if (errors.length > 0 && (!bestEffort || plans.length === 0)) {
     const prefix = bestEffort ? "Edit aborted (0 files modified):" : "Atomic edit aborted (0 files modified):";
     return {
-      text: truncateWithByteNotice(
-        `${prefix}
-- ${errors.join("\n- ")}`,
-        DEFAULT_INLINE_MAX_BYTES
-      ),
+      text: formatErrorBulletsWithinBytes(prefix, errors, DEFAULT_INLINE_MAX_BYTES),
       isError: true
     };
   }
@@ -3421,8 +3511,8 @@ async function runApplyEdits(input) {
     };
   }
   const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
-  const parts = [`${header}
-${summaryLines.join("\n")}`];
+  const appliedFull = `${header}
+${summaryLines.join("\n")}`;
   if (!input.dryRun && validatedVerify) {
     const verifySpec = validatedVerify;
     const verifyCwd = verifySpec.cwd ? resolvePath(verifySpec.cwd, baseCwd) : baseCwd;
@@ -3435,24 +3525,68 @@ ${summaryLines.join("\n")}`];
       cwd: verifyCwd,
       timeoutMs
     });
-    const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+    const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const verifyPrefix = `
+
+Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
+`;
+    const preparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
       timedOut: res.timedOut,
-      error: res.error,
-      maxChars: maxVerifyChars
+      error: res.error
     });
-    parts.push(
-      `
-Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
+    const minApplied = `${header} (${summaryLines.length} file(s) written; list omitted to preserve verify diagnostics)`;
+    const reservedForApplied = status === "PASS" ? Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      DEFAULT_INLINE_MAX_BYTES - 512
+    ) : Math.min(
+      Buffer.byteLength(appliedFull, "utf8"),
+      Buffer.byteLength(minApplied, "utf8")
     );
+    const maxVerifyBodyBytes = Math.max(
+      256,
+      DEFAULT_INLINE_MAX_BYTES - reservedForApplied - Buffer.byteLength(verifyPrefix, "utf8")
+    );
+    let targetChars = Math.min(maxVerifyChars, maxVerifyBodyBytes);
+    let formatted = renderPreparedCompactCommandOutput(
+      preparedVerify,
+      targetChars
+    ).text;
+    for (let iter = 0; iter < 4; iter++) {
+      const actualBytes = Buffer.byteLength(formatted, "utf8");
+      if (actualBytes <= maxVerifyBodyBytes || targetChars <= 64) break;
+      targetChars = Math.max(
+        64,
+        Math.floor(targetChars * (maxVerifyBodyBytes / actualBytes) * 0.94)
+      );
+      formatted = renderPreparedCompactCommandOutput(
+        preparedVerify,
+        targetChars
+      ).text;
+    }
+    if (Buffer.byteLength(formatted, "utf8") > maxVerifyBodyBytes) {
+      formatted = truncateHeadTailWithByteNotice(formatted, maxVerifyBodyBytes);
+    }
+    const verifySection = `${verifyPrefix}${formatted}`;
+    const remainingAppliedBytes = DEFAULT_INLINE_MAX_BYTES - Buffer.byteLength(verifySection, "utf8");
+    const appliedSection = compactSummaryLinesToBytes(
+      header,
+      summaryLines,
+      "written",
+      Math.max(64, remainingAppliedBytes)
+    );
+    const combined = `${appliedSection}${verifySection}`;
+    return {
+      text: Buffer.byteLength(combined, "utf8") <= DEFAULT_INLINE_MAX_BYTES ? combined : truncateWithByteNotice(combined, DEFAULT_INLINE_MAX_BYTES),
+      isError: false
+    };
   }
-  const outText = parts.join("\n");
-  const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
-  return { text: finalText, isError: false };
+  return {
+    text: truncateWithByteNotice(appliedFull, DEFAULT_INLINE_MAX_BYTES),
+    isError: false
+  };
 }
 
 // src/tools/batch-search.ts
