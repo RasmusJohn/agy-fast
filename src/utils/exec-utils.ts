@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 export interface ExecResult {
@@ -171,8 +172,8 @@ export function decodeProcessOutput(
  */
 export const MCP_CALL_BUDGET_SEC = 170;
 
-function killChildTree(pid: number | undefined, detached: boolean): void {
-  if (!pid) return;
+function killChildTree(pid: number | undefined, detached: boolean): NodeJS.Timeout | null {
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = (): void => {
       try {
@@ -193,7 +194,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
 
   try {
@@ -205,7 +206,7 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
   } catch {
     // Process may already have exited
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -215,7 +216,9 @@ function killChildTree(pid: number | undefined, detached: boolean): void {
     } catch {
       // Already exited
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 
 export function execBinaryAsync(
@@ -412,7 +415,7 @@ function stripQuotedSpans(command: string, stripDoubleQuotes: boolean): string {
       continue;
     }
     if (quote === '"') {
-      if ((ch === "\\" || ch === "`") && next === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
         i++;
         if (!stripDoubleQuotes) out += ch + next;
         continue;
@@ -491,7 +494,7 @@ export function formatPowerShellCommand(command: string): string {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^\s+/.test(afterQuote)) {
+      if (!/^[ \t]+/.test(afterQuote)) {
         return command;
       }
       const rest = afterQuote.trimStart();
@@ -693,9 +696,10 @@ function spawnAndCollect(
     }
 
     let settleFallbackTimer: NodeJS.Timeout | null = null;
+    let sigkillTimer: NodeJS.Timeout | null = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -713,6 +717,7 @@ function spawnAndCollect(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -769,18 +774,33 @@ function spawnAndCollect(
 }
 
 let cachedRgAvailable: boolean | null = null;
+let pendingRgProbe: Promise<boolean> | null = null;
 
 export async function isRipgrepAvailable(): Promise<boolean> {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
-  const res = await execBinaryAsync("rg", ["--version"], {
-    cwd: process.cwd(),
-    timeoutMs: 2000,
-    maxOutputBytes: 4096,
-  });
-  cachedRgAvailable = !res.error && res.exitCode === 0;
-  return cachedRgAvailable;
+  if (pendingRgProbe) return pendingRgProbe;
+
+  pendingRgProbe = (async () => {
+    try {
+      const res = await execBinaryAsync("rg", ["--version"], {
+        cwd: os.tmpdir(),
+        timeoutMs: 2000,
+        maxOutputBytes: 4096,
+      });
+      const available = !res.error && !res.timedOut && res.exitCode === 0;
+      if (!res.timedOut) {
+        cachedRgAvailable = available;
+      }
+      return available;
+    } finally {
+      pendingRgProbe = null;
+    }
+  })();
+
+  return pendingRgProbe;
 }
 
 export function resetRipgrepCache(): void {
   cachedRgAvailable = null;
+  pendingRgProbe = null;
 }
