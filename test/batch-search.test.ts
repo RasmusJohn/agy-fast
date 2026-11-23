@@ -9,6 +9,7 @@ import {
   tokenizeArgs,
   validateReadonlyGitArgs,
 } from "../src/tools/batch-search.js";
+import { globToRegExp, resolvePath, walkFiles } from "../src/utils/fs-utils.js";
 
 describe("batch_search", () => {
   let tmpDir: string;
@@ -1258,6 +1259,68 @@ describe("batch_search", () => {
       assert.match(fitRes.text, /\.\.\. \[truncated at 10 matches\]$/);
     } finally {
       await fs.rm(budgetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hardens fs-utils globToRegExp/walkFiles/resolvePath and batch_search stringified limits, hidden globs, and fast-path CRLF parity", async () => {
+    // 1. globToRegExp resists repeated `**/` ReDoS and handles brace spaces & negated/leading-`]` char classes
+    const redosStart = Date.now();
+    const collapsed = globToRegExp("**/**/**/**/**/**/**/**/nope.ts");
+    assert.equal(collapsed.test("a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/file.js"), false);
+    assert.ok(Date.now() - redosStart < 100, "Repeated **/ glob must stay linear-time");
+    assert.equal(globToRegExp("foo{ ,_}bar.ts").test("foo bar.ts"), true);
+    assert.equal(globToRegExp("foo{ ,_}bar.ts").test("foobar.ts"), false);
+    assert.equal(globToRegExp("[!a].ts").test("b.ts"), true);
+    assert.equal(globToRegExp("[!a].ts").test("/.ts"), false);
+    assert.equal(globToRegExp("[]a].ts").test("].ts"), true);
+    assert.equal(globToRegExp("{a[,],b}.ts").test("a,.ts"), true);
+
+    // 2. resolvePath binds drive-less leading-slash paths to baseDir's drive on Windows
+    if (process.platform === "win32") {
+      assert.equal(resolvePath("/src/index.ts", "D:\\repo"), "D:\\src\\index.ts");
+    }
+
+    // 3. walkFiles returns deterministic order and does not report truncated when file count === maxFiles
+    const walkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-walk-exact-"));
+    try {
+      await fs.mkdir(path.join(walkDir, "b"), { recursive: true });
+      await fs.mkdir(path.join(walkDir, "a"), { recursive: true });
+      await fs.writeFile(path.join(walkDir, "a", "1.ts"), "export const a = 1;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, "b", "2.ts"), "export const b = 2;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, "c.ts"), "export const c = 3;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, ".env"), "SECRET=1\n", "utf8");
+      await fs.mkdir(path.join(walkDir, ".hidden"), { recursive: true });
+      await fs.writeFile(path.join(walkDir, ".hidden", "skip.ts"), "export const h = 1;\n", "utf8");
+
+      const exact = await walkFiles(walkDir, { maxFiles: 3 });
+      assert.deepEqual(exact.files, ["c.ts", "a/1.ts", "b/2.ts"]);
+      assert.equal(exact.truncated, false);
+
+      const over = await walkFiles(walkDir, { maxFiles: 2 });
+      assert.deepEqual(over.files, ["c.ts", "a/1.ts"]);
+      assert.equal(over.truncated, true);
+
+      // 4. Stringified maxResults does not collapse to 1; `./` prefix does not crawl hidden dirs; `{.env,...}` finds dotfiles
+      const strLimit = await runBatchSearch({
+        cwd: walkDir,
+        queries: [
+          { type: "glob", pattern: "**/*.ts", maxResults: "10" as unknown as number },
+          { type: "glob", pattern: "./**/*.ts" },
+          { type: "glob", pattern: "{.env,.env.local}" },
+          { type: "regex", pattern: "const b = 2;$" },
+        ],
+      }, { forceNodeFallback: true });
+      assert.equal(strLimit.isError, false);
+      const secs = strLimit.text.split("\n\n");
+      assert.match(secs[0]!, /a\/1\.ts/);
+      assert.match(secs[0]!, /b\/2\.ts/);
+      assert.match(secs[0]!, /c\.ts/);
+      assert.doesNotMatch(secs[0]!, /truncated/);
+      assert.doesNotMatch(secs[1]!, /\.hidden\/skip\.ts/);
+      assert.match(secs[2]!, /\.env/);
+      assert.match(secs[3]!, /b\/2\.ts\n\s+1: export const b = 2;/);
+    } finally {
+      await fs.rm(walkDir, { recursive: true, force: true });
     }
   });
 });
