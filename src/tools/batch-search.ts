@@ -1544,6 +1544,8 @@ function hardenGitExecArgs(validatedArgs: string[]): string[] {
     "-c",
     "core.fsmonitor=false",
     "-c",
+    "core.quotePath=false",
+    "-c",
     "diff.external=",
     "-c",
     "gpg.program=false",

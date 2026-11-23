@@ -799,4 +799,25 @@ describe("session-start hook", () => {
       await fs.rm(brokenGitDir, { recursive: true, force: true });
     }
   });
+
+  it("renders CJK filenames verbatim without octal escaping in git status snapshot", async () => {
+    const cjkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-cjk-snap-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: cjkDir });
+      execFileSync("git", ["config", "core.quotePath", "true"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "init.ts"), "export const a = 1;\n", "utf8");
+      execFileSync("git", ["add", "init.ts"], { cwd: cjkDir });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "中文模块.ts"), "export const zh = true;\n", "utf8");
+
+      const snap = await buildWorkspaceSnapshot(cjkDir);
+      assert.ok(snap !== null, "Expected non-null workspace snapshot");
+      assert.match(snap, /Modified \(1\):[^\n]*中文模块\.ts/);
+      assert.ok(!snap.includes("\\344\\270\\255"), `Unexpected octal-escaped path in snapshot:\n${snap}`);
+    } finally {
+      await fs.rm(cjkDir, { recursive: true, force: true });
+    }
+  });
 });

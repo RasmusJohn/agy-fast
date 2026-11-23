@@ -1519,4 +1519,28 @@ describe("batch_search", () => {
       await fs.rm(outerDir, { recursive: true, force: true });
     }
   });
+
+  it("renders CJK filenames verbatim without octal escaping in git queries", async () => {
+    const cjkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-cjk-git-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: cjkDir });
+      execFileSync("git", ["config", "core.quotePath", "true"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "base.ts"), "export const ok = 1;\n", "utf8");
+      execFileSync("git", ["add", "base.ts"], { cwd: cjkDir });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "中文模块.ts"), "export const zh = 1;\n", "utf8");
+
+      const res = await runBatchSearch({
+        cwd: cjkDir,
+        queries: [{ type: "git", pattern: "status --short" }],
+      });
+      assert.equal(res.isError, false);
+      assert.ok(res.text.includes("中文模块.ts"), `Expected verbatim CJK filename:\n${res.text}`);
+      assert.ok(!res.text.includes("\\344\\270\\255"), `Unexpected octal-escaped path:\n${res.text}`);
+    } finally {
+      await fs.rm(cjkDir, { recursive: true, force: true });
+    }
+  });
 });
