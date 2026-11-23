@@ -437,13 +437,14 @@ describe("session-start hook", () => {
       await fs.writeFile(path.join(projDir, "src", "app.ts"), "export const x = 1;\n", "utf8");
       const projSnap = await buildWorkspaceSnapshot(projDir);
       assert.ok(projSnap);
-      assert.match(projSnap, /public\//);
-      assert.match(projSnap, /documents\//);
-      assert.match(projSnap, /recovery\//);
-      assert.match(projSnap, /src\//);
-      assert.doesNotMatch(projSnap, /AppData/);
-      assert.doesNotMatch(projSnap, /OneDrive/);
-      assert.doesNotMatch(projSnap, /\$RECYCLE\.BIN/);
+      const projBody = projSnap.split("\n").slice(1).join("\n");
+      assert.match(projBody, /public\//);
+      assert.match(projBody, /documents\//);
+      assert.match(projBody, /recovery\//);
+      assert.match(projBody, /src\//);
+      assert.doesNotMatch(projBody, /AppData/);
+      assert.doesNotMatch(projBody, /OneDrive/);
+      assert.doesNotMatch(projBody, /\$RECYCLE\.BIN/);
 
       // 2. When workspaceDir IS $HOME: Desktop/Documents/Downloads/Library/Public/Recovery/AppData/NTUSER.DAT* are skipped
       for (const d of ["Desktop", "Documents", "Downloads", "Library", "Pictures", "Public", "Recovery", "AppData", "OneDrive", "my-app"]) {
@@ -466,18 +467,19 @@ describe("session-start hook", () => {
       assert.equal(homeHookRes.code, 0);
       const homeMsg: string = JSON.parse(homeHookRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
       assert.ok(homeMsg);
-      assert.match(homeMsg, /my-app\//);
-      assert.doesNotMatch(homeMsg, /Desktop\//);
-      assert.doesNotMatch(homeMsg, /Documents\//);
-      assert.doesNotMatch(homeMsg, /Downloads\//);
-      assert.doesNotMatch(homeMsg, /Library\//);
-      assert.doesNotMatch(homeMsg, /Pictures\//);
-      assert.doesNotMatch(homeMsg, /Public\//);
-      assert.doesNotMatch(homeMsg, /Recovery\//);
-      assert.doesNotMatch(homeMsg, /AppData/);
-      assert.doesNotMatch(homeMsg, /Application Data/);
-      assert.doesNotMatch(homeMsg, /OneDrive/);
-      assert.doesNotMatch(homeMsg, /NTUSER\.DAT/);
+      const homeBody = homeMsg.split("\n").slice(1).join("\n");
+      assert.match(homeBody, /my-app\//);
+      assert.doesNotMatch(homeBody, /Desktop\//);
+      assert.doesNotMatch(homeBody, /Documents\//);
+      assert.doesNotMatch(homeBody, /Downloads\//);
+      assert.doesNotMatch(homeBody, /Library\//);
+      assert.doesNotMatch(homeBody, /Pictures\//);
+      assert.doesNotMatch(homeBody, /Public\//);
+      assert.doesNotMatch(homeBody, /Recovery\//);
+      assert.doesNotMatch(homeBody, /AppData/);
+      assert.doesNotMatch(homeBody, /Application Data/);
+      assert.doesNotMatch(homeBody, /OneDrive/);
+      assert.doesNotMatch(homeBody, /NTUSER\.DAT/);
 
       // Verify isHomeOrSystemRoot directly on filesystem root
       assert.equal(await isHomeOrSystemRoot(path.parse(projDir).root), true);
@@ -486,6 +488,7 @@ describe("session-start hook", () => {
       // 3. Scan timeout circuit-breaker bounds latency cleanly on slow directories
       const origReaddir = fs.readdir as (...args: unknown[]) => Promise<unknown>;
       const slowChildPath = path.join(projDir, "src");
+      const pendingMockTimers: NodeJS.Timeout[] = [];
       (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = (
         p: unknown,
         ...rest: unknown[]
@@ -496,6 +499,7 @@ describe("session-start hook", () => {
               origReaddir(p, ...rest).then(resolve, reject);
             }, 300);
             t.unref();
+            pendingMockTimers.push(t);
           });
         }
         return origReaddir(p, ...rest);
@@ -508,6 +512,7 @@ describe("session-start hook", () => {
         assert.ok(elapsed < 220, `Expected timeout circuit-breaker <220ms, got ${elapsed}ms`);
         assert.match(timedSnap, /scan timed out/);
       } finally {
+        for (const t of pendingMockTimers) clearTimeout(t);
         (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddir;
       }
     } finally {

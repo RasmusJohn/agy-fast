@@ -36,7 +36,8 @@ var McpStdioServer = class {
   knownRootsIds = /* @__PURE__ */ new Map();
   rootsWaiters = /* @__PURE__ */ new Set();
   activeOutgoingQueue = null;
-  pendingInitFlush = Promise.resolve();
+  initWriteInFlight = 0;
+  postInitOutgoingQueue = [];
   rootsTimeoutMs;
   constructor(options) {
     this.serverName = options.name;
@@ -77,15 +78,16 @@ var McpStdioServer = class {
     }
     if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
       const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      void this.pendingInitFlush.then(() => {
+      if (this.initWriteInFlight > 0) {
+        this.postInitOutgoingQueue.push(...tasks);
+      } else {
         for (const task of tasks) {
           try {
             task();
           } catch {
           }
         }
-      }).catch(() => {
-      });
+      }
     }
     const minSeq = this.rootsRequestCount;
     return new Promise((resolve) => {
@@ -425,7 +427,23 @@ ${serialized}`);
         ) && !parsed.some(
           (item) => item !== null && typeof item === "object" && item.method === "tools/call"
         );
-        const batchDone = Promise.all(promises).then((responses) => {
+        if (isInitOnlyBatch) {
+          this.initWriteInFlight += 1;
+        }
+        const releaseInitFlush = () => {
+          if (!isInitOnlyBatch) return;
+          this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+          if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+            const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+            for (const task of queued) {
+              try {
+                task();
+              } catch {
+              }
+            }
+          }
+        };
+        void Promise.all(promises).then((responses) => {
           const nonNull = responses.filter(
             (r) => r !== null
           );
@@ -433,14 +451,29 @@ ${serialized}`);
             writeResponse(nonNull, useContentLength);
           }
           flushOutgoingForCall();
+          releaseInitFlush();
         }).catch(() => {
+          releaseInitFlush();
         }).finally(finish);
-        if (isInitOnlyBatch) {
-          this.pendingInitFlush = batchDone;
-        }
         return;
       }
       const isSingleInit = parsed !== null && typeof parsed === "object" && parsed.method === "initialize";
+      if (isSingleInit) {
+        this.initWriteInFlight += 1;
+      }
+      const releaseSingleInitFlush = () => {
+        if (!isSingleInit) return;
+        this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+        if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+          const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+          for (const task of queued) {
+            try {
+              task();
+            } catch {
+            }
+          }
+        }
+      };
       const prevQueue = this.activeOutgoingQueue;
       this.activeOutgoingQueue = outgoingForCall;
       let promise;
@@ -449,16 +482,15 @@ ${serialized}`);
       } finally {
         this.activeOutgoingQueue = prevQueue;
       }
-      const singleDone = promise.then((response) => {
+      void promise.then((response) => {
         if (response !== null) {
           writeResponse(response, useContentLength);
         }
         flushOutgoingForCall();
+        releaseSingleInitFlush();
       }).catch(() => {
+        releaseSingleInitFlush();
       }).finally(finish);
-      if (isSingleInit) {
-        this.pendingInitFlush = singleDone;
-      }
     };
     const drainBuffer = () => {
       while (buffer.length > 0) {

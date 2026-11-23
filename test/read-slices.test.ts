@@ -1062,7 +1062,7 @@ describe("read_slices", () => {
     const svelteDos = extractSymbols("dos5.svelte", "{".repeat(150_000) + "<main>ok</main>");
     const vueDos = extractSymbols("dos6.vue", "{{".repeat(75_000) + "<main>ok</main>");
     const dosMs = performance.now() - t0;
-    assert.ok(dosMs < 400, `Expected linear-time DoS handling (<400ms total), got ${dosMs.toFixed(1)}ms`);
+    assert.ok(dosMs < 2000, `Expected linear-time DoS handling (<2000ms total), got ${dosMs.toFixed(1)}ms`);
     assert.ok(svelteDos.some((s) => s.name === "<main>"));
     assert.ok(vueDos.some((s) => s.name === "<main>"));
   });

@@ -358,7 +358,6 @@ async function raceWithDeadline<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
     timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), remaining);
-    timer.unref();
   });
   try {
     const res = await Promise.race([promise, timeoutPromise]);

@@ -932,7 +932,6 @@ async function raceWithDeadline(promise, deadlineMs) {
   let timer;
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), remaining);
-    timer.unref();
   });
   try {
     const res = await Promise.race([promise, timeoutPromise]);

@@ -86,7 +86,8 @@ export class McpStdioServer {
   private readonly knownRootsIds = new Map<string, number>();
   private readonly rootsWaiters = new Set<{ minSeq: number; resolve: () => void }>();
   private activeOutgoingQueue: Array<() => void> | null = null;
-  private pendingInitFlush: Promise<void> = Promise.resolve();
+  private initWriteInFlight = 0;
+  private postInitOutgoingQueue: Array<() => void> = [];
   private readonly rootsTimeoutMs: number;
 
   constructor(options: {
@@ -156,17 +157,17 @@ export class McpStdioServer {
     // an interactive batch that itself contains both initialize and tools/call.
     if (this.activeOutgoingQueue && this.activeOutgoingQueue.length > 0) {
       const tasks = this.activeOutgoingQueue.splice(0, this.activeOutgoingQueue.length);
-      void this.pendingInitFlush
-        .then(() => {
-          for (const task of tasks) {
-            try {
-              task();
-            } catch {
-              // Ignore write errors if stdout already closed/destroyed
-            }
+      if (this.initWriteInFlight > 0) {
+        this.postInitOutgoingQueue.push(...tasks);
+      } else {
+        for (const task of tasks) {
+          try {
+            task();
+          } catch {
+            // Ignore write errors if stdout already closed/destroyed
           }
-        })
-        .catch(() => {});
+        }
+      }
     }
     const minSeq = this.rootsRequestCount;
     return new Promise<void>((resolve) => {
@@ -582,7 +583,24 @@ export class McpStdioServer {
               typeof item === "object" &&
               (item as JsonRpcRequest).method === "tools/call",
           );
-        const batchDone = Promise.all(promises)
+        if (isInitOnlyBatch) {
+          this.initWriteInFlight += 1;
+        }
+        const releaseInitFlush = () => {
+          if (!isInitOnlyBatch) return;
+          this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+          if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+            const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+            for (const task of queued) {
+              try {
+                task();
+              } catch {
+                // Ignore write errors if stdout already closed/destroyed
+              }
+            }
+          }
+        };
+        void Promise.all(promises)
           .then((responses) => {
             const nonNull = responses.filter(
               (r): r is JsonRpcResponse => r !== null,
@@ -591,14 +609,13 @@ export class McpStdioServer {
               writeResponse(nonNull, useContentLength);
             }
             flushOutgoingForCall();
+            releaseInitFlush();
           })
           .catch(() => {
+            releaseInitFlush();
             // Isolate unexpected handler rejections from crashing stdio loop
           })
           .finally(finish);
-        if (isInitOnlyBatch) {
-          this.pendingInitFlush = batchDone;
-        }
         return;
       }
 
@@ -606,6 +623,23 @@ export class McpStdioServer {
         parsed !== null &&
         typeof parsed === "object" &&
         (parsed as JsonRpcRequest).method === "initialize";
+      if (isSingleInit) {
+        this.initWriteInFlight += 1;
+      }
+      const releaseSingleInitFlush = () => {
+        if (!isSingleInit) return;
+        this.initWriteInFlight = Math.max(0, this.initWriteInFlight - 1);
+        if (this.initWriteInFlight === 0 && this.postInitOutgoingQueue.length > 0) {
+          const queued = this.postInitOutgoingQueue.splice(0, this.postInitOutgoingQueue.length);
+          for (const task of queued) {
+            try {
+              task();
+            } catch {
+              // Ignore write errors if stdout already closed/destroyed
+            }
+          }
+        }
+      };
       const prevQueue = this.activeOutgoingQueue;
       this.activeOutgoingQueue = outgoingForCall;
       let promise: Promise<JsonRpcResponse | null>;
@@ -614,20 +648,19 @@ export class McpStdioServer {
       } finally {
         this.activeOutgoingQueue = prevQueue;
       }
-      const singleDone = promise
+      void promise
         .then((response) => {
           if (response !== null) {
             writeResponse(response, useContentLength);
           }
           flushOutgoingForCall();
+          releaseSingleInitFlush();
         })
         .catch(() => {
+          releaseSingleInitFlush();
           // Isolate unexpected handler rejections from crashing stdio loop
         })
         .finally(finish);
-      if (isSingleInit) {
-        this.pendingInitFlush = singleDone;
-      }
     };
 
     const drainBuffer = (): void => {
