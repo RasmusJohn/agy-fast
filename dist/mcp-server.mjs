@@ -8553,6 +8553,519 @@ function clampInt2(val, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
+// src/cli-runner.ts
+var MAX_CLI_STDIN_BYTES = 2 * 1024 * 1024;
+var IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS = 500;
+var TOOL_ALIASES = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks"
+};
+function resolveCliToolAlias(name) {
+  if (!name) return null;
+  return TOOL_ALIASES[name.trim().toLowerCase()] ?? null;
+}
+function formatCliUsage() {
+  return [
+    "agy-fast direct CLI mode (for Swarm workers, scripts, and non-MCP environments)",
+    "",
+    "Usage:",
+    "  node <plugin>/dist/mcp-server.mjs --cli <command> [options] [args...]",
+    "",
+    "Commands (aliases):",
+    "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
+    "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
+    "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
+    "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
+    "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
+    "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
+    "  check   | run_checks    <cmd...> [--compact|--full] [--concurrency <N>] [--timeout <sec>]",
+    "  edit    | apply_edits   [--best-effort] [--dry-run] [--verify <cmd>] (JSON via --json or stdin)",
+    "",
+    "JSON input (works for every command using the exact MCP tool schema):",
+    "  --json '<json>'         Pass tool arguments JSON object (or shorthand array) inline",
+    "  --stdin                 Read tool arguments JSON from stdin (or pipe/heredoc with no positional args)",
+    "  --cwd <dir>             Override working directory (defaults to shell CWD)",
+    "  --max-chars <N>         Override output character cap (hard UTF-8 ceiling <= 8800 bytes)"
+  ].join("\n");
+}
+function parseIntFlag(flag, raw) {
+  if (raw === void 0 || !/^-?\d+$/.test(raw.trim())) {
+    throw new Error(`Expected integer value after ${flag}`);
+  }
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid integer value after ${flag}: ${raw}`);
+  }
+  return n;
+}
+function requireValue(flag, argv, index) {
+  const next = argv[index + 1];
+  if (next === void 0) {
+    throw new Error(`Missing value after ${flag}`);
+  }
+  return next;
+}
+async function readStdinText(stream, explicitStdin) {
+  if (!explicitStdin && stream.isTTY) {
+    return "";
+  }
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    let firstByteTimer;
+    const cleanup = () => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+      stream.removeListener("error", onError);
+    };
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(text);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const onData = (chunk) => {
+      if (firstByteTimer !== void 0) {
+        clearTimeout(firstByteTimer);
+        firstByteTimer = void 0;
+      }
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      totalBytes += buf.length;
+      if (totalBytes > MAX_CLI_STDIN_BYTES) {
+        fail(new Error(`stdin payload exceeds ${MAX_CLI_STDIN_BYTES} bytes limit`));
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = () => {
+      finish(Buffer.concat(chunks).toString("utf8"));
+    };
+    const onError = (err) => {
+      fail(err);
+    };
+    if (!explicitStdin) {
+      firstByteTimer = setTimeout(() => {
+        if (totalBytes === 0) {
+          finish("");
+        }
+      }, IMPLICIT_STDIN_FIRST_BYTE_TIMEOUT_MS);
+      firstByteTimer.unref();
+    }
+    stream.on("data", onData);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+    if (typeof stream.resume === "function") {
+      stream.resume();
+    }
+  });
+}
+function parseJsonPayload(rawText, tool) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(
+      `Invalid JSON input for '${tool}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (Array.isArray(parsed)) {
+    if (tool === "batch_search") return { queries: parsed };
+    if (tool === "apply_edits") return { edits: parsed };
+    if (tool === "quick_outline") return { paths: parsed };
+    if (tool === "read_slices") {
+      if (parsed.every((item) => typeof item === "string")) {
+        return { lineRanges: parsed };
+      }
+      return { slices: parsed };
+    }
+    if (tool === "run_checks") {
+      return {
+        commands: parsed.map(
+          (item) => typeof item === "string" ? { command: item } : item
+        )
+      };
+    }
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return { ...parsed };
+  }
+  throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
+}
+function parseToolFlags(tool, args) {
+  const opts = {
+    explicitStdin: false,
+    positionals: [],
+    searchQueries: [],
+    outlineFiles: []
+  };
+  let afterDoubleDash = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (afterDoubleDash) {
+      opts.positionals.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (arg === "--cwd") {
+      opts.cwd = requireValue(arg, args, i);
+      i += 1;
+      continue;
+    }
+    if (arg === "--max-chars") {
+      opts.maxChars = parseIntFlag(arg, requireValue(arg, args, i));
+      i += 1;
+      continue;
+    }
+    if (arg === "--json") {
+      opts.jsonRaw = requireValue(arg, args, i);
+      i += 1;
+      continue;
+    }
+    if (arg === "--stdin") {
+      opts.explicitStdin = true;
+      continue;
+    }
+    if (tool === "batch_search") {
+      if (arg === "--text" || arg === "-t") {
+        opts.searchQueries.push({ type: "text", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--regex" || arg === "-r") {
+        opts.searchQueries.push({ type: "regex", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--glob" || arg === "-g") {
+        opts.searchQueries.push({ type: "glob", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--fuzzy" || arg === "-f") {
+        opts.searchQueries.push({ type: "fuzzy", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--git") {
+        opts.searchQueries.push({ type: "git", pattern: requireValue(arg, args, i) });
+        i += 1;
+        continue;
+      }
+      if (arg === "--path" || arg === "-p") {
+        opts.searchPath = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--file-type") {
+        opts.searchFileType = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--glob-filter") {
+        opts.searchGlobFilter = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = requireValue(arg, args, i);
+        if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
+          throw new Error(`Invalid --output-mode: ${mode}`);
+        }
+        opts.searchOutputMode = mode;
+        i += 1;
+        continue;
+      }
+      if (arg === "--sort-by") {
+        const sortBy = requireValue(arg, args, i);
+        if (sortBy !== "path" && sortBy !== "mtime") {
+          throw new Error(`Invalid --sort-by: ${sortBy}`);
+        }
+        opts.searchSortBy = sortBy;
+        i += 1;
+        continue;
+      }
+      if (arg === "--context" || arg === "-C") {
+        opts.searchContextLines = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--max-results") {
+        opts.searchMaxResults = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--ignore-case" || arg === "-i") {
+        opts.searchCaseSensitive = false;
+        continue;
+      }
+      if (arg === "--multiline") {
+        opts.searchMultiline = true;
+        continue;
+      }
+    } else if (tool === "read_slices") {
+      if (arg === "--outline" || arg === "-o") {
+        opts.outlineFiles.push(requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+    } else if (tool === "run_checks") {
+      if (arg === "--compact") {
+        opts.outputMode = "compact";
+        continue;
+      }
+      if (arg === "--full") {
+        opts.outputMode = "full";
+        continue;
+      }
+      if (arg === "--output-mode") {
+        const mode = requireValue(arg, args, i);
+        if (mode !== "compact" && mode !== "full") {
+          throw new Error(`Invalid --output-mode for check: ${mode}`);
+        }
+        opts.outputMode = mode;
+        i += 1;
+        continue;
+      }
+      if (arg === "--concurrency") {
+        opts.concurrency = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--timeout") {
+        opts.timeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+    } else if (tool === "apply_edits") {
+      if (arg === "--best-effort") {
+        opts.bestEffort = true;
+        continue;
+      }
+      if (arg === "--dry-run") {
+        opts.dryRun = true;
+        continue;
+      }
+      if (arg === "--verify") {
+        opts.verify = requireValue(arg, args, i);
+        i += 1;
+        continue;
+      }
+    }
+    if (arg.startsWith("-")) {
+      throw new Error(`Unknown option '${arg}' for '${tool}'. Run with '--cli --help' for usage.`);
+    }
+    opts.positionals.push(arg);
+  }
+  return opts;
+}
+async function runAgyFastCli(argv, io = {}) {
+  const stdin = io.stdin ?? process.stdin;
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const defaultCwd = io.cwd ?? process.cwd();
+  const cmdArg = argv[0];
+  if (!cmdArg || cmdArg === "--help" || cmdArg === "-h" || cmdArg === "help") {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const rest = argv.slice(1);
+  if (rest.includes("--help") || rest.includes("-h")) {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
+  }
+  const tool = resolveCliToolAlias(cmdArg);
+  if (!tool) {
+    stderr.write(
+      `Error: unknown --cli command '${cmdArg}'. Expected one of: search, outline, slice, edit, check (or --help).
+`
+    );
+    return 1;
+  }
+  let opts;
+  try {
+    opts = parseToolFlags(tool, rest);
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
+  let jsonInput = null;
+  try {
+    if (opts.jsonRaw !== void 0) {
+      jsonInput = parseJsonPayload(opts.jsonRaw, tool);
+    } else if (opts.explicitStdin || !hasShorthandArgs) {
+      const stdinText = (await readStdinText(stdin, opts.explicitStdin)).trim();
+      if (stdinText) {
+        jsonInput = parseJsonPayload(stdinText, tool);
+      }
+    }
+  } catch (err) {
+    stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
+`);
+    return 1;
+  }
+  let result;
+  const effectiveCwd = opts.cwd ?? (typeof jsonInput?.cwd === "string" ? jsonInput.cwd : defaultCwd);
+  if (tool === "batch_search") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      const queries = [
+        ...opts.searchQueries,
+        ...opts.positionals.map((pattern) => ({ type: "text", pattern }))
+      ].map((q) => ({
+        ...q,
+        ...opts.searchPath && !q.path ? { path: opts.searchPath } : {},
+        ...opts.searchFileType && !q.fileType ? { fileType: opts.searchFileType } : {},
+        ...opts.searchGlobFilter && !q.glob ? { glob: opts.searchGlobFilter } : {},
+        ...opts.searchOutputMode && !q.outputMode ? { outputMode: opts.searchOutputMode } : {},
+        ...opts.searchSortBy && !q.sortBy ? { sortBy: opts.searchSortBy } : {},
+        ...opts.searchContextLines !== void 0 && q.contextLines === void 0 ? { contextLines: opts.searchContextLines } : {},
+        ...opts.searchMaxResults !== void 0 && q.maxResults === void 0 ? { maxResults: opts.searchMaxResults } : {},
+        ...opts.searchCaseSensitive !== void 0 && q.caseSensitive === void 0 ? { caseSensitive: opts.searchCaseSensitive } : {},
+        ...opts.searchMultiline !== void 0 && q.multiline === void 0 ? { multiline: opts.searchMultiline } : {}
+      }));
+      if (queries.length === 0) {
+        stderr.write(
+          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        queries,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runBatchSearch(payload);
+  } else if (tool === "quick_outline") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          "Error: 'outline' requires one or more file paths (e.g. --cli outline src/a.ts src/b.ts) or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        paths: opts.positionals,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runQuickOutline(payload);
+  } else if (tool === "read_slices") {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0 && opts.outlineFiles.length === 0) {
+        stderr.write(
+          "Error: 'slice' requires lineRanges specs (e.g. src/a.ts:1-60), --outline <file>, or JSON input.\n"
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        ...opts.outlineFiles.length > 0 ? { outlines: opts.outlineFiles } : {},
+        ...opts.positionals.length > 0 ? { lineRanges: opts.positionals } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runReadSlices(payload);
+  } else if (tool === "apply_edits") {
+    if (!jsonInput) {
+      stderr.write(
+        `Error: 'edit' requires JSON input via --json or stdin (e.g. {"edits":[...],"bestEffort":true}).
+`
+      );
+      return 1;
+    }
+    const payload = {
+      ...jsonInput,
+      cwd: effectiveCwd,
+      ...opts.bestEffort !== void 0 ? { bestEffort: opts.bestEffort } : {},
+      ...opts.dryRun !== void 0 ? { dryRun: opts.dryRun } : {},
+      ...opts.verify !== void 0 ? { verify: opts.verify } : {}
+    };
+    result = await runApplyEdits(payload);
+  } else {
+    let payload;
+    if (jsonInput) {
+      payload = {
+        ...jsonInput,
+        cwd: effectiveCwd,
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    } else {
+      if (opts.positionals.length === 0) {
+        stderr.write(
+          `Error: 'check' requires one or more shell command strings (e.g. --cli check "npm run typecheck" "npm test") or JSON input.
+`
+        );
+        return 1;
+      }
+      payload = {
+        cwd: effectiveCwd,
+        commands: opts.positionals.map((command) => ({ command })),
+        ...opts.outputMode !== void 0 ? { outputMode: opts.outputMode } : {},
+        ...opts.concurrency !== void 0 ? { concurrency: opts.concurrency } : {},
+        ...opts.timeoutSec !== void 0 ? { timeoutSec: opts.timeoutSec } : {},
+        ...opts.maxChars !== void 0 ? { maxChars: opts.maxChars } : {}
+      };
+    }
+    result = await runChecks(payload);
+  }
+  stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}
+`);
+  return result.isError ? 1 : 0;
+}
+
 // src/mcp-server.ts
 var SERVER_VERSION = "0.2.10";
 var DEFAULT_PLUGIN_ROOT = path7.resolve(
@@ -9039,6 +9552,18 @@ function createAgyFastServer(options = {}) {
   return server;
 }
 function main() {
+  if (process.argv[2] === "--cli") {
+    void runAgyFastCli(process.argv.slice(3)).then((code) => {
+      process.exitCode = code;
+    }).catch((err) => {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : String(err)}
+`
+      );
+      process.exitCode = 1;
+    });
+    return;
+  }
   const server = createAgyFastServer();
   let flushing = false;
   const exitImmediately = () => {

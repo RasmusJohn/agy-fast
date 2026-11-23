@@ -633,6 +633,27 @@ function parseTranscriptJsonl(content) {
   }
   return steps;
 }
+var AGY_FAST_CLI_RE = /(?:^|[\s"'/\\])mcp-server\.mjs["']?\s+--cli\s+(search|batch_search|outline|quick_outline|slice|slices|read_slices|edit|apply_edits|check|checks|run_checks)(?:\s|$)/i;
+var AGY_FAST_CLI_ALIAS_MAP = {
+  search: "batch_search",
+  batch_search: "batch_search",
+  outline: "quick_outline",
+  quick_outline: "quick_outline",
+  slice: "read_slices",
+  slices: "read_slices",
+  read_slices: "read_slices",
+  edit: "apply_edits",
+  apply_edits: "apply_edits",
+  check: "run_checks",
+  checks: "run_checks",
+  run_checks: "run_checks"
+};
+function extractAgyFastCliToolName(cmd) {
+  if (!cmd || !cmd.includes("--cli")) return null;
+  const m = AGY_FAST_CLI_RE.exec(cmd);
+  if (!m?.[1]) return null;
+  return AGY_FAST_CLI_ALIAS_MAP[m[1].toLowerCase()] ?? null;
+}
 function extractAgyFastToolName(call) {
   const name = call.name ?? "";
   if (name === "call_mcp_tool") {
@@ -646,6 +667,9 @@ function extractAgyFastToolName(call) {
     const isFastServer = !serverName || /(?:^|[_:/-])fast$/i.test(serverName) || /agy-fast/i.test(serverName);
     const m2 = isFastServer ? AGY_FAST_TOOL_RE.exec(toolName) : null;
     return m2?.[1] ?? null;
+  }
+  if (name === "run_command") {
+    return extractAgyFastCliToolName(getCommandString(getCallArgs(call)));
   }
   const m = AGY_FAST_TOOL_RE.exec(name);
   return m?.[1] ?? null;
@@ -887,6 +911,7 @@ function analyzeTranscriptSessions(sessions) {
   };
   let agyEagerCalls = 0;
   let agyLazyCalls = 0;
+  let agyCliCalls = 0;
   let mcpSpillCalls = 0;
   let agyTruncatedCalls = 0;
   let agyMaxResultsCappedCalls = 0;
@@ -1006,11 +1031,19 @@ function analyzeTranscriptSessions(sessions) {
               if (cnt > 1) redundantSameTurnEditFileCalls += 1;
             }
           } else if (name === "run_command") {
-            runCommandCalls += 1;
-            runCmdCallsThisTurn += 1;
             const cmd = getCommandString(callArgs);
-            if (isReadonlySearchShell(cmd)) {
-              readonlySearchRunCommandCalls += 1;
+            const cliFastTool = extractAgyFastCliToolName(cmd);
+            if (cliFastTool && agyFastToolCalls[cliFastTool] !== void 0) {
+              agyFastToolCalls[cliFastTool] = (agyFastToolCalls[cliFastTool] ?? 0) + 1;
+              agyCliCalls += 1;
+              sessionFastCalls += 1;
+              agyCallsThisTurn.push({ callIdx, call, fastTool: cliFastTool });
+            } else {
+              runCommandCalls += 1;
+              runCmdCallsThisTurn += 1;
+              if (isReadonlySearchShell(cmd)) {
+                readonlySearchRunCommandCalls += 1;
+              }
             }
           } else {
             const fastTool = extractAgyFastToolName(call);
@@ -1208,6 +1241,7 @@ function analyzeTranscriptSessions(sessions) {
     agyFastToolCalls,
     agyEagerCalls,
     agyLazyCalls,
+    agyCliCalls,
     mcpSpillCalls,
     agyTruncatedCalls,
     agyMaxResultsCappedCalls,
@@ -1465,7 +1499,7 @@ function formatMetricsMarkdown(m) {
     `| Turns >= 150k context | ${pct(m.over150kContextRatio)} |`,
     `| Average Prompt Cache hit rate | ${pct(m.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(m.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}) |`,
+    `| agy-fast tool calls | ${fastTotal} (search:${m.agyFastToolCalls.batch_search}, edit:${m.agyFastToolCalls.apply_edits}, slice:${m.agyFastToolCalls.read_slices}, outline:${m.agyFastToolCalls.quick_outline ?? 0}, check:${m.agyFastToolCalls.run_checks}; eager:${m.agyEagerCalls}, lazy:${m.agyLazyCalls}${m.agyCliCalls > 0 ? `, cli:${m.agyCliCalls}` : ""}) |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${m.mcpSpillCalls} / ${m.agyTruncatedCalls} / ${m.agyMaxResultsCappedCalls} / ${m.agyErrorCalls} / ${m.agyVerifyFailedCalls} |`,
     ...m.agyUnpairedResultCalls > 0 ? [`| agy-fast unpaired results | ${m.agyUnpairedResultCalls} |`] : [],
     ...m.agyCorruptedArgCalls > 0 ? [
@@ -1532,7 +1566,7 @@ function formatUsageSplitMarkdown(split) {
     `| Average context (tokens) | ${overall.avgContextTokens.toLocaleString("en-US")} | ${wo.avgContextTokens.toLocaleString("en-US")} | ${wf.avgContextTokens.toLocaleString("en-US")} | ${formatDelta(wo.avgContextTokens, wf.avgContextTokens)} |`,
     `| Prompt Cache hit rate | ${pct(overall.avgCacheHitRate)} | ${pct(wo.avgCacheHitRate)} | ${pct(wf.avgCacheHitRate)} | ${formatDelta(wo.avgCacheHitRate, wf.avgCacheHitRate)} |`,
     `| Turn gaps > 60s | ${pct(overall.over60sGapRatio)} | ${pct(wo.over60sGapRatio)} | ${pct(wf.over60sGapRatio)} | ${formatDelta(wo.over60sGapRatio, wf.over60sGapRatio)} |`,
-    `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}) | - |`,
+    `| agy-fast tool calls | ${fastSum(overall)} (eager:${overall.agyEagerCalls}, lazy:${overall.agyLazyCalls}${overall.agyCliCalls > 0 ? `, cli:${overall.agyCliCalls}` : ""}) | 0 | ${fastSum(wf)} (search:${wf.agyFastToolCalls.batch_search}, edit:${wf.agyFastToolCalls.apply_edits}, slice:${wf.agyFastToolCalls.read_slices}, outline:${wf.agyFastToolCalls.quick_outline ?? 0}, check:${wf.agyFastToolCalls.run_checks}; eager:${wf.agyEagerCalls}, lazy:${wf.agyLazyCalls}${wf.agyCliCalls > 0 ? `, cli:${wf.agyCliCalls}` : ""}) | - |`,
     `| agy-fast health (spills / budget-truncs / max-results / errs / verify-fails) | ${overall.mcpSpillCalls} / ${overall.agyTruncatedCalls} / ${overall.agyMaxResultsCappedCalls} / ${overall.agyErrorCalls} / ${overall.agyVerifyFailedCalls} | 0 / 0 / 0 / 0 / 0 | ${wf.mcpSpillCalls} / ${wf.agyTruncatedCalls} / ${wf.agyMaxResultsCappedCalls} / ${wf.agyErrorCalls} / ${wf.agyVerifyFailedCalls} | - |`,
     ...overall.agyUnpairedResultCalls > 0 ? [
       `| agy-fast unpaired results | ${overall.agyUnpairedResultCalls} | 0 | ${wf.agyUnpairedResultCalls} | - |`

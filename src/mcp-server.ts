@@ -18,6 +18,7 @@ import {
   type ReadSlicesInput,
 } from "./tools/read-slices.js";
 import { runChecks, type RunChecksInput } from "./tools/run-checks.js";
+import { runAgyFastCli } from "./cli-runner.js";
 
 const SERVER_VERSION = "0.2.10";
 const DEFAULT_PLUGIN_ROOT = path.resolve(
@@ -571,6 +572,20 @@ export function createAgyFastServer(
 }
 
 function main(): void {
+  if (process.argv[2] === "--cli") {
+    void runAgyFastCli(process.argv.slice(3))
+      .then((code) => {
+        process.exitCode = code;
+      })
+      .catch((err) => {
+        process.stderr.write(
+          `Error: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exitCode = 1;
+      });
+    return;
+  }
+
   const server = createAgyFastServer();
   let flushing = false;
   const exitImmediately = () => {

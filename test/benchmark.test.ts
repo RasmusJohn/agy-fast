@@ -1476,4 +1476,81 @@ describe("benchmark analyzer & CLI", () => {
       /Parallel leaks \(same-MCP \(diff-MCP\) \/ multi-run_command\) \| 1 \(1\) \/ 0 \| 0 \(0\) \/ 0 \| 1 \(1\) \/ 0 \|/,
     );
   });
+
+  it("tracks --cli invocations inside run_command for Swarm workers without counting them as readonly shell leaks", () => {
+    const swarmCliSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-23T08:50:00Z",
+          content: "[Message] @worker audit src/",
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T08:50:02Z",
+          output_tokens: 180,
+          tool_calls: [
+            { name: "read_board", args: {} },
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli outline src/a.ts src/b.ts",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 3,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T08:50:03Z",
+          content: '{"messages":[]}',
+        }),
+        JSON.stringify({
+          step_index: 4,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T08:50:04Z",
+          content: "## Outline: src/a.ts (10 lines)\nL1-L5 [function] alpha",
+        }),
+        JSON.stringify({
+          step_index: 5,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T08:50:05Z",
+          output_tokens: 120,
+          tool_calls: [
+            {
+              name: "run_command",
+              args: {
+                CommandLine:
+                  "node ~/.gemini/config/plugins/agy-fast/dist/mcp-server.mjs --cli search --text alpha",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 6,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T08:50:06Z",
+          content: "## Query 1 [text] alpha\nsrc/a.ts\n  1: export function alpha() {}",
+        }),
+      ].join("\n"),
+    );
+
+    const m = analyzeTranscriptSessions([swarmCliSteps]);
+    assert.equal(m.sessionsWithAgyFast, 1);
+    assert.equal(m.swarmWorkerSessions, 1);
+    assert.equal(m.swarmWorkerSessionsWithAgyFast, 1);
+    assert.equal(m.agyCliCalls, 2);
+    assert.equal(m.agyFastToolCalls.quick_outline, 1);
+    assert.equal(m.agyFastToolCalls.batch_search, 1);
+    assert.equal(m.readonlySearchRunCommandCalls, 0);
+    assert.equal(m.runCommandCalls, 0);
+    assert.match(formatMetricsMarkdown(m), /cli:2/);
+    assert.match(formatMetricsMarkdown(m), /Swarm worker coverage \| 1\/1 using agy-fast/);
+  });
 });
