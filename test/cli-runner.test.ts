@@ -187,4 +187,68 @@ describe("agy-fast --cli direct runner", () => {
     assert.equal(failEdit.code, 1);
     assert.match(failEdit.stdout, /target text not found/);
   });
+
+  it("exits non-zero on failed checks or verify, scopes per-query --path, and searches literal --help/-h", async () => {
+    const subA = path.join(tmpDir, "pkg-a");
+    const subB = path.join(tmpDir, "pkg-b");
+    await fs.mkdir(subA, { recursive: true });
+    await fs.mkdir(subB, { recursive: true });
+    await fs.writeFile(path.join(subA, "cli.ts"), "export const flag = '--help';\nexport const tokenA = 'ONLY_IN_A';\n", "utf8");
+    await fs.writeFile(path.join(subB, "cli.ts"), "export const tokenB = 'ONLY_IN_B';\n", "utf8");
+
+    // 1. Literal --help / -h after --text or -- must search, NOT print CLI usage
+    const literalHelp = await runCliSubprocess(
+      ["search", "--path=pkg-a", "--text", "--help"],
+      { cwd: tmpDir },
+    );
+    assert.equal(literalHelp.code, 0, literalHelp.stderr);
+    assert.doesNotMatch(literalHelp.stdout, /agy-fast direct CLI mode/);
+    assert.match(literalHelp.stdout, /flag = '--help'/);
+
+    const dashDashHelp = await runCliSubprocess(
+      ["search", "--path", "pkg-a", "--", "--help"],
+      { cwd: tmpDir },
+    );
+    assert.equal(dashDashHelp.code, 0, dashDashHelp.stderr);
+    assert.match(dashDashHelp.stdout, /flag = '--help'/);
+
+    // Subcommand --help (not consumed by a value flag) still shows usage and exits 0
+    const subHelp = await runCliSubprocess(["search", "--help"], { cwd: tmpDir });
+    assert.equal(subHelp.code, 0);
+    assert.match(subHelp.stdout, /agy-fast direct CLI mode/);
+
+    // 2. Per-query --path scoping must not overwrite earlier queries
+    const multiScoped = await runCliSubprocess(
+      ["search", "--path", "pkg-a", "--text", "ONLY_IN_A", "--path", "pkg-b", "--text", "ONLY_IN_B"],
+      { cwd: tmpDir },
+    );
+    assert.equal(multiScoped.code, 0, multiScoped.stderr);
+    assert.match(multiScoped.stdout, /Query 1 \[text\] ONLY_IN_A \(in pkg-a\)/);
+    assert.match(multiScoped.stdout, /pkg-a\/cli\.ts/);
+    assert.match(multiScoped.stdout, /Query 2 \[text\] ONLY_IN_B \(in pkg-b\)/);
+    assert.match(multiScoped.stdout, /pkg-b\/cli\.ts/);
+
+    // 3. --cli check MUST return exit code 1 when any command fails
+    const failedCheck = await runCliSubprocess(
+      ["check", 'node -e "process.exit(0)"', 'node -e "console.error(\'BOOM\'); process.exit(2)"'],
+      { cwd: tmpDir },
+    );
+    assert.equal(failedCheck.code, 1);
+    assert.match(failedCheck.stdout, /Checks: 1\/2 passed, 1 failed/);
+    assert.match(failedCheck.stdout, /BOOM/);
+
+    // 4. --cli edit --verify MUST return exit code 1 when edits succeed but verify fails
+    const failedVerifyEdit = await runCliSubprocess(
+      ["edit", "--verify=node -e \"console.error('TYPE_ERR'); process.exit(1)\""],
+      {
+        cwd: tmpDir,
+        stdin: JSON.stringify({
+          edits: [{ path: "pkg-b/cli.ts", hunks: [{ target: "ONLY_IN_B", replacement: "ONLY_IN_B_V2" }] }],
+        }),
+      },
+    );
+    assert.equal(failedVerifyEdit.code, 1);
+    assert.match(failedVerifyEdit.stdout, /Verify \[FAIL/);
+    assert.match(failedVerifyEdit.stdout, /TYPE_ERR/);
+  });
 });

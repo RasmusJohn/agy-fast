@@ -1186,13 +1186,46 @@ var ANSI_REGEX = (
 function stripAnsi(text) {
   return text.replace(ANSI_REGEX, "");
 }
+var LINE_ERASE_CSI_RE = /\x1B\[(?:2K|0?K)/;
+var LEADING_CLEAR_TO_EOL_RE = /^(?:\x1B\[0?K)+/;
 function normalizeTerminalOutput(raw) {
-  const clean = stripAnsi(raw).replace(/\r\n/g, "\n");
-  return clean.split("\n").map((line) => {
-    if (!line.includes("\r")) return line;
-    const parts = line.split("\r").filter((p) => p.length > 0);
-    return parts[parts.length - 1] ?? "";
-  }).join("\n").trimEnd();
+  const rawLines = raw.replace(/\r\n/g, "\n").split("\n");
+  const normalizedLines = [];
+  for (const rawLine of rawLines) {
+    if (rawLine.length === 0) {
+      normalizedLines.push("");
+      continue;
+    }
+    const hadLineErase = LINE_ERASE_CSI_RE.test(rawLine);
+    let working = rawLine;
+    const lastFullErase = working.lastIndexOf("\x1B[2K");
+    if (lastFullErase !== -1) {
+      working = working.slice(lastFullErase + 4);
+    }
+    if (!working.includes("\r") && !hadLineErase) {
+      normalizedLines.push(stripAnsi(working));
+      continue;
+    }
+    let currentFrame = "";
+    const crFrames = working.split("\r");
+    for (let idx = 0; idx < crFrames.length; idx++) {
+      let seg = crFrames[idx];
+      if (idx > 0 && LEADING_CLEAR_TO_EOL_RE.test(seg)) {
+        seg = seg.replace(LEADING_CLEAR_TO_EOL_RE, "");
+        currentFrame = stripAnsi(seg);
+        continue;
+      }
+      const cleanSeg = stripAnsi(seg);
+      if (cleanSeg.length > 0) {
+        currentFrame = cleanSeg;
+      }
+    }
+    if (hadLineErase && currentFrame.length === 0) {
+      continue;
+    }
+    normalizedLines.push(currentFrame);
+  }
+  return normalizedLines.join("\n").trimEnd();
 }
 var DEFAULT_INLINE_MAX_BYTES = 8800;
 function sliceUtf8Bytes(text, maxBytes) {
@@ -1547,18 +1580,32 @@ var GREEN_BUILD_OR_PASS_PATTERNS = [
   /^>\s+Task\s+:[\w:.-]+\s+(?:UP-TO-DATE|FROM-CACHE|NO-SOURCE|SKIPPED)\s*$/,
   /^\[INFO\]\s*(?:---\s+\S|Building\s+\S|Compiling\s+\S|Changes detected|Nothing to compile|Copying\s+\d+|Using\s+'[^']+'\s+encoding|Downloading\b|Downloaded\b|Installing\s+\S|Packaging\s+\S|Tests run:\s*\d+,\s*Failures:\s*0,\s*Errors:\s*0\b|Results:|Running\s+\S|Reactor Summary|BUILD SUCCESS|Total time:|Finished at:|-+\s*$|$)/i
 ];
+var UNAMBIGUOUS_TEST_PASS_PATTERNS = [
+  /^[✓✔]\s+(?!built\b|done\b|\d+\s+modules?\s+transformed\b)\S/,
+  /^---\s+PASS:\s+\S/,
+  /^ok\s+\d+\s+-\s+\S/,
+  /^ok\t\S/,
+  /^test\s+\S+\s+\.\.\.\s+ok\s*$/,
+  /^PASS\s+\S+\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|cs|php|vue|svelte)\b/
+];
+function isUnambiguousTestPassLine(trimmed) {
+  if (!trimmed || /[✖✘✗×]/.test(trimmed)) return false;
+  return UNAMBIGUOUS_TEST_PASS_PATTERNS.some((re) => re.test(trimmed));
+}
 var MIN_FOLD_RUN_LINES = 4;
 var PROTECTED_TAIL_LINES = 15;
 function isGreenBuildOrPassLine(line) {
   const trimmed = line.trim();
   if (!trimmed) return false;
+  if (isUnambiguousTestPassLine(trimmed)) return true;
+  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+  const inner = prefixMatch ? trimmed.slice(prefixMatch[0].length).trim() : "";
+  if (inner && isUnambiguousTestPassLine(inner)) return true;
   if (hasFoldDangerToken(trimmed)) return false;
   if (GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(trimmed))) {
     return true;
   }
-  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
   if (prefixMatch) {
-    const inner = trimmed.slice(prefixMatch[0].length).trim();
     if (!inner) return false;
     if (inner === "Done") return true;
     return GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(inner));
@@ -1725,6 +1772,12 @@ function compactLongFailureLines(lines, maxChars) {
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const trimmed = line.trim();
+    const monoMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+    const monoInner = monoMatch ? trimmed.slice(monoMatch[0].length).trim() : "";
+    if (isUnambiguousTestPassLine(trimmed) || monoInner.length > 0 && isUnambiguousTestPassLine(monoInner)) {
+      continue;
+    }
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
       if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
@@ -8643,6 +8696,13 @@ async function readStdinText(stream, explicitStdin) {
       if (settled) return;
       settled = true;
       cleanup();
+      if (typeof stream.pause === "function") {
+        stream.pause();
+      }
+      const maybeUnref = stream.unref;
+      if (typeof maybeUnref === "function") {
+        maybeUnref.call(stream);
+      }
       reject(err);
     };
     const onData = (chunk) => {
@@ -8714,13 +8774,79 @@ function parseJsonPayload(rawText, tool) {
   }
   throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
 }
-function parseToolFlags(tool, args) {
+function applySearchModifiers(q, mods) {
+  return {
+    ...q,
+    ...mods.path !== void 0 && q.path === void 0 ? { path: mods.path } : {},
+    ...mods.fileType !== void 0 && q.fileType === void 0 ? { fileType: mods.fileType } : {},
+    ...mods.glob !== void 0 && q.glob === void 0 ? { glob: mods.glob } : {},
+    ...mods.outputMode !== void 0 && q.outputMode === void 0 ? { outputMode: mods.outputMode } : {},
+    ...mods.sortBy !== void 0 && q.sortBy === void 0 ? { sortBy: mods.sortBy } : {},
+    ...mods.contextLines !== void 0 && q.contextLines === void 0 ? { contextLines: mods.contextLines } : {},
+    ...mods.maxResults !== void 0 && q.maxResults === void 0 ? { maxResults: mods.maxResults } : {},
+    ...mods.caseSensitive !== void 0 && q.caseSensitive === void 0 ? { caseSensitive: mods.caseSensitive } : {},
+    ...mods.multiline !== void 0 && q.multiline === void 0 ? { multiline: mods.multiline } : {}
+  };
+}
+var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--text",
+  "--regex",
+  "--glob",
+  "--fuzzy",
+  "--git",
+  "--path",
+  "--file-type",
+  "--glob-filter",
+  "--output-mode",
+  "--sort-by",
+  "--context",
+  "--max-results",
+  "--outline",
+  "--concurrency",
+  "--timeout",
+  "--verify",
+  "--verify-timeout",
+  "--max-verify-chars"
+]);
+function normalizeCliArgs(rawArgs) {
+  const out = [];
+  let afterDoubleDash = false;
+  for (const arg of rawArgs) {
+    if (afterDoubleDash) {
+      out.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      out.push(arg);
+      continue;
+    }
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 2 && arg.startsWith("--")) {
+      const flag = arg.slice(0, eqIdx);
+      if (VALUE_LONG_FLAGS.has(flag)) {
+        out.push(flag, arg.slice(eqIdx + 1));
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+function parseToolFlags(tool, rawArgs) {
+  const args = normalizeCliArgs(rawArgs);
   const opts = {
+    showHelp: false,
     explicitStdin: false,
     positionals: [],
     searchQueries: [],
+    trailingSearchMods: {},
     outlineFiles: []
   };
+  let pendingMods = {};
   let afterDoubleDash = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -8730,6 +8856,10 @@ function parseToolFlags(tool, args) {
     }
     if (arg === "--") {
       afterDoubleDash = true;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      opts.showHelp = true;
       continue;
     }
     if (arg === "--cwd") {
@@ -8752,43 +8882,47 @@ function parseToolFlags(tool, args) {
       continue;
     }
     if (tool === "batch_search") {
+      const pushScopedQuery = (base) => {
+        opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+        pendingMods = {};
+      };
       if (arg === "--text" || arg === "-t") {
-        opts.searchQueries.push({ type: "text", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "text", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--regex" || arg === "-r") {
-        opts.searchQueries.push({ type: "regex", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "regex", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--glob" || arg === "-g") {
-        opts.searchQueries.push({ type: "glob", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "glob", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--fuzzy" || arg === "-f") {
-        opts.searchQueries.push({ type: "fuzzy", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "fuzzy", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--git") {
-        opts.searchQueries.push({ type: "git", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "git", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--path" || arg === "-p") {
-        opts.searchPath = requireValue(arg, args, i);
+        pendingMods.path = requireValue(arg, args, i);
         i += 1;
         continue;
       }
       if (arg === "--file-type") {
-        opts.searchFileType = requireValue(arg, args, i);
+        pendingMods.fileType = requireValue(arg, args, i);
         i += 1;
         continue;
       }
       if (arg === "--glob-filter") {
-        opts.searchGlobFilter = requireValue(arg, args, i);
+        pendingMods.glob = requireValue(arg, args, i);
         i += 1;
         continue;
       }
@@ -8797,7 +8931,7 @@ function parseToolFlags(tool, args) {
         if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
           throw new Error(`Invalid --output-mode: ${mode}`);
         }
-        opts.searchOutputMode = mode;
+        pendingMods.outputMode = mode;
         i += 1;
         continue;
       }
@@ -8806,26 +8940,26 @@ function parseToolFlags(tool, args) {
         if (sortBy !== "path" && sortBy !== "mtime") {
           throw new Error(`Invalid --sort-by: ${sortBy}`);
         }
-        opts.searchSortBy = sortBy;
+        pendingMods.sortBy = sortBy;
         i += 1;
         continue;
       }
       if (arg === "--context" || arg === "-C") {
-        opts.searchContextLines = parseIntFlag(arg, requireValue(arg, args, i));
+        pendingMods.contextLines = parseIntFlag(arg, requireValue(arg, args, i));
         i += 1;
         continue;
       }
       if (arg === "--max-results") {
-        opts.searchMaxResults = parseIntFlag(arg, requireValue(arg, args, i));
+        pendingMods.maxResults = parseIntFlag(arg, requireValue(arg, args, i));
         i += 1;
         continue;
       }
       if (arg === "--ignore-case" || arg === "-i") {
-        opts.searchCaseSensitive = false;
+        pendingMods.caseSensitive = false;
         continue;
       }
       if (arg === "--multiline") {
-        opts.searchMultiline = true;
+        pendingMods.multiline = true;
         continue;
       }
     } else if (tool === "read_slices") {
@@ -8876,12 +9010,23 @@ function parseToolFlags(tool, args) {
         i += 1;
         continue;
       }
+      if (arg === "--verify-timeout") {
+        opts.verifyTimeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--max-verify-chars") {
+        opts.maxVerifyChars = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
     }
     if (arg.startsWith("-")) {
       throw new Error(`Unknown option '${arg}' for '${tool}'. Run with '--cli --help' for usage.`);
     }
     opts.positionals.push(arg);
   }
+  opts.trailingSearchMods = pendingMods;
   return opts;
 }
 async function runAgyFastCli(argv, io = {}) {
@@ -8896,11 +9041,6 @@ async function runAgyFastCli(argv, io = {}) {
     return 0;
   }
   const rest = argv.slice(1);
-  if (rest.includes("--help") || rest.includes("-h")) {
-    stdout.write(`${formatCliUsage()}
-`);
-    return 0;
-  }
   const tool = resolveCliToolAlias(cmdArg);
   if (!tool) {
     stderr.write(
@@ -8916,6 +9056,11 @@ async function runAgyFastCli(argv, io = {}) {
     stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}
 `);
     return 1;
+  }
+  if (opts.showHelp) {
+    stdout.write(`${formatCliUsage()}
+`);
+    return 0;
   }
   const hasShorthandArgs = opts.positionals.length > 0 || opts.searchQueries.length > 0 || opts.outlineFiles.length > 0;
   let jsonInput = null;
@@ -8947,18 +9092,7 @@ async function runAgyFastCli(argv, io = {}) {
       const queries = [
         ...opts.searchQueries,
         ...opts.positionals.map((pattern) => ({ type: "text", pattern }))
-      ].map((q) => ({
-        ...q,
-        ...opts.searchPath && !q.path ? { path: opts.searchPath } : {},
-        ...opts.searchFileType && !q.fileType ? { fileType: opts.searchFileType } : {},
-        ...opts.searchGlobFilter && !q.glob ? { glob: opts.searchGlobFilter } : {},
-        ...opts.searchOutputMode && !q.outputMode ? { outputMode: opts.searchOutputMode } : {},
-        ...opts.searchSortBy && !q.sortBy ? { sortBy: opts.searchSortBy } : {},
-        ...opts.searchContextLines !== void 0 && q.contextLines === void 0 ? { contextLines: opts.searchContextLines } : {},
-        ...opts.searchMaxResults !== void 0 && q.maxResults === void 0 ? { maxResults: opts.searchMaxResults } : {},
-        ...opts.searchCaseSensitive !== void 0 && q.caseSensitive === void 0 ? { caseSensitive: opts.searchCaseSensitive } : {},
-        ...opts.searchMultiline !== void 0 && q.multiline === void 0 ? { multiline: opts.searchMultiline } : {}
-      }));
+      ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
       if (queries.length === 0) {
         stderr.write(
           "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n"
@@ -9025,12 +9159,15 @@ async function runAgyFastCli(argv, io = {}) {
       );
       return 1;
     }
+    const effectiveMaxVerifyChars = opts.maxVerifyChars ?? (opts.maxChars !== void 0 ? Math.max(300, Math.min(7500, opts.maxChars)) : void 0);
     const payload = {
       ...jsonInput,
       cwd: effectiveCwd,
       ...opts.bestEffort !== void 0 ? { bestEffort: opts.bestEffort } : {},
       ...opts.dryRun !== void 0 ? { dryRun: opts.dryRun } : {},
-      ...opts.verify !== void 0 ? { verify: opts.verify } : {}
+      ...opts.verify !== void 0 ? { verify: opts.verify } : {},
+      ...opts.verifyTimeoutSec !== void 0 ? { verifyTimeoutSec: opts.verifyTimeoutSec } : {},
+      ...effectiveMaxVerifyChars !== void 0 ? { maxVerifyChars: effectiveMaxVerifyChars } : {}
     };
     result = await runApplyEdits(payload);
   } else {
@@ -9065,7 +9202,10 @@ async function runAgyFastCli(argv, io = {}) {
   }
   stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}
 `);
-  return result.isError ? 1 : 0;
+  const cliFailed = result.isError || tool === "run_checks" && /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|0\s+failed,\s+[1-9]\d*\s+not run)\b/.test(
+    result.text
+  ) || tool === "apply_edits" && /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text);
+  return cliFailed ? 1 : 0;
 }
 
 // src/mcp-server.ts

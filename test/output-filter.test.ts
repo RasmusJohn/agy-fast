@@ -6,6 +6,7 @@ import {
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
   formatCompactCommandOutputWithMeta,
+  normalizeTerminalOutput,
 } from "../src/utils/output-filter.js";
 
 describe("output-filter", () => {
@@ -527,5 +528,40 @@ describe("output-filter", () => {
     assert.ok(elapsedMs < 500, `Expected linear-time < 500ms on adversarial input, took ${elapsedMs.toFixed(1)}ms`);
     assert.ok(res.text.length <= 1000);
     assert.match(res.text, /tail line 15/);
+  });
+
+  it("folds passing test lines containing error-domain words without hiding actual mid-suite failures, and drops ANSI-erased spinner lines", () => {
+    const spinnerRaw =
+      "⠋ Transforming (12/140)...\r\x1B[2K\n⠙ Bundling chunks...\r\x1B[K\n⠹ Resolving...\r\x1B[2K✓ Built client\n\nReal error: boom";
+    assert.equal(normalizeTerminalOutput(spinnerRaw), "✓ Built client\n\nReal error: boom");
+
+    const suiteLines = [
+      ...Array.from(
+        { length: 40 },
+        (_, i) =>
+          `✔ test #${i + 1}: handles invalid error, undefined input, not found, and timeout cleanly (1.2ms)`,
+      ),
+      "✖ ACTUAL_FAILING_TEST_AT_MIDPOINT (4.8ms)",
+      "  AssertionError [ERR_ASSERTION]: Expected status 200 but received 500",
+      ...Array.from(
+        { length: 30 },
+        (_, i) => `      at Layer.handle (/repo/src/router/frame_${i}.ts:${i + 10}:15)`,
+      ),
+      "ℹ tests 41",
+      "ℹ pass 40",
+      "ℹ fail 1",
+    ];
+    const meta = formatCompactCommandOutputWithMeta({
+      stdout: suiteLines.join("\n"),
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      maxChars: 950,
+    });
+    assert.equal(meta.collapsedLines, 40);
+    assert.match(meta.text, /collapsed 40 build\/pass lines/);
+    assert.match(meta.text, /ACTUAL_FAILING_TEST_AT_MIDPOINT/);
+    assert.match(meta.text, /AssertionError \[ERR_ASSERTION\]/);
+    assert.match(meta.text, /ℹ fail 1/);
   });
 });

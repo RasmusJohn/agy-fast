@@ -1552,5 +1552,77 @@ describe("benchmark analyzer & CLI", () => {
     assert.equal(m.runCommandCalls, 0);
     assert.match(formatMetricsMarkdown(m), /cli:2/);
     assert.match(formatMetricsMarkdown(m), /Swarm worker coverage \| 1\/1 using agy-fast/);
+
+    // Verify --cli false-positives (rg/echo), wrapped --cli error/verify-fail detection,
+    // read_slices string-shorthand non-corruption, and Windows 2>NUL / PowerShell readonly detection
+    const cliEdgeSteps = parseTranscriptJsonl(
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T09:00:00Z",
+          output_tokens: 200,
+          tool_calls: [
+            {
+              name: "mcp_agy-fast_fast_read_slices",
+              args: { slices: ["src/a.ts:1-20"] },
+            },
+            {
+              name: "run_command",
+              args: { CommandLine: 'rg "mcp-server.mjs --cli search" src/ 2>NUL' },
+            },
+            {
+              name: "run_command",
+              args: { CommandLine: "Select-String -Path src/*.ts -Pattern alpha 2>$null" },
+            },
+          ],
+        }),
+        JSON.stringify({ step_index: 2, type: "GENERIC", status: "DONE", created_at: "2026-11-23T09:00:01Z", content: "slice ok" }),
+        JSON.stringify({ step_index: 3, type: "GENERIC", status: "DONE", created_at: "2026-11-23T09:00:02Z", content: "rg match" }),
+        JSON.stringify({ step_index: 4, type: "GENERIC", status: "DONE", created_at: "2026-11-23T09:00:02Z", content: "sls match" }),
+        JSON.stringify({
+          step_index: 5,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-23T09:00:03Z",
+          output_tokens: 150,
+          tool_calls: [
+            {
+              name: "run_command",
+              args: { CommandLine: "node dist/mcp-server.mjs --cli edit --json '{bad'" },
+            },
+            {
+              name: "run_command",
+              args: { CommandLine: "node dist/mcp-server.mjs --cli edit --verify 'npm test' --json '{}'" },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 6,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:00:04Z",
+          content: "Created At: 2026-11-23T09:00:03Z\nCompleted At: 2026-11-23T09:00:04Z\nCommand exited with code 1.\n\nCommand output:\nError: Invalid JSON input for 'apply_edits'",
+        }),
+        JSON.stringify({
+          step_index: 7,
+          type: "GENERIC",
+          status: "DONE",
+          created_at: "2026-11-23T09:00:05Z",
+          content: "Command exited with code 1.\n\nCommand output:\nApplied edits to 1 file(s):\n- a.ts: updated\n\nVerify [FAIL (exit 1) in 45ms] `npm test`:\nFAIL",
+        }),
+      ].join("\n"),
+    );
+
+    const em = analyzeTranscriptSessions([cliEdgeSteps]);
+    assert.equal(em.agyCorruptedArgCalls, 0);
+    assert.equal(em.agyCliCalls, 2); // rg "mcp-server.mjs --cli search" NOT miscounted as --cli!
+    assert.equal(em.readonlySearchRunCommandCalls, 2); // 2>NUL and PowerShell Select-String 2>$null recognized!
+    assert.equal(em.agyErrorCalls, 1);
+    assert.equal(em.agyVerifyFailedCalls, 1);
+    assert.equal(em.multiSameMcpTurns, 1); // 2 --cli edit calls in same turn tracked as duplicate batching leak!
+    assert.match(
+      formatCompareMarkdown(m, em),
+      /agy-fast dispatch \(eager \/ lazy \/ cli\) \| 0 \/ 0 \/ 2 \| 1 \/ 0 \/ 2 \|/,
+    );
   });
 });

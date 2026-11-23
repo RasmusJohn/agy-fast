@@ -127,6 +127,13 @@ async function readStdinText(
       if (settled) return;
       settled = true;
       cleanup();
+      if (typeof (stream as { pause?: () => void }).pause === "function") {
+        (stream as { pause: () => void }).pause();
+      }
+      const maybeUnref = (stream as unknown as { unref?: () => void }).unref;
+      if (typeof maybeUnref === "function") {
+        maybeUnref.call(stream);
+      }
       reject(err);
     };
 
@@ -208,7 +215,100 @@ function parseJsonPayload(
   throw new Error(`JSON input for '${tool}' must be an object (or shorthand array).`);
 }
 
+interface SearchQueryModifiers {
+  path?: string;
+  fileType?: string;
+  glob?: string;
+  outputMode?: "content" | "files_with_matches" | "count";
+  sortBy?: "path" | "mtime";
+  contextLines?: number;
+  maxResults?: number;
+  caseSensitive?: boolean;
+  multiline?: boolean;
+}
+
+function applySearchModifiers(
+  q: SearchQuery,
+  mods: SearchQueryModifiers,
+): SearchQuery {
+  return {
+    ...q,
+    ...(mods.path !== undefined && q.path === undefined ? { path: mods.path } : {}),
+    ...(mods.fileType !== undefined && q.fileType === undefined
+      ? { fileType: mods.fileType }
+      : {}),
+    ...(mods.glob !== undefined && q.glob === undefined ? { glob: mods.glob } : {}),
+    ...(mods.outputMode !== undefined && q.outputMode === undefined
+      ? { outputMode: mods.outputMode }
+      : {}),
+    ...(mods.sortBy !== undefined && q.sortBy === undefined ? { sortBy: mods.sortBy } : {}),
+    ...(mods.contextLines !== undefined && q.contextLines === undefined
+      ? { contextLines: mods.contextLines }
+      : {}),
+    ...(mods.maxResults !== undefined && q.maxResults === undefined
+      ? { maxResults: mods.maxResults }
+      : {}),
+    ...(mods.caseSensitive !== undefined && q.caseSensitive === undefined
+      ? { caseSensitive: mods.caseSensitive }
+      : {}),
+    ...(mods.multiline !== undefined && q.multiline === undefined
+      ? { multiline: mods.multiline }
+      : {}),
+  };
+}
+
+const VALUE_LONG_FLAGS = new Set([
+  "--cwd",
+  "--max-chars",
+  "--json",
+  "--text",
+  "--regex",
+  "--glob",
+  "--fuzzy",
+  "--git",
+  "--path",
+  "--file-type",
+  "--glob-filter",
+  "--output-mode",
+  "--sort-by",
+  "--context",
+  "--max-results",
+  "--outline",
+  "--concurrency",
+  "--timeout",
+  "--verify",
+  "--verify-timeout",
+  "--max-verify-chars",
+]);
+
+function normalizeCliArgs(rawArgs: string[]): string[] {
+  const out: string[] = [];
+  let afterDoubleDash = false;
+  for (const arg of rawArgs) {
+    if (afterDoubleDash) {
+      out.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      out.push(arg);
+      continue;
+    }
+    const eqIdx = arg.indexOf("=");
+    if (eqIdx > 2 && arg.startsWith("--")) {
+      const flag = arg.slice(0, eqIdx);
+      if (VALUE_LONG_FLAGS.has(flag)) {
+        out.push(flag, arg.slice(eqIdx + 1));
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
 interface ParsedCliOptions {
+  showHelp: boolean;
   cwd?: string;
   maxChars?: number;
   jsonRaw?: string;
@@ -216,15 +316,7 @@ interface ParsedCliOptions {
   positionals: string[];
   // search flags
   searchQueries: SearchQuery[];
-  searchPath?: string;
-  searchFileType?: string;
-  searchGlobFilter?: string;
-  searchOutputMode?: "content" | "files_with_matches" | "count";
-  searchSortBy?: "path" | "mtime";
-  searchContextLines?: number;
-  searchMaxResults?: number;
-  searchCaseSensitive?: boolean;
-  searchMultiline?: boolean;
+  trailingSearchMods: SearchQueryModifiers;
   // slice flags
   outlineFiles: string[];
   // check flags
@@ -235,15 +327,21 @@ interface ParsedCliOptions {
   bestEffort?: boolean;
   dryRun?: boolean;
   verify?: string;
+  verifyTimeoutSec?: number;
+  maxVerifyChars?: number;
 }
 
-function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOptions {
+function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOptions {
+  const args = normalizeCliArgs(rawArgs);
   const opts: ParsedCliOptions = {
+    showHelp: false,
     explicitStdin: false,
     positionals: [],
     searchQueries: [],
+    trailingSearchMods: {},
     outlineFiles: [],
   };
+  let pendingMods: SearchQueryModifiers = {};
 
   let afterDoubleDash = false;
   for (let i = 0; i < args.length; i++) {
@@ -254,6 +352,10 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
     }
     if (arg === "--") {
       afterDoubleDash = true;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      opts.showHelp = true;
       continue;
     }
     if (arg === "--cwd") {
@@ -277,43 +379,47 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
     }
 
     if (tool === "batch_search") {
+      const pushScopedQuery = (base: SearchQuery) => {
+        opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+        pendingMods = {};
+      };
       if (arg === "--text" || arg === "-t") {
-        opts.searchQueries.push({ type: "text", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "text", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--regex" || arg === "-r") {
-        opts.searchQueries.push({ type: "regex", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "regex", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--glob" || arg === "-g") {
-        opts.searchQueries.push({ type: "glob", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "glob", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--fuzzy" || arg === "-f") {
-        opts.searchQueries.push({ type: "fuzzy", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "fuzzy", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--git") {
-        opts.searchQueries.push({ type: "git", pattern: requireValue(arg, args, i) });
+        pushScopedQuery({ type: "git", pattern: requireValue(arg, args, i) });
         i += 1;
         continue;
       }
       if (arg === "--path" || arg === "-p") {
-        opts.searchPath = requireValue(arg, args, i);
+        pendingMods.path = requireValue(arg, args, i);
         i += 1;
         continue;
       }
       if (arg === "--file-type") {
-        opts.searchFileType = requireValue(arg, args, i);
+        pendingMods.fileType = requireValue(arg, args, i);
         i += 1;
         continue;
       }
       if (arg === "--glob-filter") {
-        opts.searchGlobFilter = requireValue(arg, args, i);
+        pendingMods.glob = requireValue(arg, args, i);
         i += 1;
         continue;
       }
@@ -322,7 +428,7 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
         if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") {
           throw new Error(`Invalid --output-mode: ${mode}`);
         }
-        opts.searchOutputMode = mode;
+        pendingMods.outputMode = mode;
         i += 1;
         continue;
       }
@@ -331,26 +437,26 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
         if (sortBy !== "path" && sortBy !== "mtime") {
           throw new Error(`Invalid --sort-by: ${sortBy}`);
         }
-        opts.searchSortBy = sortBy;
+        pendingMods.sortBy = sortBy;
         i += 1;
         continue;
       }
       if (arg === "--context" || arg === "-C") {
-        opts.searchContextLines = parseIntFlag(arg, requireValue(arg, args, i));
+        pendingMods.contextLines = parseIntFlag(arg, requireValue(arg, args, i));
         i += 1;
         continue;
       }
       if (arg === "--max-results") {
-        opts.searchMaxResults = parseIntFlag(arg, requireValue(arg, args, i));
+        pendingMods.maxResults = parseIntFlag(arg, requireValue(arg, args, i));
         i += 1;
         continue;
       }
       if (arg === "--ignore-case" || arg === "-i") {
-        opts.searchCaseSensitive = false;
+        pendingMods.caseSensitive = false;
         continue;
       }
       if (arg === "--multiline") {
-        opts.searchMultiline = true;
+        pendingMods.multiline = true;
         continue;
       }
     } else if (tool === "read_slices") {
@@ -401,6 +507,16 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
         i += 1;
         continue;
       }
+      if (arg === "--verify-timeout") {
+        opts.verifyTimeoutSec = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
+      if (arg === "--max-verify-chars") {
+        opts.maxVerifyChars = parseIntFlag(arg, requireValue(arg, args, i));
+        i += 1;
+        continue;
+      }
     }
 
     if (arg.startsWith("-")) {
@@ -409,6 +525,7 @@ function parseToolFlags(tool: CliCanonicalTool, args: string[]): ParsedCliOption
     opts.positionals.push(arg);
   }
 
+  opts.trailingSearchMods = pendingMods;
   return opts;
 }
 
@@ -428,11 +545,6 @@ export async function runAgyFastCli(
   }
 
   const rest = argv.slice(1);
-  if (rest.includes("--help") || rest.includes("-h")) {
-    stdout.write(`${formatCliUsage()}\n`);
-    return 0;
-  }
-
   const tool = resolveCliToolAlias(cmdArg);
   if (!tool) {
     stderr.write(
@@ -447,6 +559,11 @@ export async function runAgyFastCli(
   } catch (err) {
     stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;
+  }
+
+  if (opts.showHelp) {
+    stdout.write(`${formatCliUsage()}\n`);
+    return 0;
   }
 
   const hasShorthandArgs =
@@ -484,26 +601,7 @@ export async function runAgyFastCli(
       const queries: SearchQuery[] = [
         ...opts.searchQueries,
         ...opts.positionals.map((pattern): SearchQuery => ({ type: "text", pattern })),
-      ].map((q) => ({
-        ...q,
-        ...(opts.searchPath && !q.path ? { path: opts.searchPath } : {}),
-        ...(opts.searchFileType && !q.fileType ? { fileType: opts.searchFileType } : {}),
-        ...(opts.searchGlobFilter && !q.glob ? { glob: opts.searchGlobFilter } : {}),
-        ...(opts.searchOutputMode && !q.outputMode ? { outputMode: opts.searchOutputMode } : {}),
-        ...(opts.searchSortBy && !q.sortBy ? { sortBy: opts.searchSortBy } : {}),
-        ...(opts.searchContextLines !== undefined && q.contextLines === undefined
-          ? { contextLines: opts.searchContextLines }
-          : {}),
-        ...(opts.searchMaxResults !== undefined && q.maxResults === undefined
-          ? { maxResults: opts.searchMaxResults }
-          : {}),
-        ...(opts.searchCaseSensitive !== undefined && q.caseSensitive === undefined
-          ? { caseSensitive: opts.searchCaseSensitive }
-          : {}),
-        ...(opts.searchMultiline !== undefined && q.multiline === undefined
-          ? { multiline: opts.searchMultiline }
-          : {}),
-      }));
+      ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
       if (queries.length === 0) {
         stderr.write(
           "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n",
@@ -569,12 +667,23 @@ export async function runAgyFastCli(
       );
       return 1;
     }
+    const effectiveMaxVerifyChars =
+      opts.maxVerifyChars ??
+      (opts.maxChars !== undefined
+        ? Math.max(300, Math.min(7500, opts.maxChars))
+        : undefined);
     const payload: ApplyEditsInput = {
       ...(jsonInput as unknown as ApplyEditsInput),
       cwd: effectiveCwd,
       ...(opts.bestEffort !== undefined ? { bestEffort: opts.bestEffort } : {}),
       ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
       ...(opts.verify !== undefined ? { verify: opts.verify } : {}),
+      ...(opts.verifyTimeoutSec !== undefined
+        ? { verifyTimeoutSec: opts.verifyTimeoutSec }
+        : {}),
+      ...(effectiveMaxVerifyChars !== undefined
+        ? { maxVerifyChars: effectiveMaxVerifyChars }
+        : {}),
     };
     result = await runApplyEdits(payload);
   } else {
@@ -608,5 +717,13 @@ export async function runAgyFastCli(
   }
 
   stdout.write(result.text.endsWith("\n") ? result.text : `${result.text}\n`);
-  return result.isError ? 1 : 0;
+  const cliFailed =
+    result.isError ||
+    (tool === "run_checks" &&
+      /^Checks:\s+\d+\/\d+\s+passed,\s+(?:[1-9]\d*\s+failed|0\s+failed,\s+[1-9]\d*\s+not run)\b/.test(
+        result.text,
+      )) ||
+    (tool === "apply_edits" &&
+      /(?:^|\n)Verify \[(?:FAIL|TIMEOUT|ERROR)\b/.test(result.text));
+  return cliFailed ? 1 : 0;
 }
