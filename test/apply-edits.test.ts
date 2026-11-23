@@ -843,7 +843,8 @@ describe("apply_edits", () => {
     assert.equal(dupCreate.isError, true);
     assert.match(dupCreate.text, /duplicate entries cannot mix 'create'/);
 
-    // 3. Single CRLF in an LF-majority script must NOT rewrite the whole file to CRLF
+    // 3. Single CRLF in an LF-majority script must NOT rewrite the whole file to CRLF,
+    //    while preserving untouched lines' exact original line endings
     const scriptPath = path.join(realSubDir, "run.sh");
     await fs.writeFile(scriptPath, "#!/usr/bin/env bash\necho 1\r\necho 2\necho 3\n", "utf8");
     const lfRes = await runApplyEdits({
@@ -853,7 +854,7 @@ describe("apply_edits", () => {
     assert.equal(lfRes.isError, false);
     const scriptAfter = await fs.readFile(scriptPath, "utf8");
     assert.ok(scriptAfter.startsWith("#!/usr/bin/env bash\n"));
-    assert.ok(!scriptAfter.includes("\r\n"));
+    assert.equal(scriptAfter, "#!/usr/bin/env bash\necho 1\r\necho 2\necho 4\n");
 
     // 4. Malformed verify fails validation BEFORE writing files; non-finite verifyTimeoutSec/maxVerifyChars stay safe
     const verifyFile = path.join(realSubDir, "v.ts");
@@ -1565,5 +1566,121 @@ describe("apply_edits", () => {
       fs.readFile = origReadFile;
     }
     assert.deepEqual(await fs.readFile(largeBinPath), largeBinBytes);
+  });
+
+  it("preserves mixed CRLF/LF line endings on untouched lines and matches local span EOL", async () => {
+    // 1. Editing a single LF line in a mixed CRLF+LF file preserves all untouched CRLF lines verbatim
+    const mixedLfEdit = path.join(tmpDir, "mixed-lf-edit.txt");
+    await fs.writeFile(
+      mixedLfEdit,
+      "win1\r\nwin2\r\nunix3\nwin4\r\n",
+      "utf8",
+    );
+    const r1 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-lf-edit.txt",
+          hunks: [{ target: "unix3", replacement: "unix3a\nunix3b" }],
+        },
+      ],
+    });
+    assert.equal(r1.isError, false);
+    assert.equal(
+      await fs.readFile(mixedLfEdit, "utf8"),
+      "win1\r\nwin2\r\nunix3a\nunix3b\nwin4\r\n",
+    );
+
+    // 2. Editing a single CRLF line in a mostly-LF file preserves untouched LF lines verbatim
+    //    and uses CRLF for newly inserted lines inside that span
+    const mixedCrlfEdit = path.join(tmpDir, "mixed-crlf-edit.txt");
+    await fs.writeFile(
+      mixedCrlfEdit,
+      "unix1\nunix2\nwin3\r\nunix4\nunix5\n",
+      "utf8",
+    );
+    const r2 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-crlf-edit.txt",
+          hunks: [{ target: "win3", replacement: "win3a\nwin3b" }],
+        },
+      ],
+    });
+    assert.equal(r2.isError, false);
+    assert.equal(
+      await fs.readFile(mixedCrlfEdit, "utf8"),
+      "unix1\nunix2\nwin3a\r\nwin3b\r\nunix4\nunix5\n",
+    );
+
+    // 3. Multi-hunk edit on a mixed-EOL file keeps every untouched line byte-for-byte identical
+    const mixedMulti = path.join(tmpDir, "mixed-multi.txt");
+    await fs.writeFile(
+      mixedMulti,
+      "header\r\nkeep-lf-1\nedit-crlf\r\nkeep-crlf-2\r\nedit-lf\nkeep-crlf-3\r\nfooter-no-eol",
+      "utf8",
+    );
+    const r3 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-multi.txt",
+          hunks: [
+            { target: "edit-crlf", replacement: "EDITED-CRLF-1\nEDITED-CRLF-2" },
+            { target: "edit-lf", replacement: "EDITED-LF-1\nEDITED-LF-2" },
+            { target: "footer-no-eol", replacement: "FOOTER-1\nFOOTER-2" },
+          ],
+        },
+      ],
+    });
+    assert.equal(r3.isError, false);
+    assert.equal(
+      await fs.readFile(mixedMulti, "utf8"),
+      "header\r\nkeep-lf-1\nEDITED-CRLF-1\r\nEDITED-CRLF-2\r\nkeep-crlf-2\r\nEDITED-LF-1\nEDITED-LF-2\nkeep-crlf-3\r\nFOOTER-1\r\nFOOTER-2",
+    );
+
+    // 4. UTF-8 BOM + mixed CRLF/LF: BOM stays at index 0 before line 1 and mixed EOLs are preserved
+    const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomMixed = path.join(tmpDir, "bom-mixed.txt");
+    await fs.writeFile(
+      bomMixed,
+      Buffer.concat([utf8Bom, Buffer.from("line1-crlf\r\nline2-lf\nline3-crlf\r\n", "utf8")]),
+    );
+    const r4 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-mixed.txt",
+          hunks: [
+            { target: "line1-crlf", replacement: "line1a\nline1b" },
+            { target: "line2-lf", replacement: "line2a\nline2b" },
+          ],
+        },
+      ],
+    });
+    assert.equal(r4.isError, false);
+    const bomMixedAfter = await fs.readFile(bomMixed);
+    assert.deepEqual(bomMixedAfter.subarray(0, 3), utf8Bom);
+    assert.equal(
+      bomMixedAfter.subarray(3).toString("utf8"),
+      "line1a\r\nline1b\r\nline2a\nline2b\nline3-crlf\r\n",
+    );
+
+    // 5. create(overwrite: true) on a UTF-8 BOM mixed-EOL file keeps BOM at byte 0 without duplicating it
+    const r5 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-mixed.txt",
+          create: "over1\r\nover2\n",
+          overwrite: true,
+        },
+      ],
+    });
+    assert.equal(r5.isError, false);
+    const bomOverwriteAfter = await fs.readFile(bomMixed);
+    assert.deepEqual(bomOverwriteAfter.subarray(0, 3), utf8Bom);
+    assert.equal(bomOverwriteAfter.subarray(3).toString("utf8"), "over1\r\nover2\n");
   });
 });
