@@ -225,6 +225,13 @@ function killChildTree(pid, detached) {
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
 }
+function withNonInteractiveGitEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
+    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never"
+  };
+}
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
@@ -672,26 +679,31 @@ var HARDENED_GIT_BASE_ARGS = [
   "--no-pager"
 ];
 async function getGitSummary(workspaceDir, timeoutMs) {
+  const gitEnv = withNonInteractiveGitEnv();
   const [branchRes, symRefRes, statusRes, logRes] = await Promise.all([
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
-      maxOutputBytes: 4096
+      maxOutputBytes: 4096,
+      env: gitEnv
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "symbolic-ref", "--short", "HEAD"], {
       cwd: workspaceDir,
       timeoutMs,
-      maxOutputBytes: 4096
+      maxOutputBytes: 4096,
+      env: gitEnv
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1"], {
       cwd: workspaceDir,
       timeoutMs,
-      maxOutputBytes: 32768
+      maxOutputBytes: 32768,
+      env: gitEnv
     }),
     execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
-      maxOutputBytes: 8192
+      maxOutputBytes: 8192,
+      env: gitEnv
     })
   ]);
   const hasValidRepo = !branchRes.error && branchRes.exitCode === 0 || !symRefRes.error && symRefRes.exitCode === 0 || !statusRes.error && statusRes.exitCode === 0;

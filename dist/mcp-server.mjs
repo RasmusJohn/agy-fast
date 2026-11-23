@@ -1090,7 +1090,18 @@ async function resolveWindowsPowerShell(probe = defaultProbeWindowsShell) {
   })();
   return pendingWindowsPowerShellProbe;
 }
+function withNonInteractiveGitEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
+    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never"
+  };
+}
 async function runShellCommandAsync(command, options) {
+  const effectiveOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env)
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -1101,13 +1112,13 @@ async function runShellCommandAsync(command, options) {
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options
+          effectiveOptions
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 function spawnAndCollect(commandOrBin, args, shell, options) {
   const startMs = Date.now();
@@ -4942,7 +4953,8 @@ async function runGitQuery(query, searchRoot) {
   const res = await execBinaryAsync("git", execArgs, {
     cwd: searchRoot,
     timeoutMs: 1e4,
-    maxOutputBytes: 512 * 1024
+    maxOutputBytes: 512 * 1024,
+    env: withNonInteractiveGitEnv()
   });
   if (res.error) {
     throw new Error(`git execution error: ${res.error}`);

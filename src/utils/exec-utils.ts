@@ -568,10 +568,24 @@ export function resetWindowsShellCache(): void {
   pendingWindowsPowerShellProbe = null;
 }
 
+export function withNonInteractiveGitEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
+    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never",
+  };
+}
+
 export async function runShellCommandAsync(
   command: string,
   options: ExecOptions,
 ): Promise<ExecResult> {
+  const effectiveOptions: ExecOptions = {
+    ...options,
+    env: withNonInteractiveGitEnv(options.env),
+  };
   if (process.platform === "win32") {
     const effectiveCommand = unwrapTrivialWindowsPowerShellCommand(command);
     if (needsPowerShellOnWindows(effectiveCommand)) {
@@ -582,13 +596,13 @@ export async function runShellCommandAsync(
           cachedWindowsPowerShellExecPath ?? psBin,
           ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", utf8Command],
           false,
-          options,
+          effectiveOptions,
         );
       }
     }
-    return spawnAndCollect(effectiveCommand, [], true, options);
+    return spawnAndCollect(effectiveCommand, [], true, effectiveOptions);
   }
-  return spawnAndCollect(command, [], true, options);
+  return spawnAndCollect(command, [], true, effectiveOptions);
 }
 
 function spawnAndCollect(

@@ -13,6 +13,7 @@ import {
   resetWindowsShellCache,
   resolveWindowsPowerShell,
   unwrapTrivialWindowsPowerShellCommand,
+  withNonInteractiveGitEnv,
 } from "../src/utils/exec-utils.js";
 import {
   fitSectionsToByteBudget,
@@ -710,4 +711,58 @@ describe("run_checks", () => {
       }
     });
   }
+
+  it("injects non-interactive git env defaults without overriding caller values", async () => {
+    const base: NodeJS.ProcessEnv = { CUSTOM_VAR: "keep" };
+    const defaulted = withNonInteractiveGitEnv(base);
+    assert.equal(defaulted.CUSTOM_VAR, "keep");
+    assert.equal(defaulted.GIT_TERMINAL_PROMPT, "0");
+    assert.equal(defaulted.GCM_INTERACTIVE, "never");
+    assert.equal(base.GIT_TERMINAL_PROMPT, undefined);
+    assert.equal(base.GCM_INTERACTIVE, undefined);
+
+    const overridden = withNonInteractiveGitEnv({
+      GIT_TERMINAL_PROMPT: "1",
+      GCM_INTERACTIVE: "always",
+    });
+    assert.equal(overridden.GIT_TERMINAL_PROMPT, "1");
+    assert.equal(overridden.GCM_INTERACTIVE, "always");
+
+    const prevPrompt = process.env.GIT_TERMINAL_PROMPT;
+    const prevGcm = process.env.GCM_INTERACTIVE;
+    try {
+      delete process.env.GIT_TERMINAL_PROMPT;
+      delete process.env.GCM_INTERACTIVE;
+      const defaultRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "git-env-default",
+            command: `${nodeBin} -e "console.log(process.env.GIT_TERMINAL_PROMPT, process.env.GCM_INTERACTIVE)"`,
+          },
+        ],
+      });
+      assert.equal(defaultRes.isError, false);
+      assert.match(defaultRes.text, /\b0 never\b/);
+
+      process.env.GIT_TERMINAL_PROMPT = "1";
+      process.env.GCM_INTERACTIVE = "auto";
+      const overrideRes = await runChecks({
+        outputMode: "full",
+        commands: [
+          {
+            name: "git-env-override",
+            command: `${nodeBin} -e "console.log(process.env.GIT_TERMINAL_PROMPT, process.env.GCM_INTERACTIVE)"`,
+          },
+        ],
+      });
+      assert.equal(overrideRes.isError, false);
+      assert.match(overrideRes.text, /\b1 auto\b/);
+    } finally {
+      if (prevPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+      else process.env.GIT_TERMINAL_PROMPT = prevPrompt;
+      if (prevGcm === undefined) delete process.env.GCM_INTERACTIVE;
+      else process.env.GCM_INTERACTIVE = prevGcm;
+    }
+  });
 });
