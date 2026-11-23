@@ -43,7 +43,7 @@ case "$0" in
         */*) script_parent=${0%/*} ;;
         *)   script_parent=. ;;
       esac
-      SCRIPT_DIR="$(CDPATH= cd -P "$script_parent" 2>/dev/null && pwd -P)" || SCRIPT_DIR=""
+      SCRIPT_DIR="$(CDPATH= cd -P "${script_parent:-/}" 2>/dev/null && pwd -P)" || SCRIPT_DIR=""
     fi
     ;;
 esac

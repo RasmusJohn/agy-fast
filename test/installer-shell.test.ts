@@ -32,7 +32,7 @@ async function withFixture(run: (fixture: InstallerFixture) => Promise<void>): P
     await fs.writeFile(fakeGit, "#!/bin/sh\necho REMOTE_CLONE_ATTEMPT >&2\nexit 19\n");
     await fs.chmod(fakeGit, 0o755);
 
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: home,
       PATH: `${binDir}${path.delimiter}${process.env.PATH ?? "/usr/bin:/bin"}`,
