@@ -159,16 +159,18 @@ describe("installer", () => {
     );
     assert.ok((await fs.lstat(linkTarget)).isSymbolicLink());
 
-    // Shell syntax check and local invocation via install.sh (skip on Windows when `sh` is absent)
-    const hasSh = (() => {
-      try {
-        execFileSync("sh", ["-c", "exit 0"], { stdio: "ignore" });
-        return true;
-      } catch {
-        return false;
-      }
-    })();
-    if (hasSh) {
+    // Shell syntax check and local invocation via install.sh (skip only on Windows when `sh` is absent)
+    const runShTests =
+      process.platform !== "win32" ||
+      (() => {
+        try {
+          execFileSync("sh", ["-c", "exit 0"], { stdio: "ignore" });
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+    if (runShTests) {
       execFileSync("sh", ["-n", INSTALL_SH], { encoding: "utf8" });
       const shTarget = path.join(fakeHome, "sh-installed-agy-fast");
       const shOut = execFileSync("sh", [INSTALL_SH, "--target", shTarget, "--no-enable"], {

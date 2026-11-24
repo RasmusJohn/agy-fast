@@ -270,6 +270,14 @@ describe("run_checks", () => {
       formatPowerShellCommand('"$env:FOO"\nGet-Date'),
       '"$env:FOO"\nGet-Date',
     );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO" \nGet-Date'),
+      '"$env:FOO" \nGet-Date',
+    );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO"  \t\r\nGet-Date'),
+      '"$env:FOO"  \t\r\nGet-Date',
+    );
     assert.equal(needsPowerShellOnWindows('echo "C:\\\\" && Get-ChildItem'), true);
     assert.equal(needsPowerShellOnWindows('echo "foo``" && Get-ChildItem'), true);
 

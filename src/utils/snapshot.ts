@@ -13,6 +13,7 @@ export interface SnapshotOptions {
   maxBytes?: number;
   gitTimeoutMs?: number;
   scanTimeoutMs?: number;
+  gitExec?: typeof execBinaryAsync;
 }
 
 const HARDENED_GIT_BASE_ARGS = [
@@ -67,14 +68,15 @@ async function readBranchFromGitEntry(gitEntry: string | null): Promise<string |
   }
 }
 
-function parsePorcelainBranchHeader(headerLine: string): {
+export function parsePorcelainBranchHeader(headerLine: string): {
   branch: string;
   isUnborn: boolean;
 } {
   const body = headerLine.slice(3).trim();
   const unbornMatch = /^(?:No commits yet|Initial commit) on (.+)$/.exec(body);
   if (unbornMatch?.[1]) {
-    return { branch: unbornMatch[1].trim(), isUnborn: true };
+    const branchOnly = unbornMatch[1].split("...")[0]?.trim() || "HEAD";
+    return { branch: branchOnly, isUnborn: true };
   }
   if (/^HEAD\s*\(no branch\)$/i.test(body)) {
     return { branch: "HEAD", isUnborn: false };
@@ -87,6 +89,7 @@ function parsePorcelainBranchHeader(headerLine: string): {
 async function getGitSummary(
   workspaceDir: string,
   timeoutMs: number,
+  gitExec: typeof execBinaryAsync = execBinaryAsync,
 ): Promise<string | null> {
   const hasExplicitGitEnv = Boolean(process.env.GIT_DIR || process.env.GIT_WORK_TREE);
   const gitEntry = hasExplicitGitEnv ? null : await findGitEntry(workspaceDir);
@@ -96,7 +99,7 @@ async function getGitSummary(
 
   const gitEnv = withNonInteractiveGitEnv();
   const [statusRes, logRes] = await Promise.all([
-    execBinaryAsync(
+    gitExec(
       "git",
       [...HARDENED_GIT_BASE_ARGS, "-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"],
       {
@@ -106,7 +109,7 @@ async function getGitSummary(
         env: gitEnv,
       },
     ),
-    execBinaryAsync("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
+    gitExec("git", [...HARDENED_GIT_BASE_ARGS, "log", "-n", "3", "--format=%h %s"], {
       cwd: workspaceDir,
       timeoutMs,
       maxOutputBytes: 8192,
@@ -116,8 +119,10 @@ async function getGitSummary(
 
   const statusOk = !statusRes.error && !statusRes.timedOut && statusRes.exitCode === 0;
   const logOk = !logRes.error && !logRes.timedOut && logRes.exitCode === 0;
+  const fallbackBranch =
+    !statusOk && gitEntry ? await readBranchFromGitEntry(gitEntry) : null;
 
-  if (!statusOk && !logOk) {
+  if (!statusOk && !logOk && !(statusRes.timedOut && fallbackBranch)) {
     return null;
   }
 
@@ -151,7 +156,7 @@ async function getGitSummary(
       return true;
     });
   } else {
-    branch = (await readBranchFromGitEntry(gitEntry)) ?? "HEAD";
+    branch = fallbackBranch ?? "HEAD";
   }
 
   const logLines = logOk
@@ -916,7 +921,7 @@ export async function buildWorkspaceSnapshot(
   if (!statRes.ok || !statRes.value.isDirectory()) return null;
 
   // Start git summary in parallel with home-root detection and shared root readdir
-  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs);
+  const gitPromise = getGitSummary(workspaceDir, gitTimeoutMs, options.gitExec);
   const [isHomeRoot, topRes] = await Promise.all([
     isHomeOrSystemRoot(workspaceDir, scanDeadline),
     raceWithDeadline(

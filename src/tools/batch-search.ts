@@ -14,6 +14,7 @@ import {
 } from "../utils/exec-utils.js";
 import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
+  DEFAULT_IGNORE_DIRS,
   globToRegExp,
   isLikelyBinary,
   resolvePath,
@@ -581,14 +582,21 @@ async function runTextOrRegexWithRg(
   if (query.caseSensitive === false) {
     args.push("--ignore-case");
   }
-  // Always skip heavy vendor/build noise directories unless explicitly targeted;
-  // emit default exclusions BEFORE user query.glob so explicit user globs win
-  // under ripgrep's last-match-wins precedence.
+  if (query.glob) {
+    args.push(`--glob=${query.glob}`);
+  }
+  // Always skip heavy vendor/build noise directories unless explicitly targeted
+  // by searchRoot (including paths outside baseCwd) or a positive query.glob.
+  // Emit default exclusions AFTER user query.glob so positive globs like `*.mjs`
+  // cannot override them under ripgrep's last-match-wins precedence.
   const relRoot = toPosixPath(path.relative(baseCwd, searchRoot));
-  const rootSegments =
-    relRoot && !relRoot.startsWith("..") && !path.isAbsolute(relRoot)
-      ? relRoot.split("/")
-      : [];
+  const isInsideBaseCwd =
+    relRoot === "" || (!relRoot.startsWith("..") && !path.isAbsolute(relRoot));
+  const rootSegments = isInsideBaseCwd
+    ? (relRoot ? relRoot.split("/") : [])
+    : toPosixPath(searchRoot).split("/").filter(Boolean);
+  const positiveGlob =
+    query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
     "node_modules",
     ".git",
@@ -600,12 +608,12 @@ async function runTextOrRegexWithRg(
     ".venv",
     ".next",
   ]) {
-    if (!rootSegments.includes(dir)) {
+    if (
+      !rootSegments.includes(dir) &&
+      !(positiveGlob && globTargetsDir(positiveGlob, dir))
+    ) {
       args.push(`--glob=!**/${dir}/**`);
     }
-  }
-  if (query.glob) {
-    args.push(`--glob=${query.glob}`);
   }
 
   const runRg = async (
@@ -1025,9 +1033,20 @@ async function runTextOrRegexWithNode(
     const includeHidden = Boolean(
       rawGlob && !globNegated && patternTargetsHidden(rawGlob),
     );
+    let ignoreDirs: Set<string> | undefined;
+    if (rawGlob && !globNegated) {
+      const targeted = [...DEFAULT_IGNORE_DIRS].filter((dir) =>
+        globTargetsDir(rawGlob, dir),
+      );
+      if (targeted.length > 0) {
+        ignoreDirs = new Set(DEFAULT_IGNORE_DIRS);
+        for (const dir of targeted) ignoreDirs.delete(dir);
+      }
+    }
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8000,
       includeHidden,
+      ignoreDirs,
       fileFilter: globMatchesFile,
     });
     discoveryTruncated = walked.truncated;
@@ -1064,7 +1083,11 @@ async function runTextOrRegexWithNode(
     query.pattern.length > 0;
   let wholeFileRegex: RegExp | null = null;
   const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
-  if (query.type === "regex" && !query.multiline) {
+  // Whole-file /m precheck can false-negative on lookarounds matching whitespace/newlines
+  // across line boundaries (e.g. `foo(?!\s)` or `(?<!\s)foo`), so skip precheck for them.
+  const regexHasLookaround =
+    query.type === "regex" && /\(\?<?[=!]/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexHasLookaround) {
     try {
       wholeFileRegex = new RegExp(
         regex.source,
@@ -2413,6 +2436,14 @@ export async function runBatchSearch(
 function patternTargetsHidden(pattern: string): boolean {
   const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
   return /(?:^|[/,{])\.[^./]/.test(normalized);
+}
+
+function globTargetsDir(glob: string, dir: string): boolean {
+  const normalized = glob
+    .replace(/\\/g, "/")
+    .replace(/(^|[,{])(?:\.\/)+/g, "$1");
+  const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[/,{])${escaped}(?:$|[/},])`).test(normalized);
 }
 
 function clampInt(val: unknown, min: number, max: number, fallback = min): number {

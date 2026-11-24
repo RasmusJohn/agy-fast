@@ -494,11 +494,11 @@ export function formatPowerShellCommand(command: string): string {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^[ \t]+/.test(afterQuote)) {
+      const rest = afterQuote.replace(/^[ \t]+/, "");
+      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
         return command;
       }
-      const rest = afterQuote.trimStart();
-      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -780,7 +780,8 @@ export async function isRipgrepAvailable(): Promise<boolean> {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
   if (pendingRgProbe) return pendingRgProbe;
 
-  pendingRgProbe = (async () => {
+  let probe: Promise<boolean> | null = null;
+  probe = (async () => {
     try {
       const res = await execBinaryAsync("rg", ["--version"], {
         cwd: os.tmpdir(),
@@ -788,16 +789,19 @@ export async function isRipgrepAvailable(): Promise<boolean> {
         maxOutputBytes: 4096,
       });
       const available = !res.error && !res.timedOut && res.exitCode === 0;
-      if (!res.timedOut) {
+      if (!res.timedOut && pendingRgProbe === probe) {
         cachedRgAvailable = available;
       }
       return available;
     } finally {
-      pendingRgProbe = null;
+      if (pendingRgProbe === probe) {
+        pendingRgProbe = null;
+      }
     }
   })();
 
-  return pendingRgProbe;
+  pendingRgProbe = probe;
+  return probe;
 }
 
 export function resetRipgrepCache(): void {

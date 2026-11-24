@@ -1323,4 +1323,121 @@ describe("batch_search", () => {
       await fs.rm(walkDir, { recursive: true, force: true });
     }
   });
+
+  it("keeps default excluded dirs ahead of positive user globs, honors explicit excluded-dir globs & external paths, preserves lookaround regexes, and bounds walkFiles on truncation", async () => {
+    const outerDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-glob-prec-"));
+    const wsDir = path.join(outerDir, "ws");
+    const externalDistDir = path.join(outerDir, "shared", "dist");
+    try {
+      await fs.mkdir(path.join(wsDir, "src"), { recursive: true });
+      await fs.mkdir(path.join(wsDir, "dist"), { recursive: true });
+      await fs.mkdir(path.join(wsDir, "node_modules", "pkg"), { recursive: true });
+      await fs.mkdir(externalDistDir, { recursive: true });
+
+      await fs.writeFile(path.join(wsDir, "src", "app.mjs"), "export const x = 'NEEDLE_GLOB_TEST src';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "dist", "bundle.mjs"), "export const x = 'NEEDLE_GLOB_TEST dist';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "node_modules", "pkg", "index.mjs"), "export const x = 'NEEDLE_GLOB_TEST nm';\n", "utf8");
+      await fs.writeFile(path.join(externalDistDir, "lib.mjs"), "export const x = 'NEEDLE_GLOB_TEST external_dist';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "src", "lookaround.txt"), "foo\nbar\nqux\r\nbaz\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "src", "lookbehind.txt"), "bar\nfoo\n", "utf8");
+
+      // 1. Both ripgrep and Node fallback keep default exclusions for positive globs like `*.mjs`,
+      //    while honoring explicit `dist/*.mjs`, `{dist,src}/*.mjs`, and external `../shared/dist`.
+      for (const forceNodeFallback of [false, true]) {
+        const res = await runBatchSearch(
+          {
+            cwd: wsDir,
+            queries: [
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "dist/*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "{dist,src}/*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", path: "../shared/dist" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", path: "../shared/dist", glob: "*.mjs" },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(res.isError, false);
+        const sections = res.text.split("\n\n");
+        // Query 1: `*.mjs` must NOT pierce default exclusions (`dist/` or `node_modules/`)
+        assert.match(sections[0]!, /src\/app\.mjs/);
+        assert.doesNotMatch(sections[0]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[0]!, /node_modules/);
+        // Query 2: explicit `dist/*.mjs` searches `dist/` while keeping `node_modules/` excluded
+        assert.match(sections[1]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[1]!, /src\/app\.mjs/);
+        assert.doesNotMatch(sections[1]!, /node_modules/);
+        // Query 3: brace glob `{dist,src}/*.mjs` searches both `dist/` and `src/`
+        assert.match(sections[2]!, /src\/app\.mjs/);
+        assert.match(sections[2]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[2]!, /node_modules/);
+        // Query 4 & 5: external path `../shared/dist` is not wiped out by default `!**/dist/**`
+        assert.match(sections[3]!, /NEEDLE_GLOB_TEST external_dist/);
+        assert.match(sections[4]!, /NEEDLE_GLOB_TEST external_dist/);
+      }
+
+      // 2. Lookaround regexes must not false-negative in Node whole-file precheck
+      const lookRes = await runBatchSearch(
+        {
+          cwd: wsDir,
+          queries: [
+            { type: "regex", pattern: "foo(?!\\s)" },
+            { type: "regex", pattern: "(?<!\\s)foo" },
+            { type: "regex", pattern: "qux(?![\\r\\n])" },
+          ],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(lookRes.isError, false);
+      const lookSecs = lookRes.text.split("\n\n");
+      assert.match(lookSecs[0]!, /src\/lookaround\.txt\n\s+1: foo/);
+      assert.match(lookSecs[0]!, /src\/lookbehind\.txt\n\s+2: foo/);
+      assert.match(lookSecs[1]!, /src\/lookaround\.txt\n\s+1: foo/);
+      assert.match(lookSecs[1]!, /src\/lookbehind\.txt\n\s+2: foo/);
+      assert.match(lookSecs[2]!, /src\/lookaround\.txt\n\s+3: qux/);
+
+      // 3. walkFiles keeps simultaneous fs.readdir <= 16 and leaves 0 in-flight calls after truncation
+      const nestedDir = path.join(outerDir, "nested");
+      for (let i = 0; i < 24; i++) {
+        const sub = path.join(nestedDir, `d${String(i).padStart(2, "0")}`, "leaf");
+        await fs.mkdir(sub, { recursive: true });
+        await fs.writeFile(path.join(sub, "f1.ts"), "export const a = 1;\n", "utf8");
+        await fs.writeFile(path.join(sub, "f2.ts"), "export const b = 2;\n", "utf8");
+      }
+
+      const origReaddir = fs.readdir as (...args: unknown[]) => Promise<unknown>;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = async (
+        ...args: unknown[]
+      ) => {
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        try {
+          await new Promise((r) => setTimeout(r, 4));
+          return await origReaddir(...args);
+        } finally {
+          inFlight--;
+        }
+      };
+      try {
+        const fullWalk = await walkFiles(nestedDir, { maxFiles: 100 });
+        assert.equal(fullWalk.truncated, false);
+        assert.equal(fullWalk.files.length, 48);
+        assert.ok(maxInFlight <= 16, `Expected <=16 concurrent readdirs, got ${maxInFlight}`);
+        assert.equal(inFlight, 0);
+
+        maxInFlight = 0;
+        const truncWalk = await walkFiles(nestedDir, { maxFiles: 3 });
+        assert.equal(truncWalk.truncated, true);
+        assert.equal(truncWalk.files.length, 3);
+        assert.ok(maxInFlight <= 16, `Expected <=16 concurrent readdirs on truncation, got ${maxInFlight}`);
+        assert.equal(inFlight, 0, "walkFiles must not leave dangling readdir calls after truncation");
+      } finally {
+        (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddir;
+      }
+    } finally {
+      await fs.rm(outerDir, { recursive: true, force: true });
+    }
+  });
 });

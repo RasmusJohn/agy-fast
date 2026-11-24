@@ -256,17 +256,34 @@ export async function walkFiles(
   const MAX_CONCURRENT_READDIRS = 16;
   let activeReaddirs = 0;
   const waitQueue: Array<() => void> = [];
-  const readDirBounded = async (dir: string) => {
-    if (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
-      await new Promise<void>((resolve) => waitQueue.push(resolve));
+  const drainWaiters = (): void => {
+    while (waitQueue.length > 0) {
+      waitQueue.shift()!();
     }
+  };
+  const markTruncated = (): void => {
+    if (truncated) return;
+    truncated = true;
+    drainWaiters();
+  };
+  const readDirBounded = async (dir: string) => {
+    if (truncated) return null;
+    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
+      await new Promise<void>((resolve) => waitQueue.push(resolve));
+      if (truncated) return null;
+    }
+    if (truncated) return null;
     activeReaddirs++;
     try {
       return await fs.readdir(dir, { withFileTypes: true });
     } finally {
       activeReaddirs--;
-      const next = waitQueue.shift();
-      if (next) next();
+      if (truncated) {
+        drainWaiters();
+      } else {
+        const next = waitQueue.shift();
+        if (next) next();
+      }
     }
   };
 
@@ -276,12 +293,14 @@ export async function walkFiles(
   }
 
   const scanDir = async (dir: string, relDir: string): Promise<DirScanResult> => {
+    if (truncated) return { localFiles: [], subdirs: [] };
     let entries;
     try {
       entries = await readDirBounded(dir);
     } catch {
       return { localFiles: [], subdirs: [] };
     }
+    if (!entries || truncated) return { localFiles: [], subdirs: [] };
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     const localFiles: string[] = [];
@@ -319,7 +338,7 @@ export async function walkFiles(
 
     for (const relPosix of localFiles) {
       if (files.length >= maxFiles) {
-        truncated = true;
+        markTruncated();
         return;
       }
       files.push(relPosix);
@@ -331,8 +350,16 @@ export async function walkFiles(
     for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
       const slice = subdirs.slice(i, i + batchSize);
       const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
-      for (let j = 0; j < slice.length && !truncated; j++) {
-        await visit(slice[j]!.abs, slice[j]!.rel, depth + 1, prefetches[j]);
+      try {
+        for (let j = 0; j < slice.length && !truncated; j++) {
+          await visit(slice[j]!.abs, slice[j]!.rel, depth + 1, prefetches[j]);
+        }
+      } finally {
+        // Ensure no sibling prefetches remain in flight after early truncation
+        // (avoids dangling directory handles / EBUSY on Windows temp cleanup).
+        if (truncated) {
+          await Promise.allSettled(prefetches);
+        }
       }
     }
   }
