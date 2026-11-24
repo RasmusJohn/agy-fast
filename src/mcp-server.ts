@@ -131,13 +131,13 @@ function buildApplyEditsToolDefinition(
         },
       };
 
-  const baseDesc = `Atomic batch. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
+  const baseDesc = `Atomic multi-file edits. bestEffort writes valid files atomically per file, gives closest lines, skips verify on failure. dryRun=false (true validates only). verify shell in cwd after writes (60s/4000 chars default, agy drops at 180s). 8800 UTF-8 bytes total. Absolute cwd if no roots/list (Desktop 2.0 Hub).`;
 
   return {
     name: "apply_edits",
     description: preferStringEdits
       ? baseDesc
-      : `${baseDesc} edits accepts JSON array strings. Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
+      : `${baseDesc} Exact target in 1-based window (all if replaceAll). Nonempty hunks XOR full-file create. overwrite allows replacing via create.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -276,7 +276,7 @@ export function createAgyFastServer(
     {
       name: "batch_search",
       description:
-        "Parallel. Literal text, fuzzy paths. Glob */{a,b}, no |. Read-only git subcommand. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir. Text/regex glob filter. multiline spans lines (dot too). count/file=matching lines or multiline occurrences. Defaults outputMode=content, caseSensitive=true, contextLines=0, maxResults=40 matches/files, maxChars=8500. fileType lang/ext (text/regex/fuzzy). Glob sortBy=path (mtime newest). 8800 UTF-8 bytes total.",
+        "Parallel search: literal text, regex, fuzzy paths, glob (*/{a,b}, no |), read-only git. Absolute cwd if no roots/list (Desktop 2.0 Hub). path rel/abs file/dir; glob filters text/regex; fileType lang/ext (text/regex/fuzzy). multiline spans lines (dot too); count/file=lines or multiline occurrences. Defaults: outputMode=content, caseSensitive=true, contextLines=0, maxResults=40, maxChars=8500 (8800B UTF-8 max); glob sortBy=path (mtime newest).",
       inputSchema: {
         type: "object",
         properties: {

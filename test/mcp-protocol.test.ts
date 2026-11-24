@@ -379,6 +379,14 @@ describe("MCP Stdio Server end-to-end", () => {
           `tool ${tool.name} (${mode} mode) is ${bytes} UTF-8 bytes, exceeding ${MAX_TOOL_SCHEMA_BYTES}B budget`,
         );
       }
+      const applyTool = tools.find((t) => t.name === "apply_edits")!;
+      if (mode === "array") {
+        assert.doesNotMatch(
+          applyTool.description,
+          /JSON array string/i,
+          "array-mode apply_edits must not bait strict JSON Schema hosts into sending stringified edits",
+        );
+      }
     }
   });
 
