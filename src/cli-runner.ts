@@ -60,6 +60,7 @@ export function formatCliUsage(): string {
     "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
     "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
     "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
+    "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
     "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
@@ -250,6 +251,14 @@ function applySearchModifiers(
   };
 }
 
+const SEARCH_QUERY_TYPES = new Set<SearchQuery["type"]>([
+  "text",
+  "regex",
+  "glob",
+  "fuzzy",
+  "git",
+]);
+
 const VALUE_LONG_FLAGS = new Set([
   "--cwd",
   "--max-chars",
@@ -259,6 +268,8 @@ const VALUE_LONG_FLAGS = new Set([
   "--glob",
   "--fuzzy",
   "--git",
+  "--pattern",
+  "--type",
   "--path",
   "--file-type",
   "--glob-filter",
@@ -283,6 +294,8 @@ interface ParsedCliOptions {
   positionals: string[];
   // search flags
   searchQueries: SearchQuery[];
+  implicitTypeQueryIndices: Set<number>;
+  trailingSearchType?: SearchQuery["type"];
   trailingSearchMods: SearchQueryModifiers;
   // slice flags
   outlineFiles: string[];
@@ -304,20 +317,32 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
     explicitStdin: false,
     positionals: [],
     searchQueries: [],
+    implicitTypeQueryIndices: new Set<number>(),
     trailingSearchMods: {},
     outlineFiles: [],
   };
   let pendingMods: SearchQueryModifiers = {};
-  const pushScopedQuery = (base: SearchQuery) => {
+  let pendingType: SearchQuery["type"] | undefined;
+  const pushScopedQuery = (base: SearchQuery, explicitType: boolean) => {
+    const idx = opts.searchQueries.length;
     opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+    if (!explicitType) {
+      opts.implicitTypeQueryIndices.add(idx);
+    }
     pendingMods = {};
+    pendingType = undefined;
   };
 
   let afterDoubleDash = false;
   for (let i = 0; i < rawArgs.length; i++) {
     const rawArg = rawArgs[i]!;
     if (afterDoubleDash) {
-      opts.positionals.push(rawArg);
+      if (tool === "batch_search") {
+        const explicit = pendingType !== undefined;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+      } else {
+        opts.positionals.push(rawArg);
+      }
       continue;
     }
     if (rawArg === "--") {
@@ -373,23 +398,38 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
 
     if (tool === "batch_search") {
       if (arg === "--text" || arg === "-t") {
-        pushScopedQuery({ type: "text", pattern: consumeValue() });
+        pushScopedQuery({ type: "text", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--regex" || arg === "-r") {
-        pushScopedQuery({ type: "regex", pattern: consumeValue() });
+        pushScopedQuery({ type: "regex", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--glob" || arg === "-g") {
-        pushScopedQuery({ type: "glob", pattern: consumeValue() });
+        pushScopedQuery({ type: "glob", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--fuzzy" || arg === "-f") {
-        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() });
+        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--git") {
-        pushScopedQuery({ type: "git", pattern: consumeValue() });
+        pushScopedQuery({ type: "git", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--type") {
+        const rawType = consumeValue().trim().toLowerCase();
+        if (!SEARCH_QUERY_TYPES.has(rawType as SearchQuery["type"])) {
+          throw new Error(
+            `Invalid --type: ${rawType} (expected text, regex, glob, fuzzy, or git)`,
+          );
+        }
+        pendingType = rawType as SearchQuery["type"];
+        continue;
+      }
+      if (arg === "--pattern") {
+        const explicit = pendingType !== undefined;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: consumeValue() }, explicit);
         continue;
       }
       if (arg === "--path" || arg === "-p") {
@@ -493,12 +533,14 @@ function parseToolFlags(tool: CliCanonicalTool, rawArgs: string[]): ParsedCliOpt
       throw new Error(`Unknown option '${rawArg}' for '${tool}'. Run with '--cli --help' for usage.`);
     }
     if (tool === "batch_search") {
-      pushScopedQuery({ type: "text", pattern: rawArg });
+      const explicit = pendingType !== undefined;
+      pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
     } else {
       opts.positionals.push(rawArg);
     }
   }
 
+  opts.trailingSearchType = pendingType;
   opts.trailingSearchMods = pendingMods;
   return opts;
 }
@@ -573,12 +615,18 @@ export async function runAgyFastCli(
       };
     } else {
       const queries: SearchQuery[] = [
-        ...opts.searchQueries,
-        ...opts.positionals.map((pattern): SearchQuery => ({ type: "text", pattern })),
+        ...opts.searchQueries.map((q, idx): SearchQuery =>
+          opts.trailingSearchType !== undefined && opts.implicitTypeQueryIndices.has(idx)
+            ? { ...q, type: opts.trailingSearchType }
+            : q,
+        ),
+        ...opts.positionals.map(
+          (pattern): SearchQuery => ({ type: opts.trailingSearchType ?? "text", pattern }),
+        ),
       ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
       if (queries.length === 0) {
         stderr.write(
-          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n",
+          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git/--pattern, --json, or JSON on stdin).\n",
         );
         return 1;
       }
