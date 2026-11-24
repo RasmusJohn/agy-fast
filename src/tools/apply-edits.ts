@@ -356,7 +356,7 @@ function planHunksForContent(
   normalizedContent: string,
   hunks: EditHunk[],
   displayPath: string,
-): { newNormalized: string; appliedMatches: number; errors: string[] } {
+): { newNormalized: string; appliedMatches: number; spans: MatchSpan[]; errors: string[] } {
   const lineStarts = computeLineStarts(normalizedContent);
   const spans: MatchSpan[] = [];
   const errors: string[] = [];
@@ -473,7 +473,7 @@ function planHunksForContent(
   }
 
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
 
   spans.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -489,7 +489,7 @@ function planHunksForContent(
   }
 
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
 
   const pieces: string[] = [];
@@ -504,8 +504,83 @@ function planHunksForContent(
   return {
     newNormalized: pieces.join(""),
     appliedMatches: spans.length,
+    spans,
     errors: [],
   };
+}
+
+function buildNormToRawOffsetMap(rawContent: string, normLength: number): Int32Array {
+  const map = new Int32Array(normLength + 1);
+  let normIdx = 0;
+  for (let rawIdx = 0; rawIdx < rawContent.length; rawIdx++) {
+    if (rawContent[rawIdx] === "\r" && rawContent[rawIdx + 1] === "\n") {
+      map[normIdx++] = rawIdx;
+      rawIdx++;
+    } else {
+      map[normIdx++] = rawIdx;
+    }
+  }
+  map[normIdx] = rawContent.length;
+  return map;
+}
+
+function detectLocalSpanEol(
+  rawContent: string,
+  rawStart: number,
+  rawEnd: number,
+  fallbackEol: "\r\n" | "\n",
+): "\r\n" | "\n" {
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = rawStart; i < rawEnd; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > rawStart && rawContent[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  if (crlfCount > lfOnlyCount) return "\r\n";
+  if (lfOnlyCount > crlfCount) return "\n";
+
+  // Span had no decisive newline; match the terminating EOL of the line being edited
+  for (let i = rawEnd; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+
+  // Final line without trailing newline (or tie): fall back to preceding line's EOL
+  for (let i = rawStart - 1; i >= 0; i--) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+
+  return fallbackEol;
+}
+
+function applySpansPreservingMixedEol(
+  rawContent: string,
+  normLength: number,
+  spans: MatchSpan[],
+  fallbackEol: "\r\n" | "\n",
+): string {
+  const normToRaw = buildNormToRawOffsetMap(rawContent, normLength);
+  const pieces: string[] = [];
+  let rawCursor = 0;
+  for (const span of spans) {
+    const rawStart = normToRaw[span.start]!;
+    const rawEnd = normToRaw[span.end]!;
+    pieces.push(rawContent.slice(rawCursor, rawStart));
+    const localEol = detectLocalSpanEol(rawContent, rawStart, rawEnd, fallbackEol);
+    pieces.push(
+      localEol === "\r\n"
+        ? span.replacement.replace(/\n/g, "\r\n")
+        : span.replacement,
+    );
+    rawCursor = rawEnd;
+  }
+  pieces.push(rawContent.slice(rawCursor));
+  return pieces.join("");
 }
 
 function countLines(text: string): number {
@@ -1258,15 +1333,21 @@ export async function runApplyEdits(
       continue;
     }
 
-    const normalizedOriginal = fileData.content.replace(/\r\n/g, "\n");
+    const normalizedOriginal = fileData.rawContent.replace(/\r\n/g, "\n");
     const planned = planHunksForContent(normalizedOriginal, item.hunks, item.relPath);
     if (planned.errors.length > 0) {
       errors.push(...planned.errors);
       continue;
     }
 
-    const finalContent =
-      fileData.eol === "\r\n"
+    const finalContent = fileData.mixedEol
+      ? applySpansPreservingMixedEol(
+          fileData.rawContent,
+          normalizedOriginal.length,
+          planned.spans,
+          fileData.eol,
+        )
+      : fileData.eol === "\r\n"
         ? planned.newNormalized.replace(/\n/g, "\r\n")
         : planned.newNormalized;
     const newContent =

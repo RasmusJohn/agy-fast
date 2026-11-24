@@ -57,7 +57,9 @@ export function isLikelyBinary(buf: Buffer): boolean {
 
 export interface TextFileContent {
   content: string;
+  rawContent: string;
   eol: "\r\n" | "\n";
+  mixedEol: boolean;
   hasBom: boolean;
   size: number;
   mode: number;
@@ -82,7 +84,6 @@ export function detectUtf16Bom(buf: Buffer): "UTF-16 LE" | "UTF-16 BE" | null {
   }
   return null;
 }
-
 export async function readTextFile(
   filePath: string,
   maxBytes = 10 * 1024 * 1024,
@@ -107,17 +108,27 @@ export async function readTextFile(
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
   const hasBom = hasUtf8Bom(buf);
-  const content = (hasBom ? buf.subarray(3) : buf).toString("utf8");
+  const rawContent = (hasBom ? buf.subarray(3) : buf).toString("utf8");
   let crlfCount = 0;
   let lfOnlyCount = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] === "\n") {
-      if (i > 0 && content[i - 1] === "\r") crlfCount++;
+  for (let i = 0; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > 0 && rawContent[i - 1] === "\r") crlfCount++;
       else lfOnlyCount++;
     }
   }
   const eol: "\r\n" | "\n" = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  return { content, eol, hasBom, size: stat.size, mode: stat.mode & 0o7777, rawBuffer: buf };
+  const mixedEol = crlfCount > 0 && lfOnlyCount > 0;
+  return {
+    content: rawContent,
+    rawContent,
+    eol,
+    mixedEol,
+    hasBom,
+    size: stat.size,
+    mode: stat.mode & 0o7777,
+    rawBuffer: buf,
+  };
 }
 
 /**

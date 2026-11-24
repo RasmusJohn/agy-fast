@@ -2647,17 +2647,27 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
   const hasBom = hasUtf8Bom(buf);
-  const content = (hasBom ? buf.subarray(3) : buf).toString("utf8");
+  const rawContent = (hasBom ? buf.subarray(3) : buf).toString("utf8");
   let crlfCount = 0;
   let lfOnlyCount = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] === "\n") {
-      if (i > 0 && content[i - 1] === "\r") crlfCount++;
+  for (let i = 0; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > 0 && rawContent[i - 1] === "\r") crlfCount++;
       else lfOnlyCount++;
     }
   }
   const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  return { content, eol, hasBom, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
+  const mixedEol = crlfCount > 0 && lfOnlyCount > 0;
+  return {
+    content: rawContent,
+    rawContent,
+    eol,
+    mixedEol,
+    hasBom,
+    size: stat.size,
+    mode: stat.mode & 4095,
+    rawBuffer: buf
+  };
 }
 function globToRegExp(pattern) {
   const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
@@ -3165,7 +3175,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     }
   }
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
   spans.sort((a, b) => a.start - b.start || a.end - b.end);
   for (let i = 1; i < spans.length; i++) {
@@ -3179,7 +3189,7 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
     }
   }
   if (errors.length > 0) {
-    return { newNormalized: normalizedContent, appliedMatches: 0, errors };
+    return { newNormalized: normalizedContent, appliedMatches: 0, spans: [], errors };
   }
   const pieces = [];
   let cursor = 0;
@@ -3192,8 +3202,63 @@ function planHunksForContent(normalizedContent, hunks, displayPath) {
   return {
     newNormalized: pieces.join(""),
     appliedMatches: spans.length,
+    spans,
     errors: []
   };
+}
+function buildNormToRawOffsetMap(rawContent, normLength) {
+  const map = new Int32Array(normLength + 1);
+  let normIdx = 0;
+  for (let rawIdx = 0; rawIdx < rawContent.length; rawIdx++) {
+    if (rawContent[rawIdx] === "\r" && rawContent[rawIdx + 1] === "\n") {
+      map[normIdx++] = rawIdx;
+      rawIdx++;
+    } else {
+      map[normIdx++] = rawIdx;
+    }
+  }
+  map[normIdx] = rawContent.length;
+  return map;
+}
+function detectLocalSpanEol(rawContent, rawStart, rawEnd, fallbackEol) {
+  let crlfCount = 0;
+  let lfOnlyCount = 0;
+  for (let i = rawStart; i < rawEnd; i++) {
+    if (rawContent[i] === "\n") {
+      if (i > rawStart && rawContent[i - 1] === "\r") crlfCount++;
+      else lfOnlyCount++;
+    }
+  }
+  if (crlfCount > lfOnlyCount) return "\r\n";
+  if (lfOnlyCount > crlfCount) return "\n";
+  for (let i = rawEnd; i < rawContent.length; i++) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+  for (let i = rawStart - 1; i >= 0; i--) {
+    if (rawContent[i] === "\n") {
+      return i > 0 && rawContent[i - 1] === "\r" ? "\r\n" : "\n";
+    }
+  }
+  return fallbackEol;
+}
+function applySpansPreservingMixedEol(rawContent, normLength, spans, fallbackEol) {
+  const normToRaw = buildNormToRawOffsetMap(rawContent, normLength);
+  const pieces = [];
+  let rawCursor = 0;
+  for (const span of spans) {
+    const rawStart = normToRaw[span.start];
+    const rawEnd = normToRaw[span.end];
+    pieces.push(rawContent.slice(rawCursor, rawStart));
+    const localEol = detectLocalSpanEol(rawContent, rawStart, rawEnd, fallbackEol);
+    pieces.push(
+      localEol === "\r\n" ? span.replacement.replace(/\n/g, "\r\n") : span.replacement
+    );
+    rawCursor = rawEnd;
+  }
+  pieces.push(rawContent.slice(rawCursor));
+  return pieces.join("");
 }
 function countLines(text) {
   if (!text) return 0;
@@ -3803,13 +3868,18 @@ async function runApplyEdits(input) {
       );
       continue;
     }
-    const normalizedOriginal = fileData.content.replace(/\r\n/g, "\n");
+    const normalizedOriginal = fileData.rawContent.replace(/\r\n/g, "\n");
     const planned = planHunksForContent(normalizedOriginal, item.hunks, item.relPath);
     if (planned.errors.length > 0) {
       errors.push(...planned.errors);
       continue;
     }
-    const finalContent = fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
+    const finalContent = fileData.mixedEol ? applySpansPreservingMixedEol(
+      fileData.rawContent,
+      normalizedOriginal.length,
+      planned.spans,
+      fileData.eol
+    ) : fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
     const newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
     const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
     plans.push({
