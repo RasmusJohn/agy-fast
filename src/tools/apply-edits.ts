@@ -7,7 +7,7 @@ import {
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
-import { isLikelyBinary, readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
+import { hasUtf8Bom, isLikelyBinary, readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
@@ -1110,7 +1110,14 @@ export async function runApplyEdits(
         continue;
       }
 
-      const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
+      const originalHadBom = originalBuffer ? hasUtf8Bom(originalBuffer) : false;
+      const oldLines = originalBuffer
+        ? countLines((originalHadBom ? originalBuffer.subarray(3) : originalBuffer).toString("utf8"))
+        : 0;
+      const newContent =
+        originalHadBom && !item.create.startsWith("\uFEFF")
+          ? `\uFEFF${item.create}`
+          : item.create;
       const newLines = countLines(item.create);
       plans.push({
         absPath: item.absPath,
@@ -1120,7 +1127,7 @@ export async function runApplyEdits(
         originalBuffer,
         originalMode,
         originalSymlinkTarget,
-        newContent: item.create,
+        newContent,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
         created: !exists,
@@ -1150,6 +1157,10 @@ export async function runApplyEdits(
       fileData.eol === "\r\n"
         ? planned.newNormalized.replace(/\n/g, "\r\n")
         : planned.newNormalized;
+    const newContent =
+      fileData.hasBom && !finalContent.startsWith("\uFEFF")
+        ? `\uFEFF${finalContent}`
+        : finalContent;
 
     const lineDelta =
       countLines(planned.newNormalized) - countLines(normalizedOriginal);
@@ -1161,7 +1172,7 @@ export async function runApplyEdits(
       existed: true,
       originalBuffer: fileData.rawBuffer,
       originalMode: fileData.mode,
-      newContent: finalContent,
+      newContent,
       hunkCount: planned.appliedMatches,
       lineDelta,
       created: false,

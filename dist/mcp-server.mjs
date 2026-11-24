@@ -2588,6 +2588,22 @@ function isLikelyBinary(buf) {
   }
   return false;
 }
+function hasUtf8Bom(buf) {
+  return buf.length >= 3 && buf[0] === 239 && buf[1] === 187 && buf[2] === 191;
+}
+function detectUtf16Bom(buf) {
+  if (buf.length < 2) return null;
+  if (buf[0] === 255 && buf[1] === 254) {
+    if (buf.length >= 4 && buf[2] === 0 && buf[3] === 0) {
+      return null;
+    }
+    return "UTF-16 LE";
+  }
+  if (buf[0] === 254 && buf[1] === 255) {
+    return "UTF-16 BE";
+  }
+  return null;
+}
 async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
   const stat = await fs2.stat(filePath);
   if (!stat.isFile()) {
@@ -2599,10 +2615,17 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
     );
   }
   const buf = await fs2.readFile(filePath);
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    throw new Error(
+      `UTF-16 encoded file is not supported (convert to UTF-8 first): ${filePath} [${utf16Bom}]`
+    );
+  }
   if (isLikelyBinary(buf)) {
     throw new Error(`Binary file cannot be read as text: ${filePath}`);
   }
-  const content = buf.toString("utf8");
+  const hasBom = hasUtf8Bom(buf);
+  const content = (hasBom ? buf.subarray(3) : buf).toString("utf8");
   let crlfCount = 0;
   let lfOnlyCount = 0;
   for (let i = 0; i < content.length; i++) {
@@ -2612,7 +2635,7 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
     }
   }
   const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
-  return { content, eol, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
+  return { content, eol, hasBom, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
 }
 function globToRegExp(pattern) {
   const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "");
@@ -3562,7 +3585,9 @@ async function runApplyEdits(input) {
         errors.push(`${item.relPath}: Cannot overwrite binary file with text content`);
         continue;
       }
-      const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
+      const originalHadBom = originalBuffer ? hasUtf8Bom(originalBuffer) : false;
+      const oldLines = originalBuffer ? countLines((originalHadBom ? originalBuffer.subarray(3) : originalBuffer).toString("utf8")) : 0;
+      const newContent2 = originalHadBom && !item.create.startsWith("\uFEFF") ? `\uFEFF${item.create}` : item.create;
       const newLines = countLines(item.create);
       plans.push({
         absPath: item.absPath,
@@ -3572,7 +3597,7 @@ async function runApplyEdits(input) {
         originalBuffer,
         originalMode,
         originalSymlinkTarget,
-        newContent: item.create,
+        newContent: newContent2,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
         created: !exists
@@ -3595,6 +3620,7 @@ async function runApplyEdits(input) {
       continue;
     }
     const finalContent = fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
+    const newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
     const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
     plans.push({
       absPath: item.absPath,
@@ -3603,7 +3629,7 @@ async function runApplyEdits(input) {
       existed: true,
       originalBuffer: fileData.rawBuffer,
       originalMode: fileData.mode,
-      newContent: finalContent,
+      newContent,
       hunkCount: planned.appliedMatches,
       lineDelta,
       created: false

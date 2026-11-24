@@ -1417,4 +1417,90 @@ describe("apply_edits", () => {
     assert.deepEqual(await fs.readFile(pngPath), pngBytes);
     assert.equal(await fs.readFile(txtPath, "utf8"), "updated\n");
   });
+
+  it("preserves UTF-8 BOM across hunk edits and overwrite: true, and reports clear UTF-16 errors", async () => {
+    const subDir = path.join(tmpDir, "bom-utf16-edits");
+    await fs.mkdir(subDir, { recursive: true });
+
+    const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomHunkPath = path.join(subDir, "bom-hunk.ts");
+    const bomOverwritePath = path.join(subDir, "bom-overwrite.ts");
+    const bomExplicitPath = path.join(subDir, "bom-explicit.ts");
+    const plainPath = path.join(subDir, "plain.ts");
+
+    await fs.writeFile(
+      bomHunkPath,
+      Buffer.concat([utf8Bom, Buffer.from("export const a = 1;\r\nexport const b = 2;\r\n", "utf8")]),
+    );
+    await fs.writeFile(
+      bomOverwritePath,
+      Buffer.concat([utf8Bom, Buffer.from("old line\n", "utf8")]),
+    );
+    await fs.writeFile(
+      bomExplicitPath,
+      Buffer.concat([utf8Bom, Buffer.from("old explicit\n", "utf8")]),
+    );
+    await fs.writeFile(plainPath, "export const plain = 1;\n", "utf8");
+
+    const editRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        {
+          path: "bom-hunk.ts",
+          hunks: [{ target: "export const a = 1;", replacement: "export const a = 10;" }],
+        },
+        {
+          path: "bom-overwrite.ts",
+          create: "new line 1\nnew line 2\n",
+          overwrite: true,
+        },
+        {
+          path: "bom-explicit.ts",
+          create: "\uFEFFalready has bom\n",
+          overwrite: true,
+        },
+        {
+          path: "plain.ts",
+          hunks: [{ target: "plain = 1;", replacement: "plain = 2;" }],
+        },
+      ],
+    });
+    assert.equal(editRes.isError, false);
+
+    // 1. Hunk edit on line 1 matched without needing \uFEFF and preserved both BOM and CRLF
+    const rawHunk = await fs.readFile(bomHunkPath);
+    assert.deepEqual(rawHunk.subarray(0, 3), utf8Bom);
+    assert.equal(rawHunk.subarray(3).toString("utf8"), "export const a = 10;\r\nexport const b = 2;\r\n");
+
+    // 2. create + overwrite: true preserved UTF-8 BOM on disk
+    const rawOverwrite = await fs.readFile(bomOverwritePath);
+    assert.deepEqual(rawOverwrite.subarray(0, 3), utf8Bom);
+    assert.equal(rawOverwrite.subarray(3).toString("utf8"), "new line 1\nnew line 2\n");
+
+    // 3. create + overwrite: true with explicit \uFEFF does NOT double-prepend BOM
+    const rawExplicit = await fs.readFile(bomExplicitPath);
+    assert.deepEqual(rawExplicit.subarray(0, 3), utf8Bom);
+    assert.equal(rawExplicit.subarray(3).toString("utf8"), "already has bom\n");
+
+    // 4. Plain non-BOM file remains without BOM
+    const rawPlain = await fs.readFile(plainPath);
+    assert.notDeepEqual(rawPlain.subarray(0, 3), utf8Bom);
+    assert.equal(rawPlain.toString("utf8"), "export const plain = 2;\n");
+
+    // 5. UTF-16 LE file fails with clear UTF-16 diagnostic and remains untouched
+    const utf16Path = path.join(subDir, "settings.reg");
+    const utf16Bytes = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("Windows Registry Editor Version 5.00\r\n", "utf16le"),
+    ]);
+    await fs.writeFile(utf16Path, utf16Bytes);
+
+    const utf16Res = await runApplyEdits({
+      cwd: subDir,
+      edits: [{ path: "settings.reg", hunks: [{ target: "5.00", replacement: "6.00" }] }],
+    });
+    assert.equal(utf16Res.isError, true);
+    assert.match(utf16Res.text, /UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 LE\]/);
+    assert.deepEqual(await fs.readFile(utf16Path), utf16Bytes);
+  });
 });
