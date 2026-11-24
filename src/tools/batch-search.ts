@@ -14,6 +14,7 @@ import {
 } from "../utils/exec-utils.js";
 import { rankFuzzyPaths } from "../utils/fuzzy-match.js";
 import {
+  DEFAULT_IGNORE_DIRS,
   globToRegExp,
   isLikelyBinary,
   resolvePath,
@@ -531,8 +532,8 @@ async function runTextOrRegexWithRg(
   searchRoot: string,
   baseCwd: string,
 ): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
@@ -585,7 +586,17 @@ async function runTextOrRegexWithRg(
     args.push(`--glob=${query.glob}`);
   }
   // Always skip heavy vendor/build noise directories unless explicitly targeted
-  const normRoot = toPosixPath(searchRoot);
+  // by searchRoot (including paths outside baseCwd) or a positive query.glob.
+  // Emit default exclusions AFTER user query.glob so positive globs like `*.mjs`
+  // cannot override them under ripgrep's last-match-wins precedence.
+  const relRoot = toPosixPath(path.relative(baseCwd, searchRoot));
+  const isInsideBaseCwd =
+    relRoot === "" || (!relRoot.startsWith("..") && !path.isAbsolute(relRoot));
+  const rootSegments = isInsideBaseCwd
+    ? (relRoot ? relRoot.split("/") : [])
+    : toPosixPath(searchRoot).split("/").filter(Boolean);
+  const positiveGlob =
+    query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
     "node_modules",
     ".git",
@@ -597,7 +608,10 @@ async function runTextOrRegexWithRg(
     ".venv",
     ".next",
   ]) {
-    if (!normRoot.split("/").includes(dir)) {
+    if (
+      !rootSegments.includes(dir) &&
+      !(positiveGlob && globTargetsDir(positiveGlob, dir))
+    ) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
@@ -958,8 +972,8 @@ async function runTextOrRegexWithNode(
   searchRoot: string,
   baseCwd: string,
 ): Promise<{ files: FileMatches[]; totalMatches: number; truncated: boolean }> {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
 
   let regex: RegExp;
@@ -1008,28 +1022,80 @@ async function runTextOrRegexWithNode(
 
   const stat = await fs.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
-  let targetFiles: string[];
+  let targetFiles: Array<{ abs: string; rel: string }>;
   if (stat.isFile()) {
     const relPosix =
       toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
-    targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
+    targetFiles = globMatchesFile(relPosix)
+      ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }]
+      : [];
   } else {
     const includeHidden = Boolean(
-      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/.")),
+      rawGlob && !globNegated && patternTargetsHidden(rawGlob),
     );
+    let ignoreDirs: Set<string> | undefined;
+    if (rawGlob && !globNegated) {
+      const targeted = [...DEFAULT_IGNORE_DIRS].filter((dir) =>
+        globTargetsDir(rawGlob, dir),
+      );
+      if (targeted.length > 0) {
+        ignoreDirs = new Set(DEFAULT_IGNORE_DIRS);
+        for (const dir of targeted) ignoreDirs.delete(dir);
+      }
+    }
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8000,
       includeHidden,
+      ignoreDirs,
       fileFilter: globMatchesFile,
     });
     discoveryTruncated = walked.truncated;
-    // Subdirectories are walked concurrently; scan in path order like the rg backend.
-    targetFiles = walked.files.map((rel) => path.join(searchRoot, rel));
-    targetFiles.sort((a, b) => {
-      const ra = relativeFile(baseCwd, a);
-      const rb = relativeFile(baseCwd, b);
-      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    // Precompute relative paths once in O(N) instead of O(N log N) inside sort.
+    const rootRel = toPosixPath(path.relative(baseCwd, searchRoot));
+    const useFastPrefix = Boolean(
+      rootRel === "" || (!rootRel.startsWith("..") && !path.isAbsolute(rootRel)),
+    );
+    targetFiles = walked.files.map((rel) => {
+      const abs = path.join(searchRoot, rel);
+      const displayRel = useFastPrefix
+        ? rootRel
+          ? `${rootRel}/${rel}`
+          : rel
+        : relativeFile(baseCwd, abs);
+      return { abs, rel: displayRel };
     });
+    targetFiles.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  }
+
+  // Fast whole-buffer / whole-file prechecks skip UTF-8 decoding and line splitting
+  // on non-matching files while staying 100% faithful to line-by-line matching.
+  const canBufPrecheck =
+    query.type === "text" &&
+    query.caseSensitive !== false &&
+    !query.multiline &&
+    query.pattern.length > 0 &&
+    !query.pattern.includes("\uFFFD");
+  const patternBuf = canBufPrecheck ? Buffer.from(query.pattern, "utf8") : null;
+  const canTextCaseInsensitivePrecheck =
+    query.type === "text" &&
+    query.caseSensitive === false &&
+    !query.multiline &&
+    query.pattern.length > 0;
+  let wholeFileRegex: RegExp | null = null;
+  const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
+  // Whole-file /m precheck can false-negative on lookarounds matching whitespace/newlines
+  // across line boundaries (e.g. `foo(?!\s)` or `(?<!\s)foo`), so skip precheck for them.
+  const regexHasLookaround =
+    query.type === "regex" && /\(\?<?[=!]/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexHasLookaround) {
+    try {
+      wholeFileRegex = new RegExp(
+        regex.source,
+        `${query.caseSensitive === false ? "i" : ""}m`,
+      );
+    } catch {
+      wholeFileRegex = null;
+    }
   }
 
   const files: FileMatches[] = [];
@@ -1080,16 +1146,21 @@ async function runTextOrRegexWithNode(
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
-      batch.map(async (absFile): Promise<{ relFile: string; lines: string[]; matchedLines: MatchedLineInfo[]; count: number; fileTruncated: boolean } | null> => {
+      batch.map(async ({ abs: absFile, rel: relFile }): Promise<{ relFile: string; lines: string[]; matchedLines: MatchedLineInfo[]; count: number; fileTruncated: boolean } | null> => {
         try {
           const st = await fs.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
+          if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
+
           const content = buf.toString("utf8");
-          const lines = content.split(/\r?\n/);
-          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-          const relFile = relativeFile(baseCwd, absFile);
+          if (canTextCaseInsensitivePrecheck && !regex.test(content)) return null;
+          if (wholeFileRegex && (!regexHasDollar || buf.indexOf(0x0d) === -1)) {
+            if (!wholeFileRegex.test(content)) return null;
+          }
+
+          let lines: string[] = [];
           let matchedLines: MatchedLineInfo[] = [];
           let count = 0;
           let fileTruncated = false;
@@ -1101,7 +1172,13 @@ async function runTextOrRegexWithNode(
           } else if (query.multiline) {
             matchedLines = multilineMatchLines(content, regex, maxResults + 1);
             count = matchedLines.length;
+            if (count > 0) {
+              lines = content.split(/\r?\n/);
+              if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+            }
           } else {
+            lines = content.split(/\r?\n/);
+            if (lines.length > 0 && lines.at(-1) === "") lines.pop();
             for (let idx = 0; idx < lines.length; idx++) {
               const line = lines[idx]!;
               const hit = summary ? (regex.test(line) ? { index: 0, length: 0 } : null) : (() => {
@@ -1123,7 +1200,14 @@ async function runTextOrRegexWithNode(
             }
             count = matchedLines.length;
           }
-          return count ? { relFile, lines, matchedLines, count, fileTruncated } : null;
+          if (!count) return null;
+          return {
+            relFile,
+            lines: summary ? [] : lines,
+            matchedLines,
+            count,
+            fileTruncated,
+          };
         } catch {
           return null;
         }
@@ -1161,7 +1245,7 @@ async function runTextOrRegexWithNode(
   return {
     files,
     totalMatches,
-    truncated: truncated || anyFileTruncated || ((summary || query.multiline === true) && discoveryTruncated),
+    truncated: truncated || anyFileTruncated || discoveryTruncated,
   };
 }
 
@@ -1275,11 +1359,11 @@ async function runGlobQuery(
   baseCwd: string,
   isFileTarget: boolean,
 ): Promise<string> {
-  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
+  const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
   const matchBasename = !pattern.includes("/");
-  const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+  const includeHidden = patternTargetsHidden(pattern);
 
   if (isFileTarget) {
     const rel = toPosixPath(path.relative(baseCwd, searchRoot)) || path.basename(searchRoot);
@@ -1352,7 +1436,7 @@ async function runFuzzyQuery(
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
-  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const maxResults = clampInt(query.maxResults, 1, 200, 30);
   const walked = isFileTarget
     ? { files: [searchRoot], truncated: false }
     : await walkFiles(searchRoot, { maxFiles: 8000, fileFilter: matchesType });
@@ -2189,7 +2273,7 @@ async function executeSingleQuery(
                 files: res.files,
                 totalMatches: res.totalMatches,
                 truncated: res.truncated,
-                contextLines: clampInt(query.contextLines ?? 0, 0, 5),
+                contextLines: clampInt(query.contextLines, 0, 5, 0),
               }
             : undefined,
       };
@@ -2283,7 +2367,7 @@ export async function runBatchSearch(
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
 
-  const maxChars = clampInt(input.maxChars ?? 8_500, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxChars = clampInt(input.maxChars, 500, DEFAULT_INLINE_MAX_BYTES, 8_500);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex",
@@ -2349,7 +2433,26 @@ export async function runBatchSearch(
   };
 }
 
-function clampInt(val: number, min: number, max: number): number {
-  if (!Number.isFinite(val)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(val)));
+function patternTargetsHidden(pattern: string): boolean {
+  const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+  return /(?:^|[/,{])\.[^./]/.test(normalized);
+}
+
+function globTargetsDir(glob: string, dir: string): boolean {
+  const normalized = glob
+    .replace(/\\/g, "/")
+    .replace(/(^|[,{])(?:\.\/)+/g, "$1");
+  const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[/,{])${escaped}(?:$|[/},])`).test(normalized);
+}
+
+function clampInt(val: unknown, min: number, max: number, fallback = min): number {
+  const num =
+    typeof val === "number"
+      ? val
+      : typeof val === "string" && val.trim() !== ""
+        ? Number(val)
+        : NaN;
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }

@@ -40,7 +40,7 @@ export function expandHome(inputPath: string): string {
 export function resolvePath(inputPath: string, baseDir?: string): string {
   const expanded = expandHome(inputPath.trim());
   const root = baseDir ? path.resolve(expandHome(baseDir)) : process.cwd();
-  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(root, expanded);
+  return path.resolve(root, expanded);
 }
 
 export function toPosixPath(p: string): string {
@@ -125,8 +125,24 @@ export async function readTextFile(
  * matching POSIX-normalized relative paths.
  */
 export function globToRegExp(pattern: string): RegExp {
-  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "");
-  let re = "^";
+  const normalized = pattern
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\*{3,}/g, "**")
+    .replace(/(?:\*\*\/)+/g, "**/");
+  const re = `^${compileGlobBody(normalized)}$`;
+  try {
+    return new RegExp(re);
+  } catch (err) {
+    throw new Error(
+      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function compileGlobBody(normalized: string): string {
+  let re = "";
   let i = 0;
 
   while (i < normalized.length) {
@@ -148,14 +164,16 @@ export function globToRegExp(pattern: string): RegExp {
       re += "[^/]";
       i += 1;
     } else if (ch === "[") {
-      const close = normalized.indexOf("]", i + 1);
+      const close = findClosingBracket(normalized, i);
       if (close === -1) {
         re += "\\[";
         i += 1;
       } else {
-        let inner = normalized.slice(i + 1, close).replace(/\\/g, "\\\\");
-        if (inner.startsWith("!")) inner = "^" + inner.slice(1);
-        re += `[${inner}]`;
+        let inner = normalized.slice(i + 1, close);
+        const negated = inner.startsWith("!") || inner.startsWith("^");
+        if (negated) inner = inner.slice(1);
+        inner = inner.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+        re += negated ? `(?!/)[${"^"}${inner}]` : `[${inner}]`;
         i = close + 1;
       }
     } else if (ch === "{") {
@@ -166,7 +184,7 @@ export function globToRegExp(pattern: string): RegExp {
       } else {
         const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
         const sub = parts
-          .map((part) => globToRegExp(part).source.slice(1, -1))
+          .map((part) => compileGlobBody(part.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/")))
           .join("|");
         re += `(?:${sub})`;
         i = close + 1;
@@ -180,19 +198,29 @@ export function globToRegExp(pattern: string): RegExp {
     }
   }
 
-  re += "$";
-  try {
-    return new RegExp(re);
-  } catch (err) {
-    throw new Error(
-      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`,
-    );
+  return re;
+}
+
+function findClosingBracket(str: string, openIdx: number): number {
+  let i = openIdx + 1;
+  if (i < str.length && (str[i] === "!" || str[i] === "^")) i++;
+  if (i < str.length && str[i] === "]") i++; // leading `]` is a literal member of the class
+  for (; i < str.length; i++) {
+    if (str[i] === "]") return i;
   }
+  return -1;
 }
 
 function findMatchingBrace(str: string, openIdx: number): number {
   let depth = 0;
   for (let i = openIdx; i < str.length; i++) {
+    if (str[i] === "[") {
+      const close = findClosingBracket(str, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
     if (str[i] === "{") depth++;
     else if (str[i] === "}") {
       depth--;
@@ -208,6 +236,13 @@ function splitBraceAlternatives(inner: string): string[] {
   let start = 0;
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
+    if (ch === "[") {
+      const close = findClosingBracket(inner, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
     if (ch === "{") depth++;
     else if (ch === "}") depth--;
     else if (ch === "," && depth === 0) {
@@ -236,7 +271,7 @@ export async function walkFiles(
   rootDir: string,
   options: WalkOptions = {},
 ): Promise<WalkResult> {
-  const maxFiles = options.maxFiles ?? 5000;
+  const maxFiles = Math.max(0, Math.trunc(options.maxFiles ?? 5000));
   const maxDepth = options.maxDepth ?? 32;
   const includeHidden = options.includeHidden ?? false;
   const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
@@ -245,50 +280,116 @@ export async function walkFiles(
   const files: string[] = [];
   let truncated = false;
 
-  async function visit(dir: string, relDir: string, depth: number): Promise<void> {
-    if (truncated || depth > maxDepth) return;
+  // Global concurrency semaphore caps simultaneous fs.readdir calls across all
+  // recursion depths to prevent EMFILE FD exhaustion on nested workspaces.
+  const MAX_CONCURRENT_READDIRS = 16;
+  let activeReaddirs = 0;
+  const waitQueue: Array<() => void> = [];
+  const drainWaiters = (): void => {
+    while (waitQueue.length > 0) {
+      waitQueue.shift()!();
+    }
+  };
+  const markTruncated = (): void => {
+    if (truncated) return;
+    truncated = true;
+    drainWaiters();
+  };
+  const readDirBounded = async (dir: string) => {
+    if (truncated) return null;
+    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
+      await new Promise<void>((resolve) => waitQueue.push(resolve));
+      if (truncated) return null;
+    }
+    if (truncated) return null;
+    activeReaddirs++;
+    try {
+      return await fs.readdir(dir, { withFileTypes: true });
+    } finally {
+      activeReaddirs--;
+      if (truncated) {
+        drainWaiters();
+      } else {
+        const next = waitQueue.shift();
+        if (next) next();
+      }
+    }
+  };
 
+  interface DirScanResult {
+    localFiles: string[];
+    subdirs: Array<{ abs: string; rel: string }>;
+  }
+
+  const scanDir = async (dir: string, relDir: string): Promise<DirScanResult> => {
+    if (truncated) return { localFiles: [], subdirs: [] };
     let entries;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      entries = await readDirBounded(dir);
     } catch {
-      return;
+      return { localFiles: [], subdirs: [] };
     }
-
+    if (!entries || truncated) return { localFiles: [], subdirs: [] };
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
+    const localFiles: string[] = [];
     const subdirs: Array<{ abs: string; rel: string }> = [];
-
     for (const entry of entries) {
-      if (truncated) return;
       const name = entry.name;
       if (!includeHidden && name.startsWith(".")) {
         if (!(entry.isDirectory() && name === ".agents")) {
           continue;
         }
       }
-
-      const absPath = path.join(dir, name);
       const relPosix = relDir ? `${relDir}/${name}` : name;
-
       if (entry.isDirectory()) {
         if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: absPath, rel: relPosix });
+        subdirs.push({ abs: path.join(dir, name), rel: relPosix });
       } else if (entry.isFile()) {
         if (fileFilter && !fileFilter(relPosix)) continue;
-        files.push(relPosix);
-        if (files.length >= maxFiles) {
-          truncated = true;
-          return;
-        }
+        localFiles.push(relPosix);
       }
     }
+    return { localFiles, subdirs };
+  };
 
-    // Visit subdirectories in bounded batches for speed without exhausting FDs
+  // Prefetch sibling directories concurrently in bounded batches while emitting
+  // matched files in deterministic lexicographical DFS order and only marking
+  // `truncated` when a (maxFiles + 1)-th matching file is actually encountered.
+  async function visit(
+    dir: string,
+    relDir: string,
+    depth: number,
+    prefetched?: Promise<DirScanResult>,
+  ): Promise<void> {
+    if (truncated || depth > maxDepth) return;
+    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+
+    for (const relPosix of localFiles) {
+      if (files.length >= maxFiles) {
+        markTruncated();
+        return;
+      }
+      files.push(relPosix);
+    }
+
+    if (depth >= maxDepth || subdirs.length === 0) return;
+
     const batchSize = 8;
     for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
       const slice = subdirs.slice(i, i + batchSize);
-      await Promise.all(slice.map((sub) => visit(sub.abs, sub.rel, depth + 1)));
+      const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      try {
+        for (let j = 0; j < slice.length && !truncated; j++) {
+          await visit(slice[j]!.abs, slice[j]!.rel, depth + 1, prefetches[j]);
+        }
+      } finally {
+        // Ensure no sibling prefetches remain in flight after early truncation
+        // (avoids dangling directory handles / EBUSY on Windows temp cleanup).
+        if (truncated) {
+          await Promise.allSettled(prefetches);
+        }
+      }
     }
   }
 

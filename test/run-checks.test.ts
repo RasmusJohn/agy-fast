@@ -266,6 +266,20 @@ describe("run_checks", () => {
       formatPowerShellCommand('node "$env:USERPROFILE\\a.js"'),
       'node "$env:USERPROFILE\\a.js"',
     );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO"\nGet-Date'),
+      '"$env:FOO"\nGet-Date',
+    );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO" \nGet-Date'),
+      '"$env:FOO" \nGet-Date',
+    );
+    assert.equal(
+      formatPowerShellCommand('"$env:FOO"  \t\r\nGet-Date'),
+      '"$env:FOO"  \t\r\nGet-Date',
+    );
+    assert.equal(needsPowerShellOnWindows('echo "C:\\\\" && Get-ChildItem'), true);
+    assert.equal(needsPowerShellOnWindows('echo "foo``" && Get-ChildItem'), true);
 
     // UTF-8 prefix guards non-console hosts and avoids BOM
     const wrapped = buildPowerShellUtf8Command('Write-Output "ok"');

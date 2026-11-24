@@ -9,6 +9,7 @@ import {
   tokenizeArgs,
   validateReadonlyGitArgs,
 } from "../src/tools/batch-search.js";
+import { globToRegExp, resolvePath, walkFiles } from "../src/utils/fs-utils.js";
 
 describe("batch_search", () => {
   let tmpDir: string;
@@ -1258,6 +1259,185 @@ describe("batch_search", () => {
       assert.match(fitRes.text, /\.\.\. \[truncated at 10 matches\]$/);
     } finally {
       await fs.rm(budgetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hardens fs-utils globToRegExp/walkFiles/resolvePath and batch_search stringified limits, hidden globs, and fast-path CRLF parity", async () => {
+    // 1. globToRegExp resists repeated `**/` ReDoS and handles brace spaces & negated/leading-`]` char classes
+    const redosStart = Date.now();
+    const collapsed = globToRegExp("**/**/**/**/**/**/**/**/nope.ts");
+    assert.equal(collapsed.test("a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/file.js"), false);
+    assert.ok(Date.now() - redosStart < 100, "Repeated **/ glob must stay linear-time");
+    assert.equal(globToRegExp("foo{ ,_}bar.ts").test("foo bar.ts"), true);
+    assert.equal(globToRegExp("foo{ ,_}bar.ts").test("foobar.ts"), false);
+    assert.equal(globToRegExp("[!a].ts").test("b.ts"), true);
+    assert.equal(globToRegExp("[!a].ts").test("/.ts"), false);
+    assert.equal(globToRegExp("[]a].ts").test("].ts"), true);
+    assert.equal(globToRegExp("{a[,],b}.ts").test("a,.ts"), true);
+
+    // 2. resolvePath binds drive-less leading-slash paths to baseDir's drive on Windows
+    if (process.platform === "win32") {
+      assert.equal(resolvePath("/src/index.ts", "D:\\repo"), "D:\\src\\index.ts");
+    }
+
+    // 3. walkFiles returns deterministic order and does not report truncated when file count === maxFiles
+    const walkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-walk-exact-"));
+    try {
+      await fs.mkdir(path.join(walkDir, "b"), { recursive: true });
+      await fs.mkdir(path.join(walkDir, "a"), { recursive: true });
+      await fs.writeFile(path.join(walkDir, "a", "1.ts"), "export const a = 1;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, "b", "2.ts"), "export const b = 2;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, "c.ts"), "export const c = 3;\r\n", "utf8");
+      await fs.writeFile(path.join(walkDir, ".env"), "SECRET=1\n", "utf8");
+      await fs.mkdir(path.join(walkDir, ".hidden"), { recursive: true });
+      await fs.writeFile(path.join(walkDir, ".hidden", "skip.ts"), "export const h = 1;\n", "utf8");
+
+      const exact = await walkFiles(walkDir, { maxFiles: 3 });
+      assert.deepEqual(exact.files, ["c.ts", "a/1.ts", "b/2.ts"]);
+      assert.equal(exact.truncated, false);
+
+      const over = await walkFiles(walkDir, { maxFiles: 2 });
+      assert.deepEqual(over.files, ["c.ts", "a/1.ts"]);
+      assert.equal(over.truncated, true);
+
+      // 4. Stringified maxResults does not collapse to 1; `./` prefix does not crawl hidden dirs; `{.env,...}` finds dotfiles
+      const strLimit = await runBatchSearch({
+        cwd: walkDir,
+        queries: [
+          { type: "glob", pattern: "**/*.ts", maxResults: "10" as unknown as number },
+          { type: "glob", pattern: "./**/*.ts" },
+          { type: "glob", pattern: "{.env,.env.local}" },
+          { type: "regex", pattern: "const b = 2;$" },
+        ],
+      }, { forceNodeFallback: true });
+      assert.equal(strLimit.isError, false);
+      const secs = strLimit.text.split("\n\n");
+      assert.match(secs[0]!, /a\/1\.ts/);
+      assert.match(secs[0]!, /b\/2\.ts/);
+      assert.match(secs[0]!, /c\.ts/);
+      assert.doesNotMatch(secs[0]!, /truncated/);
+      assert.doesNotMatch(secs[1]!, /\.hidden\/skip\.ts/);
+      assert.match(secs[2]!, /\.env/);
+      assert.match(secs[3]!, /b\/2\.ts\n\s+1: export const b = 2;/);
+    } finally {
+      await fs.rm(walkDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps default excluded dirs ahead of positive user globs, honors explicit excluded-dir globs & external paths, preserves lookaround regexes, and bounds walkFiles on truncation", async () => {
+    const outerDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-glob-prec-"));
+    const wsDir = path.join(outerDir, "ws");
+    const externalDistDir = path.join(outerDir, "shared", "dist");
+    try {
+      await fs.mkdir(path.join(wsDir, "src"), { recursive: true });
+      await fs.mkdir(path.join(wsDir, "dist"), { recursive: true });
+      await fs.mkdir(path.join(wsDir, "node_modules", "pkg"), { recursive: true });
+      await fs.mkdir(externalDistDir, { recursive: true });
+
+      await fs.writeFile(path.join(wsDir, "src", "app.mjs"), "export const x = 'NEEDLE_GLOB_TEST src';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "dist", "bundle.mjs"), "export const x = 'NEEDLE_GLOB_TEST dist';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "node_modules", "pkg", "index.mjs"), "export const x = 'NEEDLE_GLOB_TEST nm';\n", "utf8");
+      await fs.writeFile(path.join(externalDistDir, "lib.mjs"), "export const x = 'NEEDLE_GLOB_TEST external_dist';\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "src", "lookaround.txt"), "foo\nbar\nqux\r\nbaz\n", "utf8");
+      await fs.writeFile(path.join(wsDir, "src", "lookbehind.txt"), "bar\nfoo\n", "utf8");
+
+      // 1. Both ripgrep and Node fallback keep default exclusions for positive globs like `*.mjs`,
+      //    while honoring explicit `dist/*.mjs`, `{dist,src}/*.mjs`, and external `../shared/dist`.
+      for (const forceNodeFallback of [false, true]) {
+        const res = await runBatchSearch(
+          {
+            cwd: wsDir,
+            queries: [
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "dist/*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", glob: "{dist,src}/*.mjs" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", path: "../shared/dist" },
+              { type: "text", pattern: "NEEDLE_GLOB_TEST", path: "../shared/dist", glob: "*.mjs" },
+            ],
+          },
+          { forceNodeFallback },
+        );
+        assert.equal(res.isError, false);
+        const sections = res.text.split("\n\n");
+        // Query 1: `*.mjs` must NOT pierce default exclusions (`dist/` or `node_modules/`)
+        assert.match(sections[0]!, /src\/app\.mjs/);
+        assert.doesNotMatch(sections[0]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[0]!, /node_modules/);
+        // Query 2: explicit `dist/*.mjs` searches `dist/` while keeping `node_modules/` excluded
+        assert.match(sections[1]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[1]!, /src\/app\.mjs/);
+        assert.doesNotMatch(sections[1]!, /node_modules/);
+        // Query 3: brace glob `{dist,src}/*.mjs` searches both `dist/` and `src/`
+        assert.match(sections[2]!, /src\/app\.mjs/);
+        assert.match(sections[2]!, /dist\/bundle\.mjs/);
+        assert.doesNotMatch(sections[2]!, /node_modules/);
+        // Query 4 & 5: external path `../shared/dist` is not wiped out by default `!**/dist/**`
+        assert.match(sections[3]!, /NEEDLE_GLOB_TEST external_dist/);
+        assert.match(sections[4]!, /NEEDLE_GLOB_TEST external_dist/);
+      }
+
+      // 2. Lookaround regexes must not false-negative in Node whole-file precheck
+      const lookRes = await runBatchSearch(
+        {
+          cwd: wsDir,
+          queries: [
+            { type: "regex", pattern: "foo(?!\\s)" },
+            { type: "regex", pattern: "(?<!\\s)foo" },
+            { type: "regex", pattern: "qux(?![\\r\\n])" },
+          ],
+        },
+        { forceNodeFallback: true },
+      );
+      assert.equal(lookRes.isError, false);
+      const lookSecs = lookRes.text.split("\n\n");
+      assert.match(lookSecs[0]!, /src\/lookaround\.txt\n\s+1: foo/);
+      assert.match(lookSecs[0]!, /src\/lookbehind\.txt\n\s+2: foo/);
+      assert.match(lookSecs[1]!, /src\/lookaround\.txt\n\s+1: foo/);
+      assert.match(lookSecs[1]!, /src\/lookbehind\.txt\n\s+2: foo/);
+      assert.match(lookSecs[2]!, /src\/lookaround\.txt\n\s+3: qux/);
+
+      // 3. walkFiles keeps simultaneous fs.readdir <= 16 and leaves 0 in-flight calls after truncation
+      const nestedDir = path.join(outerDir, "nested");
+      for (let i = 0; i < 24; i++) {
+        const sub = path.join(nestedDir, `d${String(i).padStart(2, "0")}`, "leaf");
+        await fs.mkdir(sub, { recursive: true });
+        await fs.writeFile(path.join(sub, "f1.ts"), "export const a = 1;\n", "utf8");
+        await fs.writeFile(path.join(sub, "f2.ts"), "export const b = 2;\n", "utf8");
+      }
+
+      const origReaddir = fs.readdir as (...args: unknown[]) => Promise<unknown>;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = async (
+        ...args: unknown[]
+      ) => {
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        try {
+          await new Promise((r) => setTimeout(r, 4));
+          return await origReaddir(...args);
+        } finally {
+          inFlight--;
+        }
+      };
+      try {
+        const fullWalk = await walkFiles(nestedDir, { maxFiles: 100 });
+        assert.equal(fullWalk.truncated, false);
+        assert.equal(fullWalk.files.length, 48);
+        assert.ok(maxInFlight <= 16, `Expected <=16 concurrent readdirs, got ${maxInFlight}`);
+        assert.equal(inFlight, 0);
+
+        maxInFlight = 0;
+        const truncWalk = await walkFiles(nestedDir, { maxFiles: 3 });
+        assert.equal(truncWalk.truncated, true);
+        assert.equal(truncWalk.files.length, 3);
+        assert.ok(maxInFlight <= 16, `Expected <=16 concurrent readdirs on truncation, got ${maxInFlight}`);
+        assert.equal(inFlight, 0, "walkFiles must not leave dangling readdir calls after truncation");
+      } finally {
+        (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddir;
+      }
+    } finally {
+      await fs.rm(outerDir, { recursive: true, force: true });
     }
   });
 });

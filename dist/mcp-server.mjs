@@ -648,6 +648,7 @@ ${serialized}`);
 
 // src/utils/exec-utils.ts
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 var DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 var WINDOWS_CODEPAGE_LABELS = {
@@ -774,7 +775,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
 }
 var MCP_CALL_BUDGET_SEC = 170;
 function killChildTree(pid, detached) {
-  if (!pid) return;
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = () => {
       try {
@@ -794,7 +795,7 @@ function killChildTree(pid, detached) {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
   try {
     if (detached) {
@@ -804,7 +805,7 @@ function killChildTree(pid, detached) {
     }
   } catch {
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -813,7 +814,9 @@ function killChildTree(pid, detached) {
       }
     } catch {
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
@@ -972,7 +975,7 @@ function stripQuotedSpans(command, stripDoubleQuotes) {
       continue;
     }
     if (quote === '"') {
-      if ((ch === "\\" || ch === "`") && next === '"') {
+      if ((ch === "\\" || ch === "`") && (next === ch || next === '"')) {
         i++;
         if (!stripDoubleQuotes) out += ch + next;
         continue;
@@ -1033,11 +1036,11 @@ function formatPowerShellCommand(command) {
         continue;
       }
       const afterQuote = trimmed.slice(idx + 1);
-      if (!/^\s+/.test(afterQuote)) {
+      const rest = afterQuote.replace(/^[ \t]+/, "");
+      if (rest.length === afterQuote.length || !rest || /^[\r\n]/.test(rest)) {
         return command;
       }
-      const rest = afterQuote.trimStart();
-      if (rest && !PS_NON_INVOCATION_TAIL_RE.test(rest)) {
+      if (!PS_NON_INVOCATION_TAIL_RE.test(rest)) {
         return `& ${trimmed}`;
       }
       return command;
@@ -1191,9 +1194,10 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       return;
     }
     let settleFallbackTimer = null;
+    let sigkillTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -1206,6 +1210,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -1257,20 +1262,36 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
   });
 }
 var cachedRgAvailable = null;
+var pendingRgProbe = null;
 async function isRipgrepAvailable() {
   if (cachedRgAvailable !== null) return cachedRgAvailable;
-  const res = await execBinaryAsync("rg", ["--version"], {
-    cwd: process.cwd(),
-    timeoutMs: 2e3,
-    maxOutputBytes: 4096
-  });
-  cachedRgAvailable = !res.error && res.exitCode === 0;
-  return cachedRgAvailable;
+  if (pendingRgProbe) return pendingRgProbe;
+  let probe = null;
+  probe = (async () => {
+    try {
+      const res = await execBinaryAsync("rg", ["--version"], {
+        cwd: os.tmpdir(),
+        timeoutMs: 2e3,
+        maxOutputBytes: 4096
+      });
+      const available = !res.error && !res.timedOut && res.exitCode === 0;
+      if (!res.timedOut && pendingRgProbe === probe) {
+        cachedRgAvailable = available;
+      }
+      return available;
+    } finally {
+      if (pendingRgProbe === probe) {
+        pendingRgProbe = null;
+      }
+    }
+  })();
+  pendingRgProbe = probe;
+  return probe;
 }
 
 // src/utils/host-compat.ts
 import fs from "node:fs";
-import os from "node:os";
+import os2 from "node:os";
 import path2 from "node:path";
 
 // src/utils/output-filter.ts
@@ -2446,7 +2467,7 @@ function resolveHostCompat(signals = {}, rules = HOST_COMPAT_RULES) {
 }
 function getConfigPath(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
-  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os.homedir() : env.HOME || env.USERPROFILE || os.homedir();
+  const home = process.platform === "win32" ? env.USERPROFILE || env.HOME || os2.homedir() : env.HOME || env.USERPROFILE || os2.homedir();
   const cacheDir = custom ? path2.resolve(custom) : path2.join(home, ".gemini", "cache", "agy-fast");
   return path2.join(cacheDir, "config.json");
 }
@@ -2538,7 +2559,7 @@ function formatCorruptedArrayError(options) {
 
 // src/utils/fs-utils.ts
 import { promises as fs2 } from "node:fs";
-import os2 from "node:os";
+import os3 from "node:os";
 import path3 from "node:path";
 var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   ".git",
@@ -2567,16 +2588,16 @@ var DEFAULT_IGNORE_DIRS = /* @__PURE__ */ new Set([
   "vendor"
 ]);
 function expandHome(inputPath) {
-  if (inputPath === "~") return os2.homedir();
+  if (inputPath === "~") return os3.homedir();
   if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-    return path3.join(os2.homedir(), inputPath.slice(2));
+    return path3.join(os3.homedir(), inputPath.slice(2));
   }
   return inputPath;
 }
 function resolvePath(inputPath, baseDir) {
   const expanded = expandHome(inputPath.trim());
   const root = baseDir ? path3.resolve(expandHome(baseDir)) : process.cwd();
-  return path3.isAbsolute(expanded) ? path3.normalize(expanded) : path3.resolve(root, expanded);
+  return path3.resolve(root, expanded);
 }
 function toPosixPath(p) {
   return p.split(path3.sep).join("/");
@@ -2638,8 +2659,18 @@ async function readTextFile(filePath, maxBytes = 10 * 1024 * 1024) {
   return { content, eol, hasBom, size: stat.size, mode: stat.mode & 4095, rawBuffer: buf };
 }
 function globToRegExp(pattern) {
-  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "");
-  let re = "^";
+  const normalized = pattern.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/");
+  const re = `^${compileGlobBody(normalized)}$`;
+  try {
+    return new RegExp(re);
+  } catch (err) {
+    throw new Error(
+      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+function compileGlobBody(normalized) {
+  let re = "";
   let i = 0;
   while (i < normalized.length) {
     const ch = normalized[i];
@@ -2660,14 +2691,16 @@ function globToRegExp(pattern) {
       re += "[^/]";
       i += 1;
     } else if (ch === "[") {
-      const close = normalized.indexOf("]", i + 1);
+      const close = findClosingBracket(normalized, i);
       if (close === -1) {
         re += "\\[";
         i += 1;
       } else {
-        let inner = normalized.slice(i + 1, close).replace(/\\/g, "\\\\");
-        if (inner.startsWith("!")) inner = "^" + inner.slice(1);
-        re += `[${inner}]`;
+        let inner = normalized.slice(i + 1, close);
+        const negated = inner.startsWith("!") || inner.startsWith("^");
+        if (negated) inner = inner.slice(1);
+        inner = inner.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+        re += negated ? `(?!/)[${"^"}${inner}]` : `[${inner}]`;
         i = close + 1;
       }
     } else if (ch === "{") {
@@ -2677,7 +2710,7 @@ function globToRegExp(pattern) {
         i += 1;
       } else {
         const parts = splitBraceAlternatives(normalized.slice(i + 1, close));
-        const sub = parts.map((part) => globToRegExp(part).source.slice(1, -1)).join("|");
+        const sub = parts.map((part) => compileGlobBody(part.replace(/\*{3,}/g, "**").replace(/(?:\*\*\/)+/g, "**/"))).join("|");
         re += `(?:${sub})`;
         i = close + 1;
       }
@@ -2689,18 +2722,27 @@ function globToRegExp(pattern) {
       i += 1;
     }
   }
-  re += "$";
-  try {
-    return new RegExp(re);
-  } catch (err) {
-    throw new Error(
-      `Invalid glob pattern '${pattern}': ${err instanceof Error ? err.message : String(err)}`
-    );
+  return re;
+}
+function findClosingBracket(str, openIdx) {
+  let i = openIdx + 1;
+  if (i < str.length && (str[i] === "!" || str[i] === "^")) i++;
+  if (i < str.length && str[i] === "]") i++;
+  for (; i < str.length; i++) {
+    if (str[i] === "]") return i;
   }
+  return -1;
 }
 function findMatchingBrace(str, openIdx) {
   let depth = 0;
   for (let i = openIdx; i < str.length; i++) {
+    if (str[i] === "[") {
+      const close = findClosingBracket(str, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
     if (str[i] === "{") depth++;
     else if (str[i] === "}") {
       depth--;
@@ -2715,6 +2757,13 @@ function splitBraceAlternatives(inner) {
   let start = 0;
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
+    if (ch === "[") {
+      const close = findClosingBracket(inner, i);
+      if (close !== -1) {
+        i = close;
+        continue;
+      }
+    }
     if (ch === "{") depth++;
     else if (ch === "}") depth--;
     else if (ch === "," && depth === 0) {
@@ -2726,49 +2775,100 @@ function splitBraceAlternatives(inner) {
   return parts;
 }
 async function walkFiles(rootDir, options = {}) {
-  const maxFiles = options.maxFiles ?? 5e3;
+  const maxFiles = Math.max(0, Math.trunc(options.maxFiles ?? 5e3));
   const maxDepth = options.maxDepth ?? 32;
   const includeHidden = options.includeHidden ?? false;
   const ignoreDirs = options.ignoreDirs ?? DEFAULT_IGNORE_DIRS;
   const fileFilter = options.fileFilter;
   const files = [];
   let truncated = false;
-  async function visit(dir, relDir, depth) {
-    if (truncated || depth > maxDepth) return;
+  const MAX_CONCURRENT_READDIRS = 16;
+  let activeReaddirs = 0;
+  const waitQueue = [];
+  const drainWaiters = () => {
+    while (waitQueue.length > 0) {
+      waitQueue.shift()();
+    }
+  };
+  const markTruncated = () => {
+    if (truncated) return;
+    truncated = true;
+    drainWaiters();
+  };
+  const readDirBounded = async (dir) => {
+    if (truncated) return null;
+    while (activeReaddirs >= MAX_CONCURRENT_READDIRS) {
+      await new Promise((resolve) => waitQueue.push(resolve));
+      if (truncated) return null;
+    }
+    if (truncated) return null;
+    activeReaddirs++;
+    try {
+      return await fs2.readdir(dir, { withFileTypes: true });
+    } finally {
+      activeReaddirs--;
+      if (truncated) {
+        drainWaiters();
+      } else {
+        const next = waitQueue.shift();
+        if (next) next();
+      }
+    }
+  };
+  const scanDir = async (dir, relDir) => {
+    if (truncated) return { localFiles: [], subdirs: [] };
     let entries;
     try {
-      entries = await fs2.readdir(dir, { withFileTypes: true });
+      entries = await readDirBounded(dir);
     } catch {
-      return;
+      return { localFiles: [], subdirs: [] };
     }
+    if (!entries || truncated) return { localFiles: [], subdirs: [] };
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const localFiles = [];
     const subdirs = [];
     for (const entry of entries) {
-      if (truncated) return;
       const name = entry.name;
       if (!includeHidden && name.startsWith(".")) {
         if (!(entry.isDirectory() && name === ".agents")) {
           continue;
         }
       }
-      const absPath = path3.join(dir, name);
       const relPosix = relDir ? `${relDir}/${name}` : name;
       if (entry.isDirectory()) {
         if (ignoreDirs.has(name)) continue;
-        subdirs.push({ abs: absPath, rel: relPosix });
+        subdirs.push({ abs: path3.join(dir, name), rel: relPosix });
       } else if (entry.isFile()) {
         if (fileFilter && !fileFilter(relPosix)) continue;
-        files.push(relPosix);
-        if (files.length >= maxFiles) {
-          truncated = true;
-          return;
-        }
+        localFiles.push(relPosix);
       }
     }
+    return { localFiles, subdirs };
+  };
+  async function visit(dir, relDir, depth, prefetched) {
+    if (truncated || depth > maxDepth) return;
+    const { localFiles, subdirs } = await (prefetched ?? scanDir(dir, relDir));
+    for (const relPosix of localFiles) {
+      if (files.length >= maxFiles) {
+        markTruncated();
+        return;
+      }
+      files.push(relPosix);
+    }
+    if (depth >= maxDepth || subdirs.length === 0) return;
     const batchSize = 8;
     for (let i = 0; i < subdirs.length && !truncated; i += batchSize) {
       const slice = subdirs.slice(i, i + batchSize);
-      await Promise.all(slice.map((sub) => visit(sub.abs, sub.rel, depth + 1)));
+      const prefetches = slice.map((sub) => scanDir(sub.abs, sub.rel));
+      try {
+        for (let j = 0; j < slice.length && !truncated; j++) {
+          await visit(slice[j].abs, slice[j].rel, depth + 1, prefetches[j]);
+        }
+      } finally {
+        if (truncated) {
+          await Promise.allSettled(prefetches);
+        }
+      }
     }
   }
   await visit(rootDir, "", 0);
@@ -4293,8 +4393,8 @@ function fileTypeMatcher(fileType) {
   return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
@@ -4344,7 +4444,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const normRoot = toPosixPath(searchRoot);
+  const relRoot = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const isInsideBaseCwd = relRoot === "" || !relRoot.startsWith("..") && !path5.isAbsolute(relRoot);
+  const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
+  const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
     "node_modules",
     ".git",
@@ -4356,7 +4459,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     ".venv",
     ".next"
   ]) {
-    if (!normRoot.split("/").includes(dir)) {
+    if (!rootSegments.includes(dir) && !(positiveGlob && globTargetsDir(positiveGlob, dir))) {
       args.push(`--glob=!**/${dir}/**`);
     }
   }
@@ -4645,8 +4748,8 @@ function multilineMatchLines(content, regex, limit) {
   return results;
 }
 async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
-  const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
-  const contextLines = clampInt(query.contextLines ?? 0, 0, 5);
+  const maxResults = clampInt(query.maxResults, 1, 200, 40);
+  const contextLines = clampInt(query.contextLines, 0, 5, 0);
   const flags = (query.caseSensitive === false ? "i" : "") + (query.multiline ? "gmsu" : "");
   let regex;
   if (query.type === "regex") {
@@ -4692,23 +4795,54 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   let targetFiles;
   if (stat.isFile()) {
     const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
+    targetFiles = globMatchesFile(relPosix) ? [{ abs: searchRoot, rel: relativeFile(baseCwd, searchRoot) }] : [];
   } else {
     const includeHidden = Boolean(
-      rawGlob && !globNegated && (rawGlob.startsWith(".") || rawGlob.includes("/."))
+      rawGlob && !globNegated && patternTargetsHidden(rawGlob)
     );
+    let ignoreDirs;
+    if (rawGlob && !globNegated) {
+      const targeted = [...DEFAULT_IGNORE_DIRS].filter(
+        (dir) => globTargetsDir(rawGlob, dir)
+      );
+      if (targeted.length > 0) {
+        ignoreDirs = new Set(DEFAULT_IGNORE_DIRS);
+        for (const dir of targeted) ignoreDirs.delete(dir);
+      }
+    }
     const walked = await walkFiles(searchRoot, {
       maxFiles: 8e3,
       includeHidden,
+      ignoreDirs,
       fileFilter: globMatchesFile
     });
     discoveryTruncated = walked.truncated;
-    targetFiles = walked.files.map((rel) => path5.join(searchRoot, rel));
-    targetFiles.sort((a, b) => {
-      const ra = relativeFile(baseCwd, a);
-      const rb = relativeFile(baseCwd, b);
-      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    const rootRel = toPosixPath(path5.relative(baseCwd, searchRoot));
+    const useFastPrefix = Boolean(
+      rootRel === "" || !rootRel.startsWith("..") && !path5.isAbsolute(rootRel)
+    );
+    targetFiles = walked.files.map((rel) => {
+      const abs = path5.join(searchRoot, rel);
+      const displayRel = useFastPrefix ? rootRel ? `${rootRel}/${rel}` : rel : relativeFile(baseCwd, abs);
+      return { abs, rel: displayRel };
     });
+    targetFiles.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
+  }
+  const canBufPrecheck = query.type === "text" && query.caseSensitive !== false && !query.multiline && query.pattern.length > 0 && !query.pattern.includes("\uFFFD");
+  const patternBuf = canBufPrecheck ? Buffer.from(query.pattern, "utf8") : null;
+  const canTextCaseInsensitivePrecheck = query.type === "text" && query.caseSensitive === false && !query.multiline && query.pattern.length > 0;
+  let wholeFileRegex = null;
+  const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
+  const regexHasLookaround = query.type === "regex" && /\(\?<?[=!]/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexHasLookaround) {
+    try {
+      wholeFileRegex = new RegExp(
+        regex.source,
+        `${query.caseSensitive === false ? "i" : ""}m`
+      );
+    } catch {
+      wholeFileRegex = null;
+    }
   }
   const files = [];
   let totalMatches = 0;
@@ -4750,16 +4884,19 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   for (let i = 0; i < targetFiles.length && !truncated; i += batchSize) {
     const batch = targetFiles.slice(i, i + batchSize);
     const results = await Promise.all(
-      batch.map(async (absFile) => {
+      batch.map(async ({ abs: absFile, rel: relFile }) => {
         try {
           const st = await fs4.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
           const buf = await fs4.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
+          if (patternBuf && buf.indexOf(patternBuf) === -1) return null;
           const content = buf.toString("utf8");
-          const lines = content.split(/\r?\n/);
-          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-          const relFile = relativeFile(baseCwd, absFile);
+          if (canTextCaseInsensitivePrecheck && !regex.test(content)) return null;
+          if (wholeFileRegex && (!regexHasDollar || buf.indexOf(13) === -1)) {
+            if (!wholeFileRegex.test(content)) return null;
+          }
+          let lines = [];
           let matchedLines = [];
           let count = 0;
           let fileTruncated = false;
@@ -4771,7 +4908,13 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
           } else if (query.multiline) {
             matchedLines = multilineMatchLines(content, regex, maxResults + 1);
             count = matchedLines.length;
+            if (count > 0) {
+              lines = content.split(/\r?\n/);
+              if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+            }
           } else {
+            lines = content.split(/\r?\n/);
+            if (lines.length > 0 && lines.at(-1) === "") lines.pop();
             for (let idx = 0; idx < lines.length; idx++) {
               const line = lines[idx];
               const hit = summary ? regex.test(line) ? { index: 0, length: 0 } : null : (() => {
@@ -4793,7 +4936,14 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
             }
             count = matchedLines.length;
           }
-          return count ? { relFile, lines, matchedLines, count, fileTruncated } : null;
+          if (!count) return null;
+          return {
+            relFile,
+            lines: summary ? [] : lines,
+            matchedLines,
+            count,
+            fileTruncated
+          };
         } catch {
           return null;
         }
@@ -4829,7 +4979,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   return {
     files,
     totalMatches,
-    truncated: truncated || anyFileTruncated || (summary || query.multiline === true) && discoveryTruncated
+    truncated: truncated || anyFileTruncated || discoveryTruncated
   };
 }
 function buildGlobFallbackPlan(pattern) {
@@ -4906,11 +5056,11 @@ async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sor
   return `${header}${items.join("\n")}${suffix}`;
 }
 async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
-  const maxResults = clampInt(query.maxResults ?? 80, 1, 300);
+  const maxResults = clampInt(query.maxResults, 1, 300, 80);
   const pattern = query.pattern.trim() || "**/*";
   const matcher = globToRegExp(pattern);
   const matchBasename = !pattern.includes("/");
-  const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
+  const includeHidden = patternTargetsHidden(pattern);
   if (isFileTarget) {
     const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
     const base = path5.basename(searchRoot);
@@ -4970,7 +5120,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
   if (!pattern) throw new Error("Fuzzy pattern must not be blank");
   const matchesType = fileTypeMatcher(query.fileType);
-  const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
+  const maxResults = clampInt(query.maxResults, 1, 200, 30);
   const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
   const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
@@ -5618,7 +5768,7 @@ ${formatFileMatches(res.files, res.totalMatches, res.truncated)}`;
           files: res.files,
           totalMatches: res.totalMatches,
           truncated: res.truncated,
-          contextLines: clampInt(query.contextLines ?? 0, 0, 5)
+          contextLines: clampInt(query.contextLines, 0, 5, 0)
         } : void 0
       };
     }
@@ -5697,7 +5847,7 @@ async function runBatchSearch(input, options = {}) {
   } catch {
     return { text: `Error: cwd does not exist: ${baseCwd}`, isError: true };
   }
-  const maxChars = clampInt(input.maxChars ?? 8500, 500, DEFAULT_INLINE_MAX_BYTES);
+  const maxChars = clampInt(input.maxChars, 500, DEFAULT_INLINE_MAX_BYTES, 8500);
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
   const needsTextSearch = queries.some(
     (q) => q.type === "text" || q.type === "regex"
@@ -5747,9 +5897,19 @@ async function runBatchSearch(input, options = {}) {
     isError: false
   };
 }
-function clampInt(val, min, max) {
-  if (!Number.isFinite(val)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(val)));
+function patternTargetsHidden(pattern) {
+  const normalized = pattern.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+  return /(?:^|[/,{])\.[^./]/.test(normalized);
+}
+function globTargetsDir(glob, dir) {
+  const normalized = glob.replace(/\\/g, "/").replace(/(^|[,{])(?:\.\/)+/g, "$1");
+  const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[/,{])${escaped}(?:$|[/},])`).test(normalized);
+}
+function clampInt(val, min, max, fallback = min) {
+  const num = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
 // src/tools/read-slices.ts

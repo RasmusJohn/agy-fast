@@ -139,7 +139,7 @@ function decodeProcessOutput(buf, truncated = false, fallbackEncoding) {
   }
 }
 function killChildTree(pid, detached) {
-  if (!pid) return;
+  if (!pid) return null;
   if (process.platform === "win32") {
     const fallbackKill = () => {
       try {
@@ -159,7 +159,7 @@ function killChildTree(pid, detached) {
     } catch {
       fallbackKill();
     }
-    return;
+    return null;
   }
   try {
     if (detached) {
@@ -169,7 +169,7 @@ function killChildTree(pid, detached) {
     }
   } catch {
   }
-  setTimeout(() => {
+  const sigkillTimer = setTimeout(() => {
     try {
       if (detached) {
         process.kill(-pid, "SIGKILL");
@@ -178,7 +178,9 @@ function killChildTree(pid, detached) {
       }
     } catch {
     }
-  }, 400).unref();
+  }, 400);
+  sigkillTimer.unref();
+  return sigkillTimer;
 }
 function execBinaryAsync(bin, args, options) {
   return spawnAndCollect(bin, args, false, options);
@@ -241,9 +243,10 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       return;
     }
     let settleFallbackTimer = null;
+    let sigkillTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killChildTree(child.pid, detached);
+      sigkillTimer = killChildTree(child.pid, detached);
       settleFallbackTimer = setTimeout(() => {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -256,6 +259,7 @@ function spawnAndCollect(commandOrBin, args, shell, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
       if (settleFallbackTimer) clearTimeout(settleFallbackTimer);
       resolve({
         exitCode,
@@ -427,9 +431,10 @@ async function readJsonFile(filePath) {
   }
   return null;
 }
+var tmpWriteSeq = 0;
 async function writeJsonAtomically(filePath, data) {
   await fs.mkdir(path2.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++tmpWriteSeq}`;
   await fs.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}
 `, "utf8");
   try {
@@ -564,16 +569,26 @@ function extractGithubSlug(repoUrl) {
   const m = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?\/?$/i.exec(repoUrl.trim());
   return m?.[1] ?? null;
 }
+function validateRepoUrl(rawUrl) {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.startsWith("-") || /[\0\r\n]/.test(trimmed)) {
+    throw new Error(`Invalid update repository URL: ${rawUrl}`);
+  }
+  return trimmed;
+}
 async function fetchLatestRemoteVersion(opts) {
+  const safeRepoUrl = validateRepoUrl(opts.repoUrl);
   const timeoutMs = opts.timeoutMs ?? 8e3;
   const gitEnv = withNonInteractiveGitEnv();
   if (opts.channel === "release") {
+    let tagsFetchSucceeded = false;
     const tagsRes = await execBinaryAsync(
       "git",
-      ["ls-remote", "--tags", "--refs", opts.repoUrl],
+      ["ls-remote", "--tags", "--refs", "--", safeRepoUrl],
       { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
     );
     if (!tagsRes.error && !tagsRes.timedOut && tagsRes.exitCode === 0) {
+      tagsFetchSucceeded = true;
       const latest = pickLatestSemverTag(tagsRes.stdout);
       if (latest) {
         return {
@@ -584,7 +599,7 @@ async function fetchLatestRemoteVersion(opts) {
         };
       }
     }
-    const slug = extractGithubSlug(opts.repoUrl);
+    const slug = extractGithubSlug(safeRepoUrl);
     if (slug && typeof fetch === "function") {
       try {
         const res = await fetch(
@@ -613,26 +628,32 @@ async function fetchLatestRemoteVersion(opts) {
       } catch {
       }
     }
+    if (!tagsFetchSucceeded) {
+      throw new Error(
+        tagsRes.stderr.trim() || tagsRes.error || (tagsRes.timedOut ? `Timed out checking releases from: ${safeRepoUrl}` : `Unable to reach update source: ${safeRepoUrl}`)
+      );
+    }
   }
   const headRes = await execBinaryAsync(
     "git",
-    ["ls-remote", opts.repoUrl, "refs/heads/main", "HEAD"],
+    ["ls-remote", "--", safeRepoUrl, "refs/heads/main", "HEAD"],
     { cwd: os.tmpdir(), timeoutMs, env: gitEnv }
   );
   if (!headRes.error && !headRes.timedOut && headRes.exitCode === 0) {
-    const firstLine = headRes.stdout.trim().split(/\r?\n/)[0] ?? "";
-    const sha = firstLine.split(/\s+/)[0] || void 0;
-    if (sha) {
+    const entries = headRes.stdout.trim().split(/\r?\n/).map((line) => line.trim().split(/\s+/)).filter((parts) => parts.length >= 2 && Boolean(parts[0]));
+    const mainEntry = entries.find((parts) => parts[1] === "refs/heads/main");
+    const chosen = mainEntry ?? entries[0];
+    if (chosen?.[0]) {
       return {
-        ref: "main",
+        ref: mainEntry ? "main" : "HEAD",
         version: null,
-        commitSha: sha,
+        commitSha: chosen[0],
         source: "git-main"
       };
     }
   }
   throw new Error(
-    headRes.stderr.trim() || headRes.error || `Unable to reach update source: ${opts.repoUrl}`
+    headRes.stderr.trim() || headRes.error || `Unable to reach update source: ${safeRepoUrl}`
   );
 }
 async function verifyStagedPlugin(stagingDir) {
@@ -650,7 +671,7 @@ async function verifyStagedPlugin(stagingDir) {
   const mcpPath = path2.join(stagingDir, "dist", "mcp-server.mjs");
   const smokeOk = await new Promise((resolve) => {
     const child = spawn2(process.execPath, [mcpPath], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true
     });
     let stdout = "";
@@ -659,6 +680,8 @@ async function verifyStagedPlugin(stagingDir) {
       resolve(false);
     }, 6e3);
     timer.unref();
+    child.stdin.on("error", () => {
+    });
     child.stdout.on("data", (d) => {
       stdout += d.toString();
     });
@@ -753,21 +776,22 @@ function isProcessDead(pid) {
 }
 async function acquireUpdateLock(lockPath) {
   await fs.mkdir(path2.dirname(lockPath), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${++tmpWriteSeq}-${Math.random().toString(36).slice(2, 10)}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const handle = await fs.open(lockPath, "wx");
       try {
         await handle.writeFile(
-          JSON.stringify({ pid: process.pid, createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+          JSON.stringify({ pid: process.pid, token, createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
           "utf8"
         );
       } finally {
         await handle.close();
       }
-      return true;
+      return token;
     } catch (err) {
       const code = err?.code;
-      if (code !== "EEXIST") return false;
+      if (code !== "EEXIST") return null;
       try {
         const st = await fs.stat(lockPath);
         let stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
@@ -778,16 +802,31 @@ async function acquireUpdateLock(lockPath) {
           }
         }
         if (stale) {
-          await fs.rm(lockPath, { force: true });
+          const claimedPath = `${lockPath}.stale.${process.pid}.${++tmpWriteSeq}`;
+          try {
+            await fs.rename(lockPath, claimedPath);
+            await fs.rm(claimedPath, { force: true }).catch(() => {
+            });
+          } catch {
+          }
           continue;
         }
       } catch {
         continue;
       }
-      return false;
+      return null;
     }
   }
-  return false;
+  return null;
+}
+async function releaseUpdateLock(lockPath, token) {
+  try {
+    const info = await readJsonFile(lockPath);
+    if (info?.token === token) {
+      await fs.rm(lockPath, { force: true });
+    }
+  } catch {
+  }
 }
 async function runPluginUpdate(opts) {
   const env = opts.env ?? process.env;
@@ -808,8 +847,8 @@ async function runPluginUpdate(opts) {
       message: "Auto-update is disabled."
     };
   }
-  const locked = await acquireUpdateLock(paths.lockFile);
-  if (!locked) {
+  const lockToken = await acquireUpdateLock(paths.lockFile);
+  if (!lockToken) {
     return {
       status: "skipped-locked",
       currentVersion,
@@ -873,7 +912,8 @@ async function runPluginUpdate(opts) {
     );
     await fs.mkdir(paths.cacheDir, { recursive: true });
     const gitEnv = withNonInteractiveGitEnv(env);
-    const cloneArgs = remote.ref === "main" ? ["clone", "--depth", "1", "--branch", "main", repoUrl, stagingDir] : ["clone", "--depth", "1", "--branch", remote.ref, repoUrl, stagingDir];
+    const safeRepoUrl = validateRepoUrl(repoUrl);
+    const cloneArgs = remote.ref === "HEAD" ? ["clone", "--depth", "1", "--", safeRepoUrl, stagingDir] : ["clone", "--depth", "1", "--branch", remote.ref, "--", safeRepoUrl, stagingDir];
     const cloneRes = await execBinaryAsync("git", cloneArgs, {
       cwd: paths.cacheDir,
       timeoutMs: Math.max(timeoutMs, 3e4),
@@ -978,8 +1018,7 @@ async function runPluginUpdate(opts) {
       await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {
       });
     }
-    await fs.rm(paths.lockFile, { force: true }).catch(() => {
-    });
+    await releaseUpdateLock(paths.lockFile, lockToken);
   }
 }
 
