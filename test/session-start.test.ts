@@ -340,6 +340,10 @@ describe("session-start hook", () => {
         },
       );
       assert.equal(noEofResult.code, 0);
+      assert.ok(
+        noEofResult.durationMs < 1000,
+        `Expected complete JSON stdin without EOF to exit immediately (<1000ms), got ${noEofResult.durationMs}ms`,
+      );
       const parsed = JSON.parse(noEofResult.stdout);
       assert.match(parsed?.injectSteps?.[0]?.systemMessage?.systemMessage ?? "", /agy-fast startup snapshot/);
 
@@ -472,7 +476,9 @@ describe("session-start hook", () => {
       const homeMsg: string = JSON.parse(homeHookRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
       assert.ok(homeMsg);
       const homeBody = homeMsg.split("\n").slice(1).join("\n");
+      assert.match(homeBody, /Layout \(1 level\):/);
       assert.match(homeBody, /my-app\//);
+      assert.doesNotMatch(homeBody, /my-app\/package\.json/);
       assert.doesNotMatch(homeBody, /Desktop\//);
       assert.doesNotMatch(homeBody, /Documents\//);
       assert.doesNotMatch(homeBody, /Downloads\//);
@@ -484,6 +490,34 @@ describe("session-start hook", () => {
       assert.doesNotMatch(homeBody, /Application Data/);
       assert.doesNotMatch(homeBody, /OneDrive/);
       assert.doesNotMatch(homeBody, /NTUSER\.DAT/);
+
+      // Direct unit check: $HOME snapshot must NOT readdir depth-2 child dirs or probe child manifests
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      const origReaddirHome = fs.readdir as (...args: unknown[]) => Promise<unknown>;
+      const readdirTargets: string[] = [];
+      process.env.HOME = fakeHomeDir;
+      process.env.USERPROFILE = fakeHomeDir;
+      (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = (
+        p: unknown,
+        ...rest: unknown[]
+      ) => {
+        readdirTargets.push(String(p));
+        return origReaddirHome(p, ...rest);
+      };
+      try {
+        const directHomeSnap = await buildWorkspaceSnapshot(fakeHomeDir);
+        assert.ok(directHomeSnap);
+        assert.match(directHomeSnap, /Layout \(1 level\):/);
+        assert.doesNotMatch(directHomeSnap, /scan timed out/);
+        assert.deepEqual(readdirTargets, [fakeHomeDir]);
+      } finally {
+        (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddirHome;
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+      }
 
       // Verify isHomeOrSystemRoot directly on filesystem root
       assert.equal(await isHomeOrSystemRoot(path.parse(projDir).root), true);

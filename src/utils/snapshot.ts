@@ -528,6 +528,22 @@ async function getTwoLevelTree(
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
 
+  // Never fan out depth-2 readdir calls on $HOME or filesystem roots (e.g. C:\Users\<user>);
+  // a 1-level listing avoids 20+ slow OS/NTFS directory scans and scan timeouts on startup.
+  if (isHomeRoot) {
+    for (const entry of shownTop) {
+      lines.push(
+        entry.isDirectory()
+          ? `  ${entry.name}/`
+          : `  ${shortEntryName(entry.name)}`,
+      );
+    }
+    if (filteredTop.length > maxTop) {
+      lines.push(`  ... (+${filteredTop.length - maxTop} more top-level entries)`);
+    }
+    return `Layout (1 level):\n${lines.join("\n")}`;
+  }
+
   const subResults = new Array<{
     name: string;
     isDir: boolean;
@@ -814,8 +830,9 @@ async function getProjectManifestSummary(
   const rootHints = rootRes.ok ? [...rootRes.value].sort() : [];
   const subHints: string[] = [];
 
-  // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/)
-  if (performance.now() < deadlineMs && topRes.ok) {
+  // Also inspect 1-level child subproject directories (e.g. server/, web/, desktop/, SourcingAgent/),
+  // but never treat $HOME or a filesystem root as a monorepo (avoids up to 64 wasted manifest probes).
+  if (!isHomeRoot && performance.now() < deadlineMs && topRes.ok) {
     const subdirs = topRes.value
       .filter(
         (e) =>

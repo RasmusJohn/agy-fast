@@ -1113,6 +1113,18 @@ async function getTwoLevelTree(workspaceDir, topRes, isHomeRoot, deadlineMs) {
   const lines = [];
   const maxTop = 20;
   const shownTop = filteredTop.slice(0, maxTop);
+  if (isHomeRoot) {
+    for (const entry of shownTop) {
+      lines.push(
+        entry.isDirectory() ? `  ${entry.name}/` : `  ${shortEntryName(entry.name)}`
+      );
+    }
+    if (filteredTop.length > maxTop) {
+      lines.push(`  ... (+${filteredTop.length - maxTop} more top-level entries)`);
+    }
+    return `Layout (1 level):
+${lines.join("\n")}`;
+  }
   const subResults = new Array(shownTop.length);
   let nextIdx = 0;
   const workerCount = Math.min(4, shownTop.length);
@@ -1341,7 +1353,7 @@ async function getProjectManifestSummary(workspaceDir, topRes, isHomeRoot, deadl
   );
   const rootHints = rootRes.ok ? [...rootRes.value].sort() : [];
   const subHints = [];
-  if (performance.now() < deadlineMs && topRes.ok) {
+  if (!isHomeRoot && performance.now() < deadlineMs && topRes.ok) {
     const subdirs = topRes.value.filter(
       (e) => e.isDirectory() && !shouldSkipSnapshotEntry(e.name, true, false, isHomeRoot) && !MANIFEST_SKIP_SUBDIRS_LOWER.has(e.name.toLowerCase())
     ).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 8);
@@ -1729,6 +1741,24 @@ async function readStdin(timeoutMs = 1500) {
     const chunks = [];
     let totalBytes = 0;
     let settled = false;
+    const endsWithCloseBrace = (buf) => {
+      for (let i = buf.length - 1; i >= 0; i--) {
+        const b = buf[i];
+        if (b === 32 || b === 9 || b === 10 || b === 13) continue;
+        return b === 125;
+      }
+      return false;
+    };
+    const hasCompleteJsonObject = () => {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (!text.startsWith("{") || !text.endsWith("}")) return false;
+      try {
+        const parsed = JSON.parse(text);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    };
     const onData = (chunk) => {
       if (settled) return;
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
@@ -1744,6 +1774,9 @@ async function readStdin(timeoutMs = 1500) {
       } else {
         chunks.push(buf);
         totalBytes += buf.length;
+        if (endsWithCloseBrace(buf) && hasCompleteJsonObject()) {
+          finish();
+        }
       }
     };
     const onEnd = () => finish();
