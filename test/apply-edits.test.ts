@@ -1374,4 +1374,47 @@ describe("apply_edits", () => {
     assert.match(wtRes.text, /\.git: refusing to modify Git internal metadata path/);
     assert.equal(await fs.readFile(wtGitFile, "utf8"), "gitdir: /main-repo/.git/worktrees/wt1\n");
   });
+
+  it("rejects overwriting existing binary files on create with overwrite: true (atomic and bestEffort)", async () => {
+    const subDir = path.join(tmpDir, "binary-overwrite");
+    await fs.mkdir(subDir, { recursive: true });
+
+    // Minimal PNG header + IHDR bytes containing NUL bytes
+    const pngBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    ]);
+    const pngPath = path.join(subDir, "logo.png");
+    const txtPath = path.join(subDir, "notes.txt");
+    await fs.writeFile(pngPath, pngBytes);
+    await fs.writeFile(txtPath, "original\n", "utf8");
+
+    // 1. Atomic mode: binary overwrite fails and rolls back / aborts all files
+    const atomicRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: "notes.txt", hunks: [{ target: "original", replacement: "changed" }] },
+        { path: "logo.png", create: "not a png\n", overwrite: true },
+      ],
+    });
+    assert.equal(atomicRes.isError, true);
+    assert.match(atomicRes.text, /logo\.png: Cannot overwrite binary file with text content/);
+    assert.deepEqual(await fs.readFile(pngPath), pngBytes);
+    assert.equal(await fs.readFile(txtPath, "utf8"), "original\n");
+
+    // 2. bestEffort mode: isolates the binary overwrite failure while committing valid text edits
+    const bestEffortRes = await runApplyEdits({
+      cwd: subDir,
+      bestEffort: true,
+      edits: [
+        { path: "notes.txt", hunks: [{ target: "original", replacement: "updated" }] },
+        { path: "logo.png", create: "corrupted\n", overwrite: true },
+      ],
+    });
+    assert.equal(bestEffortRes.isError, true);
+    assert.match(bestEffortRes.text, /Partial edit applied \(1\/2 file\(s\) written/);
+    assert.match(bestEffortRes.text, /logo\.png: Cannot overwrite binary file with text content/);
+    assert.deepEqual(await fs.readFile(pngPath), pngBytes);
+    assert.equal(await fs.readFile(txtPath, "utf8"), "updated\n");
+  });
 });

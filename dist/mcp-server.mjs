@@ -3558,6 +3558,10 @@ async function runApplyEdits(input) {
           continue;
         }
       }
+      if (originalBuffer && isLikelyBinary(originalBuffer)) {
+        errors.push(`${item.relPath}: Cannot overwrite binary file with text content`);
+        continue;
+      }
       const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
       const newLines = countLines(item.create);
       plans.push({

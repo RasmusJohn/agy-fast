@@ -7,7 +7,7 @@ import {
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
-import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
+import { isLikelyBinary, readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
@@ -1103,6 +1103,11 @@ export async function runApplyEdits(
           );
           continue;
         }
+      }
+
+      if (originalBuffer && isLikelyBinary(originalBuffer)) {
+        errors.push(`${item.relPath}: Cannot overwrite binary file with text content`);
+        continue;
       }
 
       const oldLines = originalBuffer ? countLines(originalBuffer.toString("utf8")) : 0;
