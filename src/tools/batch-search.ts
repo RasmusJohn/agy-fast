@@ -589,9 +589,20 @@ async function runTextOrRegexWithRg(
   // by searchRoot (including paths outside baseCwd) or a positive query.glob.
   // Emit default exclusions AFTER user query.glob so positive globs like `*.mjs`
   // cannot override them under ripgrep's last-match-wins precedence.
-  const relRoot = toPosixPath(path.relative(baseCwd, searchRoot));
+  const relNative = path.relative(baseCwd, searchRoot);
+  const relRoot = toPosixPath(relNative);
   const isInsideBaseCwd =
-    relRoot === "" || (!relRoot.startsWith("..") && !path.isAbsolute(relRoot));
+    relRoot === "" || (relRoot !== ".." && !relRoot.startsWith("../") && !path.isAbsolute(relRoot));
+  // Pass a cwd-relative search target when inside baseCwd so ripgrep matches
+  // anchored globs (e.g. `dist/*.mjs`, `{dist,src}/*.mjs`, `!src/**`) even
+  // when baseCwd traverses a symlink (e.g. macOS `/var` -> `/private/var`).
+  const rgSearchTarget = isInsideBaseCwd
+    ? !relNative
+      ? "."
+      : relNative === "-"
+        ? `.${path.sep}-`
+        : relNative
+    : searchRoot;
   const rootSegments = isInsideBaseCwd
     ? (relRoot ? relRoot.split("/") : [])
     : toPosixPath(searchRoot).split("/").filter(Boolean);
@@ -648,7 +659,7 @@ async function runTextOrRegexWithRg(
         : ["--files-with-matches", "--null"]),
       "--",
       query.pattern,
-      searchRoot,
+      rgSearchTarget,
     ]);
     const files: FileMatches[] = [];
     const out = res.stdout;
@@ -704,7 +715,7 @@ async function runTextOrRegexWithRg(
       "--null",
       "--",
       query.pattern,
-      searchRoot,
+      rgSearchTarget,
     ]);
     const counted: Array<{ rawFile: string; relFile: string; count: number }> = [];
     // The text after the last newline is empty or a record cut by the output budget.
@@ -736,9 +747,11 @@ async function runTextOrRegexWithRg(
   // Pass compact relative paths (when inside baseCwd) and chunk arguments so
   // large maxResults batches stay well below Windows' 32 KB CreateProcess limit.
   const toRgArgPath = (rawFile: string): string => {
-    const rel = path.relative(baseCwd, rawFile);
+    const rel = path.relative(baseCwd, path.resolve(baseCwd, rawFile));
     const chosenPath =
-      rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel : rawFile;
+      rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
+        ? rel
+        : rawFile;
     // Never pass bare "-" as a path argument (rg interprets "-" as stdin)
     return chosenPath === "-" ? `.${path.sep}-` : chosenPath;
   };
@@ -1084,10 +1097,11 @@ async function runTextOrRegexWithNode(
   let wholeFileRegex: RegExp | null = null;
   const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
   // Whole-file /m precheck can false-negative on lookarounds matching whitespace/newlines
-  // across line boundaries (e.g. `foo(?!\s)` or `(?<!\s)foo`), so skip precheck for them.
-  const regexHasLookaround =
-    query.type === "regex" && /\(\?<?[=!]/.test(query.pattern);
-  if (query.type === "regex" && !query.multiline && !regexHasLookaround) {
+  // across line boundaries (e.g. `foo(?!\s)` or `(?<!\s)foo`) or inline modifiers disabling
+  // multiline mode (e.g. `(?-m:^foo)`), so skip precheck for them.
+  const regexUnsafeForWholeFile =
+    query.type === "regex" && /\(\?<?[=!]|\(\?[a-z]*-[a-z]*m/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexUnsafeForWholeFile) {
     try {
       wholeFileRegex = new RegExp(
         regex.source,

@@ -4444,8 +4444,10 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   if (query.glob) {
     args.push(`--glob=${query.glob}`);
   }
-  const relRoot = toPosixPath(path5.relative(baseCwd, searchRoot));
-  const isInsideBaseCwd = relRoot === "" || !relRoot.startsWith("..") && !path5.isAbsolute(relRoot);
+  const relNative = path5.relative(baseCwd, searchRoot);
+  const relRoot = toPosixPath(relNative);
+  const isInsideBaseCwd = relRoot === "" || relRoot !== ".." && !relRoot.startsWith("../") && !path5.isAbsolute(relRoot);
+  const rgSearchTarget = isInsideBaseCwd ? !relNative ? "." : relNative === "-" ? `.${path5.sep}-` : relNative : searchRoot;
   const rootSegments = isInsideBaseCwd ? relRoot ? relRoot.split("/") : [] : toPosixPath(searchRoot).split("/").filter(Boolean);
   const positiveGlob = query.glob && !query.glob.startsWith("!") ? query.glob : null;
   for (const dir of [
@@ -4484,7 +4486,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       ...query.outputMode === "count" ? [query.multiline ? "--count-matches" : "--count", "--with-filename", "--null"] : ["--files-with-matches", "--null"],
       "--",
       query.pattern,
-      searchRoot
+      rgSearchTarget
     ]);
     const files2 = [];
     const out = res.stdout;
@@ -4533,7 +4535,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       "--null",
       "--",
       query.pattern,
-      searchRoot
+      rgSearchTarget
     ]);
     const counted = [];
     for (const record of counts.stdout.split("\n").slice(0, -1)) {
@@ -4558,8 +4560,8 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, rawFile);
-    const chosenPath = rel && !rel.startsWith("..") && !path5.isAbsolute(rel) ? rel : rawFile;
+    const rel = path5.relative(baseCwd, path5.resolve(baseCwd, rawFile));
+    const chosenPath = rel && rel !== ".." && !rel.startsWith(`..${path5.sep}`) && !path5.isAbsolute(rel) ? rel : rawFile;
     return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
   };
   const rgChunks = [];
@@ -4833,8 +4835,8 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
   const canTextCaseInsensitivePrecheck = query.type === "text" && query.caseSensitive === false && !query.multiline && query.pattern.length > 0;
   let wholeFileRegex = null;
   const regexHasDollar = query.type === "regex" && query.pattern.includes("$");
-  const regexHasLookaround = query.type === "regex" && /\(\?<?[=!]/.test(query.pattern);
-  if (query.type === "regex" && !query.multiline && !regexHasLookaround) {
+  const regexUnsafeForWholeFile = query.type === "regex" && /\(\?<?[=!]|\(\?[a-z]*-[a-z]*m/.test(query.pattern);
+  if (query.type === "regex" && !query.multiline && !regexUnsafeForWholeFile) {
     try {
       wholeFileRegex = new RegExp(
         regex.source,

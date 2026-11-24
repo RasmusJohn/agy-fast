@@ -1440,4 +1440,83 @@ describe("batch_search", () => {
       await fs.rm(outerDir, { recursive: true, force: true });
     }
   });
+
+  it("handles anchored globs under symlinked workspaces in content and summary modes and preserves inline-modifier regexes", async () => {
+    const outerDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-symlink-glob-"));
+    const realWs = path.join(outerDir, "real-ws");
+    const linkWs = path.join(outerDir, "link-ws");
+    try {
+      await fs.mkdir(path.join(realWs, "src"), { recursive: true });
+      await fs.mkdir(path.join(realWs, "lib"), { recursive: true });
+      await fs.mkdir(path.join(realWs, "dist"), { recursive: true });
+      await fs.mkdir(path.join(realWs, "node_modules", "pkg"), { recursive: true });
+
+      await fs.writeFile(path.join(realWs, "src", "app.mjs"), "export const v = 'NEEDLE_LINK src';\n", "utf8");
+      await fs.writeFile(path.join(realWs, "lib", "util.mjs"), "export const v = 'NEEDLE_LINK lib';\n", "utf8");
+      await fs.writeFile(path.join(realWs, "dist", "bundle.mjs"), "export const v = 'NEEDLE_LINK dist';\n", "utf8");
+      await fs.writeFile(path.join(realWs, "node_modules", "pkg", "index.mjs"), "export const v = 'NEEDLE_LINK nm';\n", "utf8");
+      await fs.writeFile(path.join(realWs, "src", "mod.txt"), "bar\nfoo\n", "utf8");
+
+      let symlinkReady = true;
+      try {
+        await fs.symlink(realWs, linkWs, process.platform === "win32" ? "junction" : "dir");
+      } catch {
+        symlinkReady = false;
+      }
+
+      if (symlinkReady) {
+        for (const forceNodeFallback of [false, true]) {
+          const res = await runBatchSearch(
+            {
+              cwd: linkWs,
+              queries: [
+                { type: "text", pattern: "NEEDLE_LINK", glob: "dist/*.mjs" },
+                { type: "text", pattern: "NEEDLE_LINK", glob: "{dist,src}/*.mjs", outputMode: "files_with_matches" },
+                { type: "text", pattern: "NEEDLE_LINK", glob: "dist/*.mjs", outputMode: "count" },
+                { type: "text", pattern: "NEEDLE_LINK", glob: "!src/**" },
+              ],
+            },
+            { forceNodeFallback },
+          );
+          assert.equal(res.isError, false);
+          const secs = res.text.split("\n\n");
+          assert.match(secs[0]!, /dist\/bundle\.mjs/);
+          assert.doesNotMatch(secs[0]!, /src\/app\.mjs/);
+          assert.doesNotMatch(secs[0]!, /node_modules/);
+
+          assert.match(secs[1]!, /dist\/bundle\.mjs/);
+          assert.match(secs[1]!, /src\/app\.mjs/);
+          assert.doesNotMatch(secs[1]!, /node_modules/);
+
+          assert.match(secs[2]!, /dist\/bundle\.mjs.*1/);
+          assert.doesNotMatch(secs[2]!, /src\/app\.mjs/);
+
+          assert.match(secs[3]!, /lib\/util\.mjs/);
+          assert.doesNotMatch(secs[3]!, /src\/app\.mjs/);
+          assert.doesNotMatch(secs[3]!, /dist\/bundle\.mjs/);
+        }
+      }
+
+      let supportsInlineModifiers = false;
+      try {
+        new RegExp("(?-m:^foo)");
+        supportsInlineModifiers = true;
+      } catch {
+        // Node < 24 does not support ES2025 inline RegExp modifiers
+      }
+      if (supportsInlineModifiers) {
+        const modRes = await runBatchSearch(
+          {
+            cwd: realWs,
+            queries: [{ type: "regex", pattern: "(?-m:^foo)" }],
+          },
+          { forceNodeFallback: true },
+        );
+        assert.equal(modRes.isError, false);
+        assert.match(modRes.text, /src\/mod\.txt\n\s+2: foo/);
+      }
+    } finally {
+      await fs.rm(outerDir, { recursive: true, force: true });
+    }
+  });
 });
