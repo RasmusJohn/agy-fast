@@ -1493,8 +1493,17 @@ import path4 from "node:path";
 var DEFAULT_REPO_URL = "https://github.com/INK-Q/agy-fast.git";
 var DEFAULT_CHECK_INTERVAL_HOURS = 4;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
-function getHomeDir(env = process.env) {
-  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+function getHomeDir(env = process.env, platform = process.platform) {
+  if (platform === "win32") {
+    const userProfile = env.USERPROFILE?.trim();
+    if (userProfile) return userProfile;
+    const driveHome = env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}`.trim() : "";
+    if (driveHome) return driveHome;
+    const home = env.HOME?.trim();
+    if (home) return home;
+    return os3.homedir();
+  }
+  return env.HOME?.trim() || env.USERPROFILE?.trim() || os3.homedir();
 }
 function getUpdaterPaths(env = process.env) {
   const custom = env.AGY_FAST_CACHE_DIR?.trim();
@@ -1647,15 +1656,39 @@ async function consumeSnapshotUpdateNotice(pluginDir, currentVersion, env = proc
     );
     return `[agy-fast] Auto-updated v${state.lastAppliedFrom} -> v${currentVersion} (rules/hooks active now; reload Desktop/IDE window if MCP was already running).`;
   }
-  if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0 && state.notifiedAvailableVersion !== state.availableVersion) {
+  const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
+  const isManualInstall = state.availableInstallKind === "symlink" || state.availableInstallKind === "dev-source" || state.availableInstallKind === "git-dirty";
+  if (state.availableVersion && compareSemver(state.availableVersion, currentVersion) > 0) {
+    if (state.skippedVersion === state.availableVersion || state.notifiedAvailableVersion === state.availableVersion) {
+      return null;
+    }
     await writeUpdateState(
       { notifiedAvailableVersion: state.availableVersion },
       env
     ).catch(() => {
     });
+    const ver = state.availableVersion;
     const reason = state.availableReason ? ` (${state.availableReason})` : "";
-    const installerPath = path4.join(pluginDir, "scripts", "install.mjs");
-    return `[agy-fast] Update available: v${currentVersion} -> v${state.availableVersion}${reason}. Run: node "${installerPath}" update`;
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Pull & build in repo, or skip: node "${installerPath}" update --skip-version ${ver}${urlSuffix}`;
+    }
+    return `[agy-fast] Update available: v${currentVersion} -> v${ver}${reason}. Run: node "${installerPath}" update --prompt (or --skip-version ${ver})${urlSuffix}`;
+  }
+  if (!state.availableVersion && state.availableCommit && state.availableCommit !== state.lastAppliedCommit && state.notifiedAvailableCommit !== state.availableCommit) {
+    await writeUpdateState(
+      { notifiedAvailableCommit: state.availableCommit },
+      env
+    ).catch(() => {
+    });
+    const refLabel = state.availableRef || "main";
+    const shortSha = state.availableCommit.slice(0, 7);
+    const reason = state.availableReason ? ` (${state.availableReason})` : "";
+    const urlSuffix = state.availableReleaseUrl ? ` | ${state.availableReleaseUrl}` : "";
+    if (isManualInstall) {
+      return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Pull & build in repo.${urlSuffix}`;
+    }
+    return `[agy-fast] Update available on ${refLabel} (${shortSha})${reason}. Run: node "${installerPath}" update --prompt${urlSuffix}`;
   }
   return null;
 }
