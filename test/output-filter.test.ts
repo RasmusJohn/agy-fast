@@ -6,7 +6,9 @@ import {
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
   formatCompactCommandOutputWithMeta,
+  formatExitFailureLabel,
   normalizeTerminalOutput,
+  prepareCompactCommandOutput,
 } from "../src/utils/output-filter.js";
 
 describe("output-filter", () => {
@@ -563,5 +565,86 @@ describe("output-filter", () => {
     assert.match(meta.text, /ACTUAL_FAILING_TEST_AT_MIDPOINT/);
     assert.match(meta.text, /AssertionError \[ERR_ASSERTION\]/);
     assert.match(meta.text, /ℹ fail 1/);
+  });
+
+  it("formats fatal signal names and shell 128+N exit diagnostics cleanly", () => {
+    assert.equal(formatExitFailureLabel(null, "SIGKILL"), "SIGKILL - possible OOM");
+    assert.equal(formatExitFailureLabel(null, "SIGSEGV"), "SIGSEGV - segmentation fault");
+    assert.equal(formatExitFailureLabel(null, "SIGABRT"), "SIGABRT - process aborted");
+    assert.equal(formatExitFailureLabel(null, "SIGTERM"), "SIGTERM");
+    assert.equal(formatExitFailureLabel(null, "SIGBUS"), "SIGBUS");
+
+    assert.equal(formatExitFailureLabel(137, null), "exit 137 / SIGKILL - possible OOM");
+    assert.equal(formatExitFailureLabel(139, null), "exit 139 / SIGSEGV - segmentation fault");
+    assert.equal(formatExitFailureLabel(134, null), "exit 134 / SIGABRT - process aborted");
+    assert.equal(formatExitFailureLabel(0xc0000005, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(-1073741819, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(0xc00000fd, null), "exit 0xC00000FD / STATUS_STACK_OVERFLOW");
+    assert.equal(formatExitFailureLabel(0xc0000409, null), "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN");
+    assert.equal(formatExitFailureLabel(1, null), "exit 1");
+    assert.equal(formatExitFailureLabel(null, null), "exit err");
+
+    const sigkillEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      signal: "SIGKILL",
+      timedOut: false,
+    });
+    assert.equal(sigkillEmpty.kind, "fail-empty");
+    assert.equal(sigkillEmpty.bodyText, "Terminated by SIGKILL - possible OOM");
+
+    const sigsegvEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      signal: "SIGSEGV",
+      timedOut: false,
+    });
+    assert.equal(sigsegvEmpty.bodyText, "Terminated by SIGSEGV - segmentation fault");
+
+    const exit137Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 137,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit137Empty.bodyText, "Terminated (exit 137 / SIGKILL - possible OOM)");
+
+    const exit139Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 139,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit139Empty.bodyText, "Terminated (exit 139 / SIGSEGV - segmentation fault)");
+
+    const exit134Empty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 134,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(exit134Empty.bodyText, "Terminated (exit 134 / SIGABRT - process aborted)");
+
+    const ntstatusEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 0xc0000005,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(ntstatusEmpty.bodyText, "Terminated (exit 0xC0000005 / STATUS_ACCESS_VIOLATION)");
+
+    const unknownEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: null,
+      timedOut: false,
+    });
+    assert.equal(unknownEmpty.bodyText, "Exited with code unknown");
   });
 });

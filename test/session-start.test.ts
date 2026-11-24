@@ -4,7 +4,11 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
-import { buildWorkspaceSnapshot, isHomeOrSystemRoot } from "../src/utils/snapshot.js";
+import {
+  buildWorkspaceSnapshot,
+  isHomeOrSystemRoot,
+  parsePorcelainBranchHeader,
+} from "../src/utils/snapshot.js";
 
 const HOOK_SCRIPT = path.resolve(process.cwd(), "dist", "session-start.mjs");
 
@@ -336,6 +340,10 @@ describe("session-start hook", () => {
         },
       );
       assert.equal(noEofResult.code, 0);
+      assert.ok(
+        noEofResult.durationMs < 1000,
+        `Expected complete JSON stdin without EOF to exit immediately (<1000ms), got ${noEofResult.durationMs}ms`,
+      );
       const parsed = JSON.parse(noEofResult.stdout);
       assert.match(parsed?.injectSteps?.[0]?.systemMessage?.systemMessage ?? "", /agy-fast startup snapshot/);
 
@@ -468,7 +476,9 @@ describe("session-start hook", () => {
       const homeMsg: string = JSON.parse(homeHookRes.stdout)?.injectSteps?.[0]?.systemMessage?.systemMessage;
       assert.ok(homeMsg);
       const homeBody = homeMsg.split("\n").slice(1).join("\n");
+      assert.match(homeBody, /Layout \(1 level\):/);
       assert.match(homeBody, /my-app\//);
+      assert.doesNotMatch(homeBody, /my-app\/package\.json/);
       assert.doesNotMatch(homeBody, /Desktop\//);
       assert.doesNotMatch(homeBody, /Documents\//);
       assert.doesNotMatch(homeBody, /Downloads\//);
@@ -480,6 +490,34 @@ describe("session-start hook", () => {
       assert.doesNotMatch(homeBody, /Application Data/);
       assert.doesNotMatch(homeBody, /OneDrive/);
       assert.doesNotMatch(homeBody, /NTUSER\.DAT/);
+
+      // Direct unit check: $HOME snapshot must NOT readdir depth-2 child dirs or probe child manifests
+      const prevHome = process.env.HOME;
+      const prevUserProfile = process.env.USERPROFILE;
+      const origReaddirHome = fs.readdir as (...args: unknown[]) => Promise<unknown>;
+      const readdirTargets: string[] = [];
+      process.env.HOME = fakeHomeDir;
+      process.env.USERPROFILE = fakeHomeDir;
+      (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = (
+        p: unknown,
+        ...rest: unknown[]
+      ) => {
+        readdirTargets.push(String(p));
+        return origReaddirHome(p, ...rest);
+      };
+      try {
+        const directHomeSnap = await buildWorkspaceSnapshot(fakeHomeDir);
+        assert.ok(directHomeSnap);
+        assert.match(directHomeSnap, /Layout \(1 level\):/);
+        assert.doesNotMatch(directHomeSnap, /scan timed out/);
+        assert.deepEqual(readdirTargets, [fakeHomeDir]);
+      } finally {
+        (fs as unknown as { readdir: (...args: unknown[]) => Promise<unknown> }).readdir = origReaddirHome;
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+      }
 
       // Verify isHomeOrSystemRoot directly on filesystem root
       assert.equal(await isHomeOrSystemRoot(path.parse(projDir).root), true);
@@ -661,6 +699,159 @@ describe("session-start hook", () => {
     } finally {
       await fs.rm(unrelatedWorkspace, { recursive: true, force: true });
       await fs.rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("prioritizes root manifests over subprojects and handles detached HEAD cleanly", async () => {
+    const monoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-root-prio-"));
+    try {
+      await fs.writeFile(
+        path.join(monoRoot, "package.json"),
+        JSON.stringify({ name: "root-workspace", scripts: { test: "vitest" } }),
+        "utf8",
+      );
+      for (const sub of ["a-api", "b-app", "c-auth", "d-cli", "e-core", "f-edge", "g-web"]) {
+        await fs.mkdir(path.join(monoRoot, sub), { recursive: true });
+        await fs.writeFile(
+          path.join(monoRoot, sub, "package.json"),
+          JSON.stringify({ name: sub }),
+          "utf8",
+        );
+      }
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: monoRoot });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: monoRoot });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: monoRoot });
+      execFileSync("git", ["add", "package.json"], { cwd: monoRoot });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: monoRoot });
+      execFileSync("git", ["checkout", "-q", "--detach", "HEAD"], { cwd: monoRoot });
+
+      const snap = await buildWorkspaceSnapshot(monoRoot);
+      assert.ok(snap);
+      assert.match(snap, /Project:\n  - package\.json \(root-workspace\) scripts: test/);
+      assert.match(snap, /Git: branch `HEAD`/);
+    } finally {
+      await fs.rm(monoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("strips upstream suffix on unborn porcelain headers and falls back on git status timeout even when git log fails", async () => {
+    // 1. Direct porcelain branch header parsing (unborn with upstream tracking, detached, normal)
+    assert.deepEqual(
+      parsePorcelainBranchHeader("## No commits yet on main...origin/main"),
+      { branch: "main", isUnborn: true },
+    );
+    assert.deepEqual(
+      parsePorcelainBranchHeader("## Initial commit on feat/x...origin/feat/x"),
+      { branch: "feat/x", isUnborn: true },
+    );
+    assert.deepEqual(
+      parsePorcelainBranchHeader("## main...origin/main [ahead 1, behind 2]"),
+      { branch: "main", isUnborn: false },
+    );
+    assert.deepEqual(
+      parsePorcelainBranchHeader("## HEAD (no branch)"),
+      { branch: "HEAD", isUnborn: false },
+    );
+
+    const unbornTrackedDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-unborn-up-"));
+    const brokenGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-broken-git-"));
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: unbornTrackedDir });
+      execFileSync("git", ["config", "branch.main.remote", "origin"], { cwd: unbornTrackedDir });
+      execFileSync("git", ["config", "branch.main.merge", "refs/heads/main"], { cwd: unbornTrackedDir });
+      await fs.writeFile(path.join(unbornTrackedDir, "index.ts"), "export const v = 1;\n", "utf8");
+
+      // 2. End-to-end unborn repo with upstream tracking must not leak `...origin/main`
+      const unbornSnap = await buildWorkspaceSnapshot(unbornTrackedDir);
+      assert.ok(unbornSnap);
+      assert.match(unbornSnap, /Git: branch `main` \(unborn, no commits yet\)/);
+      assert.doesNotMatch(unbornSnap, /\.\.\.origin\/main/);
+
+      // 3. When git status times out AND git log fails (exit 128 on unborn repo), still render Git unknown status
+      const snapTimeoutLogFail = await buildWorkspaceSnapshot(unbornTrackedDir, {
+        gitExec: async (_bin, args) => {
+          if (args.includes("status")) {
+            return {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              durationMs: 800,
+              stdout: "",
+              stderr: "",
+              truncated: false,
+            };
+          }
+          return {
+            exitCode: 128,
+            signal: null,
+            timedOut: false,
+            durationMs: 10,
+            stdout: "",
+            stderr: "fatal: your current branch 'main' does not have any commits yet",
+            truncated: false,
+          };
+        },
+      });
+      assert.ok(snapTimeoutLogFail);
+      assert.match(snapTimeoutLogFail, /Git: branch `main`/);
+      assert.match(snapTimeoutLogFail, /Working tree: unknown \(git status timed out\)/);
+
+      // 4. When BOTH git status and git log time out, still render Git unknown status via .git/HEAD
+      const snapBothTimeout = await buildWorkspaceSnapshot(unbornTrackedDir, {
+        gitExec: async () => ({
+          exitCode: null,
+          signal: "SIGTERM",
+          timedOut: true,
+          durationMs: 800,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+        }),
+      });
+      assert.ok(snapBothTimeout);
+      assert.match(snapBothTimeout, /Git: branch `main`/);
+      assert.match(snapBothTimeout, /Working tree: unknown \(git status timed out\)/);
+
+      // 5. Invalid/broken .git directory without HEAD must NOT fabricate a Git section on timeout
+      await fs.mkdir(path.join(brokenGitDir, ".git"), { recursive: true });
+      await fs.writeFile(path.join(brokenGitDir, "README.md"), "# broken\n", "utf8");
+      const brokenSnap = await buildWorkspaceSnapshot(brokenGitDir, {
+        gitExec: async () => ({
+          exitCode: null,
+          signal: "SIGTERM",
+          timedOut: true,
+          durationMs: 800,
+          stdout: "",
+          stderr: "",
+          truncated: false,
+        }),
+      });
+      assert.ok(brokenSnap);
+      assert.doesNotMatch(brokenSnap, /Git: branch/);
+    } finally {
+      await fs.rm(unbornTrackedDir, { recursive: true, force: true });
+      await fs.rm(brokenGitDir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders CJK filenames verbatim without octal escaping in git status snapshot", async () => {
+    const cjkDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-cjk-snap-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: cjkDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: cjkDir });
+      execFileSync("git", ["config", "core.quotePath", "true"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "init.ts"), "export const a = 1;\n", "utf8");
+      execFileSync("git", ["add", "init.ts"], { cwd: cjkDir });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: cjkDir });
+      await fs.writeFile(path.join(cjkDir, "中文模块.ts"), "export const zh = true;\n", "utf8");
+
+      const snap = await buildWorkspaceSnapshot(cjkDir);
+      assert.ok(snap !== null, "Expected non-null workspace snapshot");
+      assert.match(snap, /Modified \(1\):[^\n]*中文模块\.ts/);
+      assert.ok(!snap.includes("\\344\\270\\255"), `Unexpected octal-escaped path in snapshot:\n${snap}`);
+    } finally {
+      await fs.rm(cjkDir, { recursive: true, force: true });
     }
   });
 });

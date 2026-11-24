@@ -457,7 +457,7 @@ describe("apply_edits", () => {
       'console.log("Caused by: java.sql.SQLSyntaxErrorException: Unknown column shop_avatar");',
       'console.log("[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.");',
       'console.log("[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException");',
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const verifyRes = await runApplyEdits({
       cwd: tmpDir,
@@ -603,7 +603,7 @@ describe("apply_edits", () => {
     let directWriteAttempted = false;
     fs.writeFile = (async (...args: Parameters<typeof origWriteFile>) => {
       const p = String(args[0]);
-      if (p.startsWith(`${targetFile}.agy-fast-tmp-`)) {
+      if (path.basename(p).startsWith(".agy-tmp-") && String(args[1]).includes("target mod")) {
         await origWriteFile(p, "partial");
         throw makeErrnoError("ENOSPC", "ENOSPC: no space left on device");
       }
@@ -633,7 +633,7 @@ describe("apply_edits", () => {
 
     assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
     assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
-    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
   it("rolls back target file and removes partial created file when rename and fallback direct write both fail", async () => {
@@ -698,7 +698,7 @@ describe("apply_edits", () => {
     assert.equal(await fs.readFile(firstFile, "utf8"), "first orig\n");
     assert.equal(await fs.readFile(targetFile, "utf8"), "target orig\n");
     await assert.rejects(() => fs.stat(newFile), { code: "ENOENT" });
-    assert.equal((await fs.readdir(realSubDir)).some((n) => n.includes(".agy-fast-tmp-")), false);
+    assert.equal((await fs.readdir(realSubDir)).some((n) => n.startsWith(".agy-tmp-")), false);
   });
 
   it("fails fast on non-ENOENT errors in create without overwriting or deleting existing files", async () => {
@@ -843,7 +843,8 @@ describe("apply_edits", () => {
     assert.equal(dupCreate.isError, true);
     assert.match(dupCreate.text, /duplicate entries cannot mix 'create'/);
 
-    // 3. Single CRLF in an LF-majority script must NOT rewrite the whole file to CRLF
+    // 3. Single CRLF in an LF-majority script must NOT rewrite the whole file to CRLF,
+    //    while preserving untouched lines' exact original line endings
     const scriptPath = path.join(realSubDir, "run.sh");
     await fs.writeFile(scriptPath, "#!/usr/bin/env bash\necho 1\r\necho 2\necho 3\n", "utf8");
     const lfRes = await runApplyEdits({
@@ -853,7 +854,7 @@ describe("apply_edits", () => {
     assert.equal(lfRes.isError, false);
     const scriptAfter = await fs.readFile(scriptPath, "utf8");
     assert.ok(scriptAfter.startsWith("#!/usr/bin/env bash\n"));
-    assert.ok(!scriptAfter.includes("\r\n"));
+    assert.equal(scriptAfter, "#!/usr/bin/env bash\necho 1\r\necho 2\necho 4\n");
 
     // 4. Malformed verify fails validation BEFORE writing files; non-finite verifyTimeoutSec/maxVerifyChars stay safe
     const verifyFile = path.join(realSubDir, "v.ts");
@@ -931,7 +932,7 @@ describe("apply_edits", () => {
         '  "Found 1 error in src/Table.tsx:42",',
         "];",
         'console.log(lines.join("\\n"));',
-        "process.exit(2);",
+        "process.exitCode = 2;",
       ].join("\n") + "\n",
       "utf8",
     );
@@ -1233,7 +1234,7 @@ describe("apply_edits", () => {
       "console.error('error TS2322: 首条核心类型错误根因诊断');",
       "for (let i = 0; i < 60; i++) console.error('  at middleFrame_' + i + ' (中文路径模块文件_' + i + '.ts:' + i + ':5)');",
       "console.error('FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file.');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const verifyFailRes = await runApplyEdits({
       cwd: subDir,
@@ -1373,5 +1374,542 @@ describe("apply_edits", () => {
     assert.equal(wtRes.isError, true);
     assert.match(wtRes.text, /\.git: refusing to modify Git internal metadata path/);
     assert.equal(await fs.readFile(wtGitFile, "utf8"), "gitdir: /main-repo/.git/worktrees/wt1\n");
+  });
+
+  it("rejects overwriting existing binary files on create with overwrite: true (atomic and bestEffort)", async () => {
+    const subDir = path.join(tmpDir, "binary-overwrite");
+    await fs.mkdir(subDir, { recursive: true });
+
+    // Minimal PNG header + IHDR bytes containing NUL bytes
+    const pngBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    ]);
+    const pngPath = path.join(subDir, "logo.png");
+    const txtPath = path.join(subDir, "notes.txt");
+    await fs.writeFile(pngPath, pngBytes);
+    await fs.writeFile(txtPath, "original\n", "utf8");
+
+    // 1. Atomic mode: binary overwrite fails and rolls back / aborts all files
+    const atomicRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        { path: "notes.txt", hunks: [{ target: "original", replacement: "changed" }] },
+        { path: "logo.png", create: "not a png\n", overwrite: true },
+      ],
+    });
+    assert.equal(atomicRes.isError, true);
+    assert.match(atomicRes.text, /logo\.png: Cannot overwrite binary file with text content/);
+    assert.deepEqual(await fs.readFile(pngPath), pngBytes);
+    assert.equal(await fs.readFile(txtPath, "utf8"), "original\n");
+
+    // 2. bestEffort mode: isolates the binary overwrite failure while committing valid text edits
+    const bestEffortRes = await runApplyEdits({
+      cwd: subDir,
+      bestEffort: true,
+      edits: [
+        { path: "notes.txt", hunks: [{ target: "original", replacement: "updated" }] },
+        { path: "logo.png", create: "corrupted\n", overwrite: true },
+      ],
+    });
+    assert.equal(bestEffortRes.isError, true);
+    assert.match(bestEffortRes.text, /Partial edit applied \(1\/2 file\(s\) written/);
+    assert.match(bestEffortRes.text, /logo\.png: Cannot overwrite binary file with text content/);
+    assert.deepEqual(await fs.readFile(pngPath), pngBytes);
+    assert.equal(await fs.readFile(txtPath, "utf8"), "updated\n");
+  });
+
+  it("preserves UTF-8 BOM across hunk edits and overwrite: true, and reports clear UTF-16 errors", async () => {
+    const subDir = path.join(tmpDir, "bom-utf16-edits");
+    await fs.mkdir(subDir, { recursive: true });
+
+    const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomHunkPath = path.join(subDir, "bom-hunk.ts");
+    const bomOverwritePath = path.join(subDir, "bom-overwrite.ts");
+    const bomExplicitPath = path.join(subDir, "bom-explicit.ts");
+    const plainPath = path.join(subDir, "plain.ts");
+
+    await fs.writeFile(
+      bomHunkPath,
+      Buffer.concat([utf8Bom, Buffer.from("export const a = 1;\r\nexport const b = 2;\r\n", "utf8")]),
+    );
+    await fs.writeFile(
+      bomOverwritePath,
+      Buffer.concat([utf8Bom, Buffer.from("old line\n", "utf8")]),
+    );
+    await fs.writeFile(
+      bomExplicitPath,
+      Buffer.concat([utf8Bom, Buffer.from("old explicit\n", "utf8")]),
+    );
+    await fs.writeFile(plainPath, "export const plain = 1;\n", "utf8");
+
+    const editRes = await runApplyEdits({
+      cwd: subDir,
+      edits: [
+        {
+          path: "bom-hunk.ts",
+          hunks: [{ target: "export const a = 1;", replacement: "export const a = 10;" }],
+        },
+        {
+          path: "bom-overwrite.ts",
+          create: "new line 1\nnew line 2\n",
+          overwrite: true,
+        },
+        {
+          path: "bom-explicit.ts",
+          create: "\uFEFFalready has bom\n",
+          overwrite: true,
+        },
+        {
+          path: "plain.ts",
+          hunks: [{ target: "plain = 1;", replacement: "plain = 2;" }],
+        },
+      ],
+    });
+    assert.equal(editRes.isError, false);
+
+    // 1. Hunk edit on line 1 matched without needing \uFEFF and preserved both BOM and CRLF
+    const rawHunk = await fs.readFile(bomHunkPath);
+    assert.deepEqual(rawHunk.subarray(0, 3), utf8Bom);
+    assert.equal(rawHunk.subarray(3).toString("utf8"), "export const a = 10;\r\nexport const b = 2;\r\n");
+
+    // 2. create + overwrite: true preserved UTF-8 BOM on disk
+    const rawOverwrite = await fs.readFile(bomOverwritePath);
+    assert.deepEqual(rawOverwrite.subarray(0, 3), utf8Bom);
+    assert.equal(rawOverwrite.subarray(3).toString("utf8"), "new line 1\nnew line 2\n");
+
+    // 3. create + overwrite: true with explicit \uFEFF does NOT double-prepend BOM
+    const rawExplicit = await fs.readFile(bomExplicitPath);
+    assert.deepEqual(rawExplicit.subarray(0, 3), utf8Bom);
+    assert.equal(rawExplicit.subarray(3).toString("utf8"), "already has bom\n");
+
+    // 4. Plain non-BOM file remains without BOM
+    const rawPlain = await fs.readFile(plainPath);
+    assert.notDeepEqual(rawPlain.subarray(0, 3), utf8Bom);
+    assert.equal(rawPlain.toString("utf8"), "export const plain = 2;\n");
+
+    // 5. UTF-16 LE file fails with clear UTF-16 diagnostic and remains untouched
+    const utf16Path = path.join(subDir, "settings.reg");
+    const utf16Bytes = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("Windows Registry Editor Version 5.00\r\n", "utf16le"),
+    ]);
+    await fs.writeFile(utf16Path, utf16Bytes);
+
+    const utf16Res = await runApplyEdits({
+      cwd: subDir,
+      edits: [{ path: "settings.reg", hunks: [{ target: "5.00", replacement: "6.00" }] }],
+    });
+    assert.equal(utf16Res.isError, true);
+    assert.match(utf16Res.text, /UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 LE\]/);
+    assert.deepEqual(await fs.readFile(utf16Path), utf16Bytes);
+
+    // 6. create + overwrite: true also rejects UTF-16 LE/BE (including zero-NUL CJK UTF-16) and peeks >8KB binaries without full readFile
+    const cjkUtf16Le = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("中文配置测试", "utf16le"),
+    ]);
+    assert.equal(cjkUtf16Le.includes(0x00), false, "CJK UTF-16 LE fixture must contain zero NUL bytes");
+    const cjkUtf16Path = path.join(subDir, "cjk-utf16le.txt");
+    await fs.writeFile(cjkUtf16Path, cjkUtf16Le);
+
+    const utf16BePayload = Buffer.from("中文配置", "utf16le");
+    utf16BePayload.swap16();
+    const cjkUtf16Be = Buffer.concat([Buffer.from([0xfe, 0xff]), utf16BePayload]);
+    assert.equal(cjkUtf16Be.includes(0x00), false, "CJK UTF-16 BE fixture must contain zero NUL bytes");
+    const cjkUtf16BePath = path.join(subDir, "cjk-utf16be.txt");
+    await fs.writeFile(cjkUtf16BePath, cjkUtf16Be);
+
+    const overwriteUtf16Res = await runApplyEdits({
+      cwd: subDir,
+      bestEffort: true,
+      edits: [
+        { path: "settings.reg", create: "clobbered\n", overwrite: true },
+        { path: "cjk-utf16le.txt", create: "clobbered\n", overwrite: true },
+        { path: "cjk-utf16be.txt", create: "clobbered\n", overwrite: true },
+        { path: "plain.ts", hunks: [{ target: "plain = 2;", replacement: "plain = 3;" }] },
+      ],
+    });
+    assert.equal(overwriteUtf16Res.isError, true);
+    assert.match(overwriteUtf16Res.text, /Partial edit applied \(1\/4 file\(s\) written/);
+    assert.match(overwriteUtf16Res.text, /settings\.reg: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 LE\]/);
+    assert.match(overwriteUtf16Res.text, /cjk-utf16le\.txt: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 LE\]/);
+    assert.match(overwriteUtf16Res.text, /cjk-utf16be\.txt: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 BE\]/);
+    assert.deepEqual(await fs.readFile(utf16Path), utf16Bytes);
+    assert.deepEqual(await fs.readFile(cjkUtf16Path), cjkUtf16Le);
+    assert.deepEqual(await fs.readFile(cjkUtf16BePath), cjkUtf16Be);
+    assert.equal(await fs.readFile(plainPath, "utf8"), "export const plain = 3;\n");
+
+    // >8KB binary file is rejected via header peek without invoking full fs.readFile on the target
+    const largeBinPath = path.join(subDir, "large.bin");
+    const largeBinBytes = Buffer.alloc(16 * 1024, 0x41);
+    largeBinBytes[12] = 0x00;
+    await fs.writeFile(largeBinPath, largeBinBytes);
+
+    const origReadFile = fs.readFile;
+    let fullReadAttempted = false;
+    fs.readFile = (async (...args: Parameters<typeof origReadFile>) => {
+      if (path.resolve(String(args[0])) === path.resolve(largeBinPath)) {
+        fullReadAttempted = true;
+      }
+      return origReadFile(...args);
+    }) as typeof fs.readFile;
+    try {
+      const largeBinRes = await runApplyEdits({
+        cwd: subDir,
+        edits: [{ path: "large.bin", create: "text\n", overwrite: true }],
+      });
+      assert.equal(largeBinRes.isError, true);
+      assert.match(largeBinRes.text, /large\.bin: Cannot overwrite binary file with text content/);
+      assert.equal(fullReadAttempted, false, "Expected >8KB binary overwrite rejection via header peek without full fs.readFile");
+    } finally {
+      fs.readFile = origReadFile;
+    }
+    assert.deepEqual(await fs.readFile(largeBinPath), largeBinBytes);
+  });
+
+  it("edits long 228-byte CJK filenames without ENAMETOOLONG and removes orphaned parent dirs on rollback", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "af-tmp-"));
+    try {
+      // 1. 75 CJK chars + ".ts" = 228 UTF-8 bytes (previously failed ENAMETOOLONG with target-prefixed temp name)
+      const longCjkName = `${"测".repeat(75)}.ts`;
+      const longCjkPath = path.join(workDir, longCjkName);
+      await fs.writeFile(longCjkPath, "export const count = 1;\n", "utf8");
+
+      const editRes = await runApplyEdits({
+        cwd: workDir,
+        edits: [
+          {
+            path: longCjkName,
+            hunks: [{ target: "count = 1;", replacement: "count = 2;" }],
+          },
+        ],
+      });
+      assert.equal(editRes.isError, false, `Expected long CJK edit to succeed, got:\n${editRes.text}`);
+      assert.equal(await fs.readFile(longCjkPath, "utf8"), "export const count = 2;\n");
+
+      // 2. Atomic rollback cleans up newly created nested directories while preserving pre-existing ancestors
+      const keepDir = path.join(workDir, "existing-root");
+      await fs.mkdir(keepDir, { recursive: true });
+      await fs.writeFile(path.join(keepDir, "keep.txt"), "stay\n", "utf8");
+
+      const rollbackRes = await runApplyEdits({
+        cwd: keepDir,
+        edits: [
+          { path: "nested/deep/dir/a.ts", create: "export const a = 1;\n" },
+          // After plan #1 creates nested/deep/dir/, writing a regular file at that exact directory path fails in Phase 2
+          { path: "nested/deep/dir", create: "should fail as EISDIR\n" },
+        ],
+      });
+      assert.equal(rollbackRes.isError, true);
+      assert.match(rollbackRes.text, /Write failed \(changes rolled back\)/);
+
+      const nestedExists = await fs
+        .lstat(path.join(keepDir, "nested"))
+        .then(() => true, () => false);
+      assert.equal(nestedExists, false, "Expected orphaned nested/deep/dir directories to be removed on rollback");
+      assert.equal(await fs.readFile(path.join(keepDir, "keep.txt"), "utf8"), "stay\n");
+      const remainingEntries = await fs.readdir(keepDir);
+      assert.deepEqual(remainingEntries, ["keep.txt"]);
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves mixed CRLF/LF line endings on untouched lines and matches local span EOL", async () => {
+    // 1. Editing a single LF line in a mixed CRLF+LF file preserves all untouched CRLF lines verbatim
+    const mixedLfEdit = path.join(tmpDir, "mixed-lf-edit.txt");
+    await fs.writeFile(
+      mixedLfEdit,
+      "win1\r\nwin2\r\nunix3\nwin4\r\n",
+      "utf8",
+    );
+    const r1 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-lf-edit.txt",
+          hunks: [{ target: "unix3", replacement: "unix3a\nunix3b" }],
+        },
+      ],
+    });
+    assert.equal(r1.isError, false);
+    assert.equal(
+      await fs.readFile(mixedLfEdit, "utf8"),
+      "win1\r\nwin2\r\nunix3a\nunix3b\nwin4\r\n",
+    );
+
+    // 2. Editing a single CRLF line in a mostly-LF file preserves untouched LF lines verbatim
+    //    and uses CRLF for newly inserted lines inside that span
+    const mixedCrlfEdit = path.join(tmpDir, "mixed-crlf-edit.txt");
+    await fs.writeFile(
+      mixedCrlfEdit,
+      "unix1\nunix2\nwin3\r\nunix4\nunix5\n",
+      "utf8",
+    );
+    const r2 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-crlf-edit.txt",
+          hunks: [{ target: "win3", replacement: "win3a\nwin3b" }],
+        },
+      ],
+    });
+    assert.equal(r2.isError, false);
+    assert.equal(
+      await fs.readFile(mixedCrlfEdit, "utf8"),
+      "unix1\nunix2\nwin3a\r\nwin3b\r\nunix4\nunix5\n",
+    );
+
+    // 3. Multi-hunk edit on a mixed-EOL file keeps every untouched line byte-for-byte identical
+    const mixedMulti = path.join(tmpDir, "mixed-multi.txt");
+    await fs.writeFile(
+      mixedMulti,
+      "header\r\nkeep-lf-1\nedit-crlf\r\nkeep-crlf-2\r\nedit-lf\nkeep-crlf-3\r\nfooter-no-eol",
+      "utf8",
+    );
+    const r3 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-multi.txt",
+          hunks: [
+            { target: "edit-crlf", replacement: "EDITED-CRLF-1\nEDITED-CRLF-2" },
+            { target: "edit-lf", replacement: "EDITED-LF-1\nEDITED-LF-2" },
+            { target: "footer-no-eol", replacement: "FOOTER-1\nFOOTER-2" },
+          ],
+        },
+      ],
+    });
+    assert.equal(r3.isError, false);
+    assert.equal(
+      await fs.readFile(mixedMulti, "utf8"),
+      "header\r\nkeep-lf-1\nEDITED-CRLF-1\r\nEDITED-CRLF-2\r\nkeep-crlf-2\r\nEDITED-LF-1\nEDITED-LF-2\nkeep-crlf-3\r\nFOOTER-1\r\nFOOTER-2",
+    );
+
+    // 4. UTF-8 BOM + mixed CRLF/LF: BOM stays at index 0 before line 1 and mixed EOLs are preserved
+    const utf8Bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const bomMixed = path.join(tmpDir, "bom-mixed.txt");
+    await fs.writeFile(
+      bomMixed,
+      Buffer.concat([utf8Bom, Buffer.from("line1-crlf\r\nline2-lf\nline3-crlf\r\n", "utf8")]),
+    );
+    const r4 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-mixed.txt",
+          hunks: [
+            { target: "line1-crlf", replacement: "line1a\nline1b" },
+            { target: "line2-lf", replacement: "line2a\nline2b" },
+          ],
+        },
+      ],
+    });
+    assert.equal(r4.isError, false);
+    const bomMixedAfter = await fs.readFile(bomMixed);
+    assert.deepEqual(bomMixedAfter.subarray(0, 3), utf8Bom);
+    assert.equal(
+      bomMixedAfter.subarray(3).toString("utf8"),
+      "line1a\r\nline1b\r\nline2a\nline2b\nline3-crlf\r\n",
+    );
+
+    // 5. create(overwrite: true) on a UTF-8 BOM mixed-EOL file keeps BOM at byte 0 without duplicating it
+    const r5 = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-mixed.txt",
+          create: "over1\r\nover2\n",
+          overwrite: true,
+        },
+      ],
+    });
+    assert.equal(r5.isError, false);
+    const bomOverwriteAfter = await fs.readFile(bomMixed);
+    assert.deepEqual(bomOverwriteAfter.subarray(0, 3), utf8Bom);
+    assert.equal(bomOverwriteAfter.subarray(3).toString("utf8"), "over1\r\nover2\n");
+  });
+
+  it("skips disk writes for no-op hunks, preserves mtime/inode, and reports unchanged status", async () => {
+    const noopFile = path.join(tmpDir, "noop-only.ts");
+    const realFile = path.join(tmpDir, "real-edit.ts");
+    await fs.writeFile(noopFile, "export const value = 1;\n", "utf8");
+    await fs.writeFile(realFile, "export const count = 1;\n", "utf8");
+
+    const past = new Date(Date.now() - 60_000);
+    await fs.utimes(noopFile, past, past);
+    await fs.utimes(realFile, past, past);
+    const noopBefore = await fs.stat(noopFile);
+    const realBefore = await fs.stat(realFile);
+
+    // 1. Single no-op hunk in dryRun and real mode -> reports unchanged and skips disk write
+    const dryRes = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(dryRes.isError, false);
+    assert.match(
+      dryRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+
+    const singleRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(singleRes.isError, false);
+    assert.match(singleRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    assert.match(
+      singleRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+    const noopAfterSingle = await fs.stat(noopFile);
+    assert.equal(noopAfterSingle.mtimeMs, noopBefore.mtimeMs);
+    if (process.platform !== "win32") {
+      assert.equal(noopAfterSingle.ino, noopBefore.ino);
+    }
+
+    // 2. Mixed multi-file batch (1 real edit + 1 no-op hunk) writes only the real edit
+    const mixedRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "real-edit.ts",
+          hunks: [{ target: "count = 1", replacement: "count = 2" }],
+        },
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(mixedRes.isError, false);
+    assert.match(mixedRes.text, /Applied edits to 1 file\(s\) \(1 unchanged\):/);
+    assert.match(mixedRes.text, /- real-edit\.ts: updated \(1 match\), lines \+0/);
+    assert.match(
+      mixedRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+    assert.equal(await fs.readFile(realFile, "utf8"), "export const count = 2;\n");
+
+    const noopAfterMixed = await fs.stat(noopFile);
+    const realAfterMixed = await fs.stat(realFile);
+    assert.equal(noopAfterMixed.mtimeMs, noopBefore.mtimeMs);
+    assert.ok(
+      realAfterMixed.mtimeMs > realBefore.mtimeMs,
+      `expected realFile mtime to advance (${realAfterMixed.mtimeMs} <= ${realBefore.mtimeMs})`,
+    );
+    if (process.platform !== "win32") {
+      assert.equal(noopAfterMixed.ino, noopBefore.ino);
+    }
+
+    // 3. UTF-8 BOM file: no-op hunk skips write (preserving BOM + mtime/inode), real edit writes with BOM intact
+    const bomNoopFile = path.join(tmpDir, "bom-noop.ts");
+    const bomInitial = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from("export const bomVal = 1;\n", "utf8"),
+    ]);
+    await fs.writeFile(bomNoopFile, bomInitial);
+    await fs.utimes(bomNoopFile, past, past);
+    const bomBefore = await fs.stat(bomNoopFile);
+
+    const bomNoopRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-noop.ts",
+          hunks: [{ target: "bomVal = 1", replacement: "bomVal = 1" }],
+        },
+      ],
+    });
+    assert.equal(bomNoopRes.isError, false);
+    assert.match(bomNoopRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    const bomAfterNoop = await fs.stat(bomNoopFile);
+    assert.equal(bomAfterNoop.mtimeMs, bomBefore.mtimeMs);
+    if (process.platform !== "win32") {
+      assert.equal(bomAfterNoop.ino, bomBefore.ino);
+    }
+    assert.deepEqual(await fs.readFile(bomNoopFile), bomInitial);
+
+    const bomEditRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-noop.ts",
+          hunks: [{ target: "bomVal = 1", replacement: "bomVal = 2" }],
+        },
+      ],
+    });
+    assert.equal(bomEditRes.isError, false);
+    assert.match(bomEditRes.text, /Applied edits to 1 file\(s\):/);
+    assert.deepEqual(
+      await fs.readFile(bomNoopFile),
+      Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from("export const bomVal = 2;\n", "utf8"),
+      ]),
+    );
+
+    // 4. Mixed CRLF/LF spanning no-op preserves raw bytes & mtime and still runs verify (including OOM exit-137 diagnostics)
+    const mixedNoop = path.join(tmpDir, "mixed-noop.txt");
+    const mixedInitial = "line1\r\nline2\nline3\r\n";
+    await fs.writeFile(mixedNoop, mixedInitial, "utf8");
+    await fs.utimes(mixedNoop, past, past);
+    const mixedBefore = await fs.stat(mixedNoop);
+    const verifyOomRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-noop.txt",
+          hunks: [{ target: "line1\nline2\nline3", replacement: "line1\nline2\nline3" }],
+        },
+      ],
+      verify: `"${process.execPath}" -e "process.exit(137)"`,
+    });
+    assert.equal(verifyOomRes.isError, false);
+    assert.match(verifyOomRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    assert.match(verifyOomRes.text, /Verify \[FAIL \(exit 137 \/ SIGKILL - possible OOM\) in \d+ms\]/);
+    assert.match(verifyOomRes.text, /Terminated \(exit 137 \/ SIGKILL - possible OOM\)/);
+    assert.equal(await fs.readFile(mixedNoop, "utf8"), mixedInitial);
+    assert.equal((await fs.stat(mixedNoop)).mtimeMs, mixedBefore.mtimeMs);
+
+    // 5. bestEffort byte-budget truncation footer accurately reports written vs unchanged counts
+    const bulkDir = path.join(tmpDir, "noop-bulk-trunc");
+    await fs.mkdir(bulkDir, { recursive: true });
+    const bulkEdits: FileEdit[] = [];
+    for (let i = 0; i < 48; i++) {
+      const name = `unchanged-very-long-module-filename-segment-${String(i).padStart(2, "0")}-${"x".repeat(100)}.ts`;
+      await fs.writeFile(path.join(bulkDir, name), "export const same = 1;\n", "utf8");
+      bulkEdits.push({
+        path: name,
+        hunks: [{ target: "same = 1", replacement: "same = 1" }],
+      });
+    }
+    await fs.writeFile(path.join(bulkDir, "fail-target.ts"), "export const other = 1;\n", "utf8");
+    bulkEdits.push({
+      path: "fail-target.ts",
+      hunks: [{ target: "missing_symbol_xyz", replacement: "found" }],
+    });
+    const bulkRes = await runApplyEdits({
+      cwd: bulkDir,
+      bestEffort: true,
+      edits: bulkEdits,
+    });
+    assert.equal(bulkRes.isError, true);
+    assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
+    assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
 });

@@ -1008,10 +1008,56 @@ function compactLongFailureLines(lines: string[], maxChars: number): string {
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
 
+function describeFatalExitCode(exitCode: number | null): string | null {
+  switch (exitCode) {
+    case 137:
+      return "exit 137 / SIGKILL - possible OOM";
+    case 139:
+      return "exit 139 / SIGSEGV - segmentation fault";
+    case 134:
+      return "exit 134 / SIGABRT - process aborted";
+    case 0xc0000005:
+    case -1073741819:
+      return "exit 0xC0000005 / STATUS_ACCESS_VIOLATION";
+    case 0xc00000fd:
+    case -1073741571:
+      return "exit 0xC00000FD / STATUS_STACK_OVERFLOW";
+    case 0xc0000409:
+    case -1073740791:
+      return "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN";
+    default:
+      return null;
+  }
+}
+
+export function formatExitFailureLabel(
+  exitCode: number | null,
+  signal?: NodeJS.Signals | null,
+): string {
+  if (signal) {
+    switch (signal) {
+      case "SIGKILL":
+        return "SIGKILL - possible OOM";
+      case "SIGSEGV":
+        return "SIGSEGV - segmentation fault";
+      case "SIGABRT":
+        return "SIGABRT - process aborted";
+      case "SIGTERM":
+        return "SIGTERM";
+      default:
+        return String(signal);
+    }
+  }
+  const fatalExit = describeFatalExitCode(exitCode);
+  if (fatalExit) return fatalExit;
+  return `exit ${exitCode ?? "err"}`;
+}
+
 export interface FormatCompactCommandOutputParams {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  signal?: NodeJS.Signals | null;
   timedOut: boolean;
   error?: string;
   maxChars: number;
@@ -1095,9 +1141,15 @@ export function prepareCompactCommandOutput(
   }
 
   if (!combined) {
+    const fatalExitLabel = params.signal ? null : describeFatalExitCode(params.exitCode);
+    const bodyText = params.signal
+      ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}`
+      : fatalExitLabel
+        ? `Terminated (${fatalExitLabel})`
+        : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
-      bodyText: `Exited with code ${params.exitCode ?? "unknown"}`,
+      bodyText,
       collapsedLines: 0,
       rawLines: 0,
       rawChars: 0,

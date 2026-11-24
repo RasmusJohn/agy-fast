@@ -5,6 +5,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [0.3.1] - 2026-11-24
+
+### Added
+
+- **Interactive release updates, version skipping, and no-git GitHub API fallback (`src/updater-core.ts`, `scripts/install.mjs`, `src/session-start.ts`, #58, thanks `@wathing-wind`)**
+  - Added interactive confirmation (`update --prompt`), persistent `--skip-version <ver|none>`, compact `<=185B` `SessionStart` update notices, and hardened GitHub Releases API fallback for environments without `git` (with strict zero-tag fallback guards, safe GitHub URL sanitization, and stale-state cleanup in `doctor`).
+- **Fatal signal, OOM, and Windows crash diagnostics (`src/utils/output-filter.ts`, `src/tools/run-checks.ts`, `src/tools/apply-edits.ts`, #46, thanks `@wathing-wind`)**
+  - Surfaced fatal POSIX signal names (`SIGKILL - possible OOM`, `SIGSEGV - segmentation fault`, `SIGABRT - process aborted`, `SIGTERM`), portable shell `128+N` exit codes (`134`/`137`/`139`), and Windows NTSTATUS crash codes (`0xC0000005` / `0xC00000FD` / `0xC0000409`) across `run_checks` and `apply_edits` inline `verify` while keeping timeout/spawn-error precedence and `--cli` non-zero exit detection intact.
+- **Expanded macOS & Node.js 20/22/24 CI coverage (`.github/workflows/ci.yml`, #37, thanks `@0x7b1e`)**
+  - Added `macos-latest` and Node 20/22/24 verification jobs plus `sh -n install.sh` POSIX syntax checks to CI.
+
+### Performance & Reliability
+
+- **Compact MCP tool schemas `<=1280B` to prevent eager tool eviction (`src/mcp-server.ts`, #57, thanks `@kf953741`)**
+  - Compacted tool descriptions and parameter schemas within tight host per-tool budgets and removed array-mode JSON-string hints so Antigravity keeps all 5 tools eagerly loaded.
+- **Refuse silent `$HOME`/`/` fallback on omitted `cwd` (`src/mcp-server.ts`, #66, thanks `@OnurrUgur`)**
+  - Prevented omitted `cwd` (common on Desktop 2.0 / Hub hosts when `roots/list` is unavailable) from silently scanning the user's home directory or filesystem root—including Windows `HOMEDRIVE+HOMEPATH` and MSYS2 path guards—while still allowing explicit `cwd: "~"`.
+- **Fast-path `$HOME` snapshots & instant JSON stdin exit (`src/utils/snapshot.ts`, `src/session-start.ts`, `rules/AGENTS.md`, `docs/ANALYSIS_REPORT.zh-CN.md`, #62, thanks `@757530253`)**
+  - Skipped depth-2 directory scans and child subproject manifest probes when `SessionStart` runs in `$HOME`, returned immediately on complete JSON stdin objects (eliminating the 1,500ms stall when a host keeps stdin open without EOF), tightened `/compact` guidance (`~100k–150k` tokens), and documented Windows cold-start behavior.
+- **Updater, search, snapshot, and filesystem hardening (`src/updater-core.ts`, `src/tools/batch-search.ts`, `src/utils/snapshot.ts`, `src/utils/fs-utils.ts`, `src/utils/exec-utils.ts`, #28, thanks `@3956418278-dotcom`)**
+  - Blocked `repoUrl` option injection and `release -> main` error fallback in the updater; added Node fallback buffer/file prechecks, fixed `rg` glob precedence, symlinked-workspace (`/var -> /private/var`) anchored globs, and ES2025 inline `(?-m:...)` precheck guards; halved snapshot git spawns and prevented false clean status on timeout; bound drive-less Windows paths, capped `walkFiles` FD concurrency, eliminated `globToRegExp` ReDoS, canceled POSIX `SIGKILL` timers on exit, and deduped `rg` probing.
+
+### Fixed
+
+- **`apply_edits` safety, fidelity, and no-op hygiene (#39, #40, #47, #51, #52, thanks `@wathing-wind`)**
+  - Rejected overwriting existing binary or UTF-16 files on `create` + `overwrite: true` (peeking `>8KB` binaries without full reads).
+  - Preserved UTF-8 BOM across outlines and edits and clarified UTF-16 diagnostics.
+  - Preserved mixed CRLF/LF line endings byte-for-byte on untouched lines and matched local span EOL.
+  - Removed orphaned newly created parent directories on atomic rollback and used short temp filenames to prevent `ENAMETOOLONG` on long CJK/UTF-8 names.
+  - Skipped redundant disk writes for no-op hunks (preserving `mtime`/inode and short-circuiting hot-path mixed-EOL/UTF-8 buffer work), reported `unchanged` status, and kept byte-budget truncation footers accurate when `noOpCount > 0`.
+- **CJK git filenames & mixed-encoding process output (#45, thanks `@wathing-wind`; #55, thanks `@ErrantSnow`)**
+  - Passed `-c core.quotePath=false` in `snapshot.ts` and `batch_search` git queries so CJK/non-ASCII paths render cleanly without octal escapes.
+  - Decoded mixed UTF-8 and legacy codepage process output line-by-line in `exec-utils.ts`.
+- **`--cli` flag parsing & rules clarity (#56, thanks `@ErrantSnow`; #60, thanks `@gaofeng21cn`, Refs #59; #63, thanks `@anhnt256`, Refs #61)**
+  - Supported `--flag=value`, `--pattern`, and `--type` with properly scoped positional modifiers in `--cli search`.
+  - Sharpened Swarm worker & `run_checks` hygiene and documented the host-injected `toolSummary` field in `rules/AGENTS.md`.
+
+### 简体中文摘要（v0.3.1）
+
+- **交互式更新确认、跳过版本与无 `git` API 回退（#58，感谢 `@wathing-wind`）**：新增 `update --prompt` 交互确认、`--skip-version <ver|none>` 持久化跳过、`SessionStart` 紧凑更新提示（`≤185B`）以及无 `git` 环境的 GitHub Releases API 安全回退。
+- **宿主机急加载防驱逐与 Hub 防误扫 `$HOME`（#57 感谢 `@kf953741`；#66 感谢 `@OnurrUgur`）**：将 5 个 MCP 工具 Schema 压缩至 `≤1280B` 防止宿主机预算紧时被驱逐；禁止漏传 `cwd` 时静默回落扫描 `$HOME` 或根目录（兼容 Windows `HOMEDRIVE+HOMEPATH` 且保留显式 `cwd: "~"`）。
+- **`SessionStart` 冷启动与 Windows 体验优化（#62，感谢 `@757530253`）**：`$HOME` 快照跳过二级目录与子项目清单探针；收到完整 JSON stdin 后立即返回（消除宿主不关 stdin 时的 1500ms 卡顿）；收紧 `rules/AGENTS.md` 的 `/compact` 阈值与 Windows 实践说明。
+- **`apply_edits` 五连加固（#39、#40、#47、#51、#52，感谢 `@wathing-wind`）**：禁止 `create+overwrite` 覆盖二进制/UTF-16 文件；全程保留 UTF-8 BOM 并优化 UTF-16 报错；保留未改动行的混合 CRLF/LF 换行符；原子回滚清理新建空目录并用短临时名避免超长中文文件名 `ENAMETOOLONG`；无变化 hunk 跳过写盘保 `mtime`/inode 且精准汇报 `written/unchanged` 截断统计。
+- **搜索、编码、致命信号诊断与 CI 全面补强（#28 感谢 `@3956418278-dotcom`；#45/#46 感谢 `@wathing-wind`；#55/#56 感谢 `@ErrantSnow`；#60 感谢 `@gaofeng21cn`；#63 感谢 `@anhnt256`；#37 感谢 `@0x7b1e`）**：加固更新器与 `batch_search`（Node 预检、glob 优先级、macOS 软链工作区与 ReDoS 防护）；支持 CJK git 路径无八进制转义与混合编码逐行解码；在 `run_checks`/`apply_edits` 输出 OOM/段错误/信号名与 Windows NTSTATUS 崩溃码；修复 `--cli search` 参数解析与规则文档；CI 新增 macOS + Node 20/22/24 矩阵。
+
+---
+
 ## [0.3.0] - 2026-11-23
 
 ### Added
