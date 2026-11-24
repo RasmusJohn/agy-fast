@@ -344,6 +344,44 @@ describe("MCP Stdio Server end-to-end", () => {
     );
   });
 
+  it("keeps every serialized tools/list entry <= 1280 UTF-8 bytes in both array and string modes", async () => {
+    const MAX_TOOL_SCHEMA_BYTES = 1280;
+    for (const mode of ["array", "string"] as const) {
+      const res = await sendMessagesToServer(
+        [
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "test", version: "1.0.0" },
+            },
+          }) + "\n",
+          JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n",
+        ],
+        { AGY_FAST_EDITS_FORMAT: mode },
+      );
+      assert.equal(res.code, 0);
+      assert.equal(res.stderr, "");
+      const lines = res.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      const tools = lines.find((l) => l.id === 2)?.result?.tools as Array<{
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+      }>;
+      assert.equal(tools.length, 5);
+      for (const tool of tools) {
+        const bytes = Buffer.byteLength(JSON.stringify(tool), "utf8");
+        assert.ok(
+          bytes <= MAX_TOOL_SCHEMA_BYTES,
+          `tool ${tool.name} (${mode} mode) is ${bytes} UTF-8 bytes, exceeding ${MAX_TOOL_SCHEMA_BYTES}B budget`,
+        );
+      }
+    }
+  });
+
   it("resolves tool paths against the client's workspace root instead of its own cwd", async () => {
     const msgs = [
       {
