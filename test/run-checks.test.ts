@@ -846,20 +846,21 @@ describe("run_checks", () => {
       ],
     });
     assert.equal(fullRes.isError, false);
-    assert.match(fullRes.text, /\[FAIL \(exit 139 \/ SIGSEGV\)\]/);
+    assert.match(fullRes.text, /\[FAIL \(exit 139 \/ SIGSEGV - segmentation fault\)\]/);
 
     if (process.platform !== "win32") {
       const sigRes = await runChecks({
         outputMode: "compact",
         commands: [
           {
-            name: "direct-sigabrt",
-            command: `exec ${nodeBin} -e "process.kill(process.pid, 'SIGABRT')"`,
+            name: "direct-sigkill",
+            command: `exec ${nodeBin} -e "process.kill(process.pid, 'SIGKILL')"`,
           },
         ],
       });
       assert.equal(sigRes.isError, false);
-      assert.match(sigRes.text, /FAIL \(SIGABRT - process aborted\)/);
+      assert.match(sigRes.text, /FAIL \(SIGKILL - possible OOM\)/);
+      assert.match(sigRes.text, /Terminated by SIGKILL - possible OOM/);
     }
   });
 });

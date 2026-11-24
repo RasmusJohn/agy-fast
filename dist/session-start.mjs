@@ -773,7 +773,7 @@ async function getGitSummary(workspaceDir, timeoutMs, gitExec = execBinaryAsync)
   const [statusRes, logRes] = await Promise.all([
     gitExec(
       "git",
-      [...HARDENED_GIT_BASE_ARGS, "-c", "core.quotePath=false", "status", "--porcelain=v1", "--branch"],
+      [...HARDENED_GIT_BASE_ARGS, "status", "--porcelain=v1", "--branch"],
       {
         cwd: workspaceDir,
         timeoutMs,

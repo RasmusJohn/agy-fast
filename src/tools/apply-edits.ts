@@ -859,17 +859,47 @@ function formatErrorBulletsWithinBytes(
     : truncateWithByteNotice(assembled, maxBytes);
 }
 
+function formatAppliedCountPhrase(
+  totalCount: number,
+  noOpCount: number,
+  dryRun: boolean,
+): string {
+  if (dryRun) {
+    return noOpCount > 0 ? `${totalCount} valid (${noOpCount} unchanged)` : `${totalCount} valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0 ? `${writtenCount} written, ${noOpCount} unchanged` : `${writtenCount} written`;
+}
+
+function formatAppliedSummaryCompact(
+  totalCount: number,
+  noOpCount: number,
+  dryRun: boolean,
+): string {
+  if (dryRun) {
+    return noOpCount > 0
+      ? `${totalCount} file(s) valid (${noOpCount} unchanged)`
+      : `${totalCount} file(s) valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0
+    ? `${writtenCount} file(s) written, ${noOpCount} unchanged`
+    : `${writtenCount} file(s) written`;
+}
+
 function compactSummaryLinesToBytes(
   header: string,
   summaryLines: string[],
-  verb: string,
+  noOpCount: number,
   maxBytes: number,
 ): string {
   const full = `${header}\n${summaryLines.join("\n")}`;
   if (Buffer.byteLength(full, "utf8") <= maxBytes) {
     return full;
   }
-  const minimal = `${header} (${summaryLines.length} file(s) ${verb}; list omitted to preserve verify diagnostics)`;
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, false);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, false);
+  const minimal = `${header} (${countSummary}; list omitted to preserve verify diagnostics)`;
   const headerPrefix = `${header}\n`;
   const kept: string[] = [];
   let usedBytes = Buffer.byteLength(headerPrefix, "utf8");
@@ -879,7 +909,7 @@ function compactSummaryLinesToBytes(
     const remaining = summaryLines.length - (i + 1);
     const omitNotice =
       remaining > 0
-        ? `\n... (+${remaining} more applied file(s) omitted; total ${summaryLines.length} ${verb})`
+        ? `\n... (+${remaining} more applied file(s) omitted; total ${totalPhrase})`
         : "";
     const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
     if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
@@ -892,7 +922,7 @@ function compactSummaryLinesToBytes(
   if (kept.length > 0) {
     const omitted = summaryLines.length - kept.length;
     return omitted > 0
-      ? `${headerPrefix}${kept.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${verb})`
+      ? `${headerPrefix}${kept.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${totalPhrase})`
       : `${headerPrefix}${kept.join("\n")}`;
   }
   return Buffer.byteLength(minimal, "utf8") <= maxBytes
@@ -903,11 +933,12 @@ function formatBestEffortPartialResult(params: {
   partialHeader: string;
   errors: string[];
   summaryLines: string[];
+  noOpCount: number;
   dryRun: boolean;
   verifySkipped: boolean;
   maxBytes: number;
 }): string {
-  const { partialHeader, errors, summaryLines, dryRun, verifySkipped, maxBytes } = params;
+  const { partialHeader, errors, summaryLines, noOpCount, dryRun, verifySkipped, maxBytes } = params;
   const failedHeading = dryRun
     ? "Failed (fix only these):"
     : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
@@ -928,8 +959,9 @@ function formatBestEffortPartialResult(params: {
     return fullText;
   }
 
-  const appliedVerb = dryRun ? "valid" : "written";
-  const minimalApplied = `Applied: ${summaryLines.length} file(s) ${appliedVerb} (list omitted to preserve failure diagnostics).`;
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, dryRun);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, dryRun);
+  const minimalApplied = `Applied: ${countSummary} (list omitted to preserve failure diagnostics).`;
 
   const fixedBytes =
     Buffer.byteLength(partialHeader, "utf8") +
@@ -964,7 +996,7 @@ function formatBestEffortPartialResult(params: {
       const remainingCount = summaryLines.length - (i + 1);
       const omitNotice =
         remainingCount > 0
-          ? `\n... (+${remainingCount} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})`
+          ? `\n... (+${remainingCount} more applied file(s) omitted; total ${totalPhrase})`
           : "";
       const lineBytes = (keptLines.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
       if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > remainingForApplied) {
@@ -978,7 +1010,7 @@ function formatBestEffortPartialResult(params: {
       const omitted = summaryLines.length - keptLines.length;
       appliedSection =
         omitted > 0
-          ? `${appliedPrefix}${keptLines.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})`
+          ? `${appliedPrefix}${keptLines.join("\n")}\n... (+${omitted} more applied file(s) omitted; total ${totalPhrase})`
           : `${appliedPrefix}${keptLines.join("\n")}`;
     }
   }
@@ -1344,26 +1376,32 @@ export async function runApplyEdits(
       continue;
     }
 
-    const finalContent = fileData.mixedEol
-      ? applySpansPreservingMixedEol(
-          fileData.rawContent,
-          normalizedOriginal.length,
-          planned.spans,
-          fileData.eol,
-        )
-      : fileData.eol === "\r\n"
-        ? planned.newNormalized.replace(/\n/g, "\r\n")
-        : planned.newNormalized;
-    const newContent =
-      fileData.hasBom && !finalContent.startsWith("\uFEFF")
-        ? `\uFEFF${finalContent}`
-        : finalContent;
-    const isNoOp =
-      planned.newNormalized === normalizedOriginal ||
-      Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
+    const normalizedUnchanged = planned.newNormalized === normalizedOriginal;
+    let newContent = "";
+    let isNoOp = normalizedUnchanged;
+    if (!normalizedUnchanged) {
+      const finalContent = fileData.mixedEol
+        ? applySpansPreservingMixedEol(
+            fileData.rawContent,
+            normalizedOriginal.length,
+            planned.spans,
+            fileData.eol,
+          )
+        : fileData.eol === "\r\n"
+          ? planned.newNormalized.replace(/\n/g, "\r\n")
+          : planned.newNormalized;
+      newContent =
+        fileData.hasBom && !finalContent.startsWith("\uFEFF")
+          ? `\uFEFF${finalContent}`
+          : finalContent;
+      isNoOp =
+        Buffer.byteLength(newContent, "utf8") === fileData.rawBuffer.length &&
+        Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
+    }
 
-    const lineDelta =
-      countLines(planned.newNormalized) - countLines(normalizedOriginal);
+    const lineDelta = normalizedUnchanged
+      ? 0
+      : countLines(planned.newNormalized) - countLines(normalizedOriginal);
 
     plans.push({
       absPath: item.absPath,
@@ -1429,6 +1467,7 @@ export async function runApplyEdits(
         partialHeader,
         errors,
         summaryLines,
+        noOpCount,
         dryRun: Boolean(input.dryRun),
         verifySkipped: Boolean(!input.dryRun && input.verify),
         maxBytes: DEFAULT_INLINE_MAX_BYTES,
@@ -1485,7 +1524,7 @@ export async function runApplyEdits(
       error: res.error,
     });
 
-    const minApplied = `${header} (${summaryLines.length} file(s) written; list omitted to preserve verify diagnostics)`;
+    const minApplied = `${header} (${formatAppliedSummaryCompact(summaryLines.length, noOpCount, false)}; list omitted to preserve verify diagnostics)`;
     const reservedForApplied =
       status === "PASS"
         ? Math.min(
@@ -1530,7 +1569,7 @@ export async function runApplyEdits(
     const appliedSection = compactSummaryLinesToBytes(
       header,
       summaryLines,
-      "written",
+      noOpCount,
       Math.max(64, remainingAppliedBytes),
     );
     const combined = `${appliedSection}${verifySection}`;

@@ -2055,6 +2055,27 @@ ${formatOmittedLinesMarker(omitted, true)}
   }
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
+function describeFatalExitCode(exitCode) {
+  switch (exitCode) {
+    case 137:
+      return "exit 137 / SIGKILL - possible OOM";
+    case 139:
+      return "exit 139 / SIGSEGV - segmentation fault";
+    case 134:
+      return "exit 134 / SIGABRT - process aborted";
+    case 3221225477:
+    case -1073741819:
+      return "exit 0xC0000005 / STATUS_ACCESS_VIOLATION";
+    case 3221225725:
+    case -1073741571:
+      return "exit 0xC00000FD / STATUS_STACK_OVERFLOW";
+    case 3221226505:
+    case -1073740791:
+      return "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN";
+    default:
+      return null;
+  }
+}
 function formatExitFailureLabel(exitCode, signal) {
   if (signal) {
     switch (signal) {
@@ -2070,9 +2091,8 @@ function formatExitFailureLabel(exitCode, signal) {
         return String(signal);
     }
   }
-  if (exitCode === 137) return "exit 137 / SIGKILL - possible OOM";
-  if (exitCode === 139) return "exit 139 / SIGSEGV";
-  if (exitCode === 134) return "exit 134 / SIGABRT";
+  const fatalExit = describeFatalExitCode(exitCode);
+  if (fatalExit) return fatalExit;
   return `exit ${exitCode ?? "err"}`;
 }
 function prepareCompactCommandOutput(params) {
@@ -2123,7 +2143,8 @@ ${tail}` : "TIMED OUT (no output)",
     };
   }
   if (!combined) {
-    const bodyText = params.signal ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}` : params.exitCode === 137 || params.exitCode === 139 || params.exitCode === 134 ? `Terminated (${formatExitFailureLabel(params.exitCode, null)})` : `Exited with code ${params.exitCode ?? "unknown"}`;
+    const fatalExitLabel = params.signal ? null : describeFatalExitCode(params.exitCode);
+    const bodyText = params.signal ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}` : fatalExitLabel ? `Terminated (${fatalExitLabel})` : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
       bodyText,
@@ -3501,13 +3522,29 @@ function formatErrorBulletsWithinBytes(heading, errors, maxBytes) {
   const assembled = `${headingPrefix}${fittedBullets}`;
   return Buffer.byteLength(assembled, "utf8") <= maxBytes ? assembled : truncateWithByteNotice(assembled, maxBytes);
 }
-function compactSummaryLinesToBytes(header, summaryLines, verb, maxBytes) {
+function formatAppliedCountPhrase(totalCount, noOpCount, dryRun) {
+  if (dryRun) {
+    return noOpCount > 0 ? `${totalCount} valid (${noOpCount} unchanged)` : `${totalCount} valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0 ? `${writtenCount} written, ${noOpCount} unchanged` : `${writtenCount} written`;
+}
+function formatAppliedSummaryCompact(totalCount, noOpCount, dryRun) {
+  if (dryRun) {
+    return noOpCount > 0 ? `${totalCount} file(s) valid (${noOpCount} unchanged)` : `${totalCount} file(s) valid`;
+  }
+  const writtenCount = totalCount - noOpCount;
+  return noOpCount > 0 ? `${writtenCount} file(s) written, ${noOpCount} unchanged` : `${writtenCount} file(s) written`;
+}
+function compactSummaryLinesToBytes(header, summaryLines, noOpCount, maxBytes) {
   const full = `${header}
 ${summaryLines.join("\n")}`;
   if (Buffer.byteLength(full, "utf8") <= maxBytes) {
     return full;
   }
-  const minimal = `${header} (${summaryLines.length} file(s) ${verb}; list omitted to preserve verify diagnostics)`;
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, false);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, false);
+  const minimal = `${header} (${countSummary}; list omitted to preserve verify diagnostics)`;
   const headerPrefix = `${header}
 `;
   const kept = [];
@@ -3516,7 +3553,7 @@ ${summaryLines.join("\n")}`;
     const line = summaryLines[i];
     const remaining = summaryLines.length - (i + 1);
     const omitNotice = remaining > 0 ? `
-... (+${remaining} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : "";
+... (+${remaining} more applied file(s) omitted; total ${totalPhrase})` : "";
     const lineBytes = (kept.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
     if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > maxBytes) {
       break;
@@ -3527,12 +3564,12 @@ ${summaryLines.join("\n")}`;
   if (kept.length > 0) {
     const omitted = summaryLines.length - kept.length;
     return omitted > 0 ? `${headerPrefix}${kept.join("\n")}
-... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${verb})` : `${headerPrefix}${kept.join("\n")}`;
+... (+${omitted} more applied file(s) omitted; total ${totalPhrase})` : `${headerPrefix}${kept.join("\n")}`;
   }
   return Buffer.byteLength(minimal, "utf8") <= maxBytes ? minimal : truncateWithByteNotice(minimal, maxBytes);
 }
 function formatBestEffortPartialResult(params) {
-  const { partialHeader, errors, summaryLines, dryRun, verifySkipped, maxBytes } = params;
+  const { partialHeader, errors, summaryLines, noOpCount, dryRun, verifySkipped, maxBytes } = params;
   const failedHeading = dryRun ? "Failed (fix only these):" : "Failed (retry ONLY these failed file(s); do NOT re-send applied files):";
   const failedFull = `${failedHeading}
 - ${errors.join("\n- ")}`;
@@ -3548,8 +3585,9 @@ ${summaryLines.join("\n")}`;
   if (Buffer.byteLength(fullText, "utf8") <= maxBytes) {
     return fullText;
   }
-  const appliedVerb = dryRun ? "valid" : "written";
-  const minimalApplied = `Applied: ${summaryLines.length} file(s) ${appliedVerb} (list omitted to preserve failure diagnostics).`;
+  const countSummary = formatAppliedSummaryCompact(summaryLines.length, noOpCount, dryRun);
+  const totalPhrase = formatAppliedCountPhrase(summaryLines.length, noOpCount, dryRun);
+  const minimalApplied = `Applied: ${countSummary} (list omitted to preserve failure diagnostics).`;
   const fixedBytes = Buffer.byteLength(partialHeader, "utf8") + 4 + // "\n\n" before failed + "\n\n" before applied
   (verifyNote ? 2 + Buffer.byteLength(verifyNote, "utf8") : 0);
   const minAppliedBytes = Math.min(
@@ -3574,7 +3612,7 @@ ${summaryLines.join("\n")}`;
       const line = summaryLines[i];
       const remainingCount = summaryLines.length - (i + 1);
       const omitNotice = remainingCount > 0 ? `
-... (+${remainingCount} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})` : "";
+... (+${remainingCount} more applied file(s) omitted; total ${totalPhrase})` : "";
       const lineBytes = (keptLines.length > 0 ? 1 : 0) + Buffer.byteLength(line, "utf8");
       if (usedBytes + lineBytes + Buffer.byteLength(omitNotice, "utf8") > remainingForApplied) {
         break;
@@ -3585,7 +3623,7 @@ ${summaryLines.join("\n")}`;
     if (keptLines.length > 0) {
       const omitted = summaryLines.length - keptLines.length;
       appliedSection = omitted > 0 ? `${appliedPrefix}${keptLines.join("\n")}
-... (+${omitted} more applied file(s) omitted; total ${summaryLines.length} ${appliedVerb})` : `${appliedPrefix}${keptLines.join("\n")}`;
+... (+${omitted} more applied file(s) omitted; total ${totalPhrase})` : `${appliedPrefix}${keptLines.join("\n")}`;
     }
   }
   const assembled = joinSections(failedSection, appliedSection);
@@ -3897,15 +3935,20 @@ async function runApplyEdits(input) {
       errors.push(...planned.errors);
       continue;
     }
-    const finalContent = fileData.mixedEol ? applySpansPreservingMixedEol(
-      fileData.rawContent,
-      normalizedOriginal.length,
-      planned.spans,
-      fileData.eol
-    ) : fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
-    const newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
-    const isNoOp = planned.newNormalized === normalizedOriginal || Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
-    const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
+    const normalizedUnchanged = planned.newNormalized === normalizedOriginal;
+    let newContent = "";
+    let isNoOp = normalizedUnchanged;
+    if (!normalizedUnchanged) {
+      const finalContent = fileData.mixedEol ? applySpansPreservingMixedEol(
+        fileData.rawContent,
+        normalizedOriginal.length,
+        planned.spans,
+        fileData.eol
+      ) : fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
+      newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
+      isNoOp = Buffer.byteLength(newContent, "utf8") === fileData.rawBuffer.length && Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
+    }
+    const lineDelta = normalizedUnchanged ? 0 : countLines(planned.newNormalized) - countLines(normalizedOriginal);
     plans.push({
       absPath: item.absPath,
       writeTargetPath: item.writeTargetPath,
@@ -3958,6 +4001,7 @@ async function runApplyEdits(input) {
         partialHeader,
         errors,
         summaryLines,
+        noOpCount,
         dryRun: Boolean(input.dryRun),
         verifySkipped: Boolean(!input.dryRun && input.verify),
         maxBytes: DEFAULT_INLINE_MAX_BYTES
@@ -3993,7 +4037,7 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
       timedOut: res.timedOut,
       error: res.error
     });
-    const minApplied = `${header} (${summaryLines.length} file(s) written; list omitted to preserve verify diagnostics)`;
+    const minApplied = `${header} (${formatAppliedSummaryCompact(summaryLines.length, noOpCount, false)}; list omitted to preserve verify diagnostics)`;
     const reservedForApplied = status === "PASS" ? Math.min(
       Buffer.byteLength(appliedFull, "utf8"),
       DEFAULT_INLINE_MAX_BYTES - 512
@@ -4030,7 +4074,7 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
     const appliedSection = compactSummaryLinesToBytes(
       header,
       summaryLines,
-      "written",
+      noOpCount,
       Math.max(64, remainingAppliedBytes)
     );
     const combined = `${appliedSection}${verifySection}`;

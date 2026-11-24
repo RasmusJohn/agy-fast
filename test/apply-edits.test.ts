@@ -1862,5 +1862,54 @@ describe("apply_edits", () => {
         Buffer.from("export const bomVal = 2;\n", "utf8"),
       ]),
     );
+
+    // 4. Mixed CRLF/LF spanning no-op preserves raw bytes & mtime and still runs verify (including OOM exit-137 diagnostics)
+    const mixedNoop = path.join(tmpDir, "mixed-noop.txt");
+    const mixedInitial = "line1\r\nline2\nline3\r\n";
+    await fs.writeFile(mixedNoop, mixedInitial, "utf8");
+    await fs.utimes(mixedNoop, past, past);
+    const mixedBefore = await fs.stat(mixedNoop);
+    const verifyOomRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "mixed-noop.txt",
+          hunks: [{ target: "line1\nline2\nline3", replacement: "line1\nline2\nline3" }],
+        },
+      ],
+      verify: `"${process.execPath}" -e "process.exit(137)"`,
+    });
+    assert.equal(verifyOomRes.isError, false);
+    assert.match(verifyOomRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    assert.match(verifyOomRes.text, /Verify \[FAIL \(exit 137 \/ SIGKILL - possible OOM\) in \d+ms\]/);
+    assert.match(verifyOomRes.text, /Terminated \(exit 137 \/ SIGKILL - possible OOM\)/);
+    assert.equal(await fs.readFile(mixedNoop, "utf8"), mixedInitial);
+    assert.equal((await fs.stat(mixedNoop)).mtimeMs, mixedBefore.mtimeMs);
+
+    // 5. bestEffort byte-budget truncation footer accurately reports written vs unchanged counts
+    const bulkDir = path.join(tmpDir, "noop-bulk-trunc");
+    await fs.mkdir(bulkDir, { recursive: true });
+    const bulkEdits: FileEdit[] = [];
+    for (let i = 0; i < 48; i++) {
+      const name = `unchanged-very-long-module-filename-segment-${String(i).padStart(2, "0")}-${"x".repeat(100)}.ts`;
+      await fs.writeFile(path.join(bulkDir, name), "export const same = 1;\n", "utf8");
+      bulkEdits.push({
+        path: name,
+        hunks: [{ target: "same = 1", replacement: "same = 1" }],
+      });
+    }
+    await fs.writeFile(path.join(bulkDir, "fail-target.ts"), "export const other = 1;\n", "utf8");
+    bulkEdits.push({
+      path: "fail-target.ts",
+      hunks: [{ target: "missing_symbol_xyz", replacement: "found" }],
+    });
+    const bulkRes = await runApplyEdits({
+      cwd: bulkDir,
+      bestEffort: true,
+      edits: bulkEdits,
+    });
+    assert.equal(bulkRes.isError, true);
+    assert.match(bulkRes.text, /Partial edit applied \(0\/49 file\(s\) written, 48 unchanged; 1 file\(s\) failed/);
+    assert.match(bulkRes.text, /total 0 written, 48 unchanged\)/);
   });
 });

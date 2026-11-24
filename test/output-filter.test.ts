@@ -575,8 +575,12 @@ describe("output-filter", () => {
     assert.equal(formatExitFailureLabel(null, "SIGBUS"), "SIGBUS");
 
     assert.equal(formatExitFailureLabel(137, null), "exit 137 / SIGKILL - possible OOM");
-    assert.equal(formatExitFailureLabel(139, null), "exit 139 / SIGSEGV");
-    assert.equal(formatExitFailureLabel(134, null), "exit 134 / SIGABRT");
+    assert.equal(formatExitFailureLabel(139, null), "exit 139 / SIGSEGV - segmentation fault");
+    assert.equal(formatExitFailureLabel(134, null), "exit 134 / SIGABRT - process aborted");
+    assert.equal(formatExitFailureLabel(0xc0000005, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(-1073741819, null), "exit 0xC0000005 / STATUS_ACCESS_VIOLATION");
+    assert.equal(formatExitFailureLabel(0xc00000fd, null), "exit 0xC00000FD / STATUS_STACK_OVERFLOW");
+    assert.equal(formatExitFailureLabel(0xc0000409, null), "exit 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN");
     assert.equal(formatExitFailureLabel(1, null), "exit 1");
     assert.equal(formatExitFailureLabel(null, null), "exit err");
 
@@ -615,7 +619,7 @@ describe("output-filter", () => {
       signal: null,
       timedOut: false,
     });
-    assert.equal(exit139Empty.bodyText, "Terminated (exit 139 / SIGSEGV)");
+    assert.equal(exit139Empty.bodyText, "Terminated (exit 139 / SIGSEGV - segmentation fault)");
 
     const exit134Empty = prepareCompactCommandOutput({
       stdout: "",
@@ -624,7 +628,16 @@ describe("output-filter", () => {
       signal: null,
       timedOut: false,
     });
-    assert.equal(exit134Empty.bodyText, "Terminated (exit 134 / SIGABRT)");
+    assert.equal(exit134Empty.bodyText, "Terminated (exit 134 / SIGABRT - process aborted)");
+
+    const ntstatusEmpty = prepareCompactCommandOutput({
+      stdout: "",
+      stderr: "",
+      exitCode: 0xc0000005,
+      signal: null,
+      timedOut: false,
+    });
+    assert.equal(ntstatusEmpty.bodyText, "Terminated (exit 0xC0000005 / STATUS_ACCESS_VIOLATION)");
 
     const unknownEmpty = prepareCompactCommandOutput({
       stdout: "",
