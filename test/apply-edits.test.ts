@@ -457,7 +457,7 @@ describe("apply_edits", () => {
       'console.log("Caused by: java.sql.SQLSyntaxErrorException: Unknown column shop_avatar");',
       'console.log("[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.");',
       'console.log("[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException");',
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const verifyRes = await runApplyEdits({
       cwd: tmpDir,
@@ -932,7 +932,7 @@ describe("apply_edits", () => {
         '  "Found 1 error in src/Table.tsx:42",',
         "];",
         'console.log(lines.join("\\n"));',
-        "process.exit(2);",
+        "process.exitCode = 2;",
       ].join("\n") + "\n",
       "utf8",
     );
@@ -1234,7 +1234,7 @@ describe("apply_edits", () => {
       "console.error('error TS2322: 首条核心类型错误根因诊断');",
       "for (let i = 0; i < 60; i++) console.error('  at middleFrame_' + i + ' (中文路径模块文件_' + i + '.ts:' + i + ':5)');",
       "console.error('FINAL_SUMMARY_TAIL_MARKER: Found 1 error in 1 file.');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const verifyFailRes = await runApplyEdits({
       cwd: subDir,

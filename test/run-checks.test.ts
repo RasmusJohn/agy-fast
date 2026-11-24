@@ -63,7 +63,7 @@ describe("run_checks", () => {
       "for (let i = 0; i < 40; i++) console.log('info step ' + i);",
       "console.error('\\x1b[31mError: TS2322 type mismatch at src/a.ts:12\\x1b[0m');",
       "console.log('progress 10%\\rprogress 100%');",
-      "process.exit(2);",
+      "process.exitCode = 2;",
     ].join(" ");
 
     const res = await runChecks({
@@ -156,7 +156,7 @@ describe("run_checks", () => {
       "console.error('npm ERR! code ELIFECYCLE');",
       "console.error('npm ERR! errno 1');",
       "for (let i = 0; i < 40; i++) console.log('trailing line ' + i + ' padding padding');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
 
     const res = await runChecks({
@@ -447,7 +447,7 @@ describe("run_checks", () => {
       "console.error(h + ': Error in module A');",
       "for (let i = 0; i < 60; i++) console.error('Error: duplicate noisy failure line ' + i + ' ' + 'z'.repeat(60));",
       "console.error(t + ': 61 errors found in suite');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const compactRes = await runChecks({
       outputMode: "compact",
@@ -514,7 +514,7 @@ describe("run_checks", () => {
       "console.error('src/root.ts(1,1): error TS2304: FIRST_' + 'LONG_FAIL_ROOT');",
       "for (let i = 0; i < 45; i++) console.error('src/mid-' + i + '.ts(10,2): error TS2322: cascade line ' + i + ' ' + 'a'.repeat(30));",
       "console.error('src/end.ts(99,5): error TS2345: FINAL_' + 'LONG_FAIL_TAIL');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
 
     const compactWf = await runChecks({
@@ -540,7 +540,7 @@ describe("run_checks", () => {
       "console.error('Error: 首个中文根因_' + 'CJK_ROOT');",
       "for (let i = 0; i < 120; i++) console.error('Error: 中文编译报错详情行_' + i + '_类型不匹配需要检查字段定义和接口约束');",
       "console.error('Error: 最终中文尾部_' + 'CJK_TAIL_FINAL');",
-      "process.exit(1);",
+      "process.exitCode = 1;",
     ].join(" ");
     const cjkRes = await runChecks({
       outputMode: "compact",
