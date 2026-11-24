@@ -3387,6 +3387,7 @@ async function commitPlannedWrites(plans) {
   const createdDirSet = /* @__PURE__ */ new Set();
   try {
     for (const plan of plans) {
+      if (plan.isNoOp) continue;
       const target = plan.writeTargetPath;
       const dir = path4.dirname(target);
       const missingDirs = await findMissingAncestorDirs(dir);
@@ -3876,7 +3877,8 @@ async function runApplyEdits(input) {
         newContent: newContent2,
         hunkCount: 1,
         lineDelta: newLines - oldLines,
-        created: !exists
+        created: !exists,
+        isNoOp: false
       });
       continue;
     }
@@ -3902,6 +3904,7 @@ async function runApplyEdits(input) {
       fileData.eol
     ) : fileData.eol === "\r\n" ? planned.newNormalized.replace(/\n/g, "\r\n") : planned.newNormalized;
     const newContent = fileData.hasBom && !finalContent.startsWith("\uFEFF") ? `\uFEFF${finalContent}` : finalContent;
+    const isNoOp = planned.newNormalized === normalizedOriginal || Buffer.from(newContent, "utf8").equals(fileData.rawBuffer);
     const lineDelta = countLines(planned.newNormalized) - countLines(normalizedOriginal);
     plans.push({
       absPath: item.absPath,
@@ -3913,7 +3916,8 @@ async function runApplyEdits(input) {
       newContent,
       hunkCount: planned.appliedMatches,
       lineDelta,
-      created: false
+      created: false,
+      isNoOp
     });
   }
   const bestEffort = Boolean(input.bestEffort);
@@ -3935,14 +3939,20 @@ async function runApplyEdits(input) {
     }
   }
   const summaryLines = plans.map((p) => {
+    if (p.isNoOp) {
+      return `- ${p.relPath}: unchanged (no-op: replacement identical to target)`;
+    }
     const deltaStr = p.lineDelta >= 0 ? `+${p.lineDelta}` : `${p.lineDelta}`;
     const action = p.created ? "created" : `updated (${p.hunkCount} match${p.hunkCount === 1 ? "" : "es"})`;
     return `- ${p.relPath}: ${action}, lines ${deltaStr}`;
   });
+  const noOpCount = plans.filter((p) => p.isNoOp).length;
+  const writtenCount = plans.length - noOpCount;
   if (bestEffort && errors.length > 0) {
     const totalFiles = mergedByPath.size;
     const failedFileCount = Math.max(1, totalFiles - plans.length);
-    const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${plans.length}/${totalFiles} file(s) written; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
+    const unchangedSuffix = noOpCount > 0 ? `, ${noOpCount} unchanged` : "";
+    const partialHeader = input.dryRun ? `Partial dry-run (${plans.length}/${totalFiles} file(s) valid; ${failedFileCount} file(s) failed):` : `Partial edit applied (${writtenCount}/${totalFiles} file(s) written${unchangedSuffix}; ${failedFileCount} file(s) failed \u2014 do NOT re-send applied files):`;
     return {
       text: formatBestEffortPartialResult({
         partialHeader,
@@ -3955,7 +3965,7 @@ async function runApplyEdits(input) {
       isError: true
     };
   }
-  const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : `Applied edits to ${plans.length} file(s):`;
+  const header = input.dryRun ? `Dry run validated ${plans.length} file(s) (0 files modified):` : noOpCount > 0 ? `Applied edits to ${writtenCount} file(s) (${noOpCount} unchanged):` : `Applied edits to ${plans.length} file(s):`;
   const appliedFull = `${header}
 ${summaryLines.join("\n")}`;
   if (!input.dryRun && validatedVerify) {

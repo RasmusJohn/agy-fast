@@ -1731,4 +1731,136 @@ describe("apply_edits", () => {
     assert.deepEqual(bomOverwriteAfter.subarray(0, 3), utf8Bom);
     assert.equal(bomOverwriteAfter.subarray(3).toString("utf8"), "over1\r\nover2\n");
   });
+
+  it("skips disk writes for no-op hunks, preserves mtime/inode, and reports unchanged status", async () => {
+    const noopFile = path.join(tmpDir, "noop-only.ts");
+    const realFile = path.join(tmpDir, "real-edit.ts");
+    await fs.writeFile(noopFile, "export const value = 1;\n", "utf8");
+    await fs.writeFile(realFile, "export const count = 1;\n", "utf8");
+
+    const past = new Date(Date.now() - 60_000);
+    await fs.utimes(noopFile, past, past);
+    await fs.utimes(realFile, past, past);
+    const noopBefore = await fs.stat(noopFile);
+    const realBefore = await fs.stat(realFile);
+
+    // 1. Single no-op hunk in dryRun and real mode -> reports unchanged and skips disk write
+    const dryRes = await runApplyEdits({
+      cwd: tmpDir,
+      dryRun: true,
+      edits: [
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(dryRes.isError, false);
+    assert.match(
+      dryRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+
+    const singleRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(singleRes.isError, false);
+    assert.match(singleRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    assert.match(
+      singleRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+    const noopAfterSingle = await fs.stat(noopFile);
+    assert.equal(noopAfterSingle.mtimeMs, noopBefore.mtimeMs);
+    if (process.platform !== "win32") {
+      assert.equal(noopAfterSingle.ino, noopBefore.ino);
+    }
+
+    // 2. Mixed multi-file batch (1 real edit + 1 no-op hunk) writes only the real edit
+    const mixedRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "real-edit.ts",
+          hunks: [{ target: "count = 1", replacement: "count = 2" }],
+        },
+        {
+          path: "noop-only.ts",
+          hunks: [{ target: "value = 1", replacement: "value = 1" }],
+        },
+      ],
+    });
+    assert.equal(mixedRes.isError, false);
+    assert.match(mixedRes.text, /Applied edits to 1 file\(s\) \(1 unchanged\):/);
+    assert.match(mixedRes.text, /- real-edit\.ts: updated \(1 match\), lines \+0/);
+    assert.match(
+      mixedRes.text,
+      /- noop-only\.ts: unchanged \(no-op: replacement identical to target\)/,
+    );
+    assert.equal(await fs.readFile(realFile, "utf8"), "export const count = 2;\n");
+
+    const noopAfterMixed = await fs.stat(noopFile);
+    const realAfterMixed = await fs.stat(realFile);
+    assert.equal(noopAfterMixed.mtimeMs, noopBefore.mtimeMs);
+    assert.ok(
+      realAfterMixed.mtimeMs > realBefore.mtimeMs,
+      `expected realFile mtime to advance (${realAfterMixed.mtimeMs} <= ${realBefore.mtimeMs})`,
+    );
+    if (process.platform !== "win32") {
+      assert.equal(noopAfterMixed.ino, noopBefore.ino);
+    }
+
+    // 3. UTF-8 BOM file: no-op hunk skips write (preserving BOM + mtime/inode), real edit writes with BOM intact
+    const bomNoopFile = path.join(tmpDir, "bom-noop.ts");
+    const bomInitial = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from("export const bomVal = 1;\n", "utf8"),
+    ]);
+    await fs.writeFile(bomNoopFile, bomInitial);
+    await fs.utimes(bomNoopFile, past, past);
+    const bomBefore = await fs.stat(bomNoopFile);
+
+    const bomNoopRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-noop.ts",
+          hunks: [{ target: "bomVal = 1", replacement: "bomVal = 1" }],
+        },
+      ],
+    });
+    assert.equal(bomNoopRes.isError, false);
+    assert.match(bomNoopRes.text, /Applied edits to 0 file\(s\) \(1 unchanged\):/);
+    const bomAfterNoop = await fs.stat(bomNoopFile);
+    assert.equal(bomAfterNoop.mtimeMs, bomBefore.mtimeMs);
+    if (process.platform !== "win32") {
+      assert.equal(bomAfterNoop.ino, bomBefore.ino);
+    }
+    assert.deepEqual(await fs.readFile(bomNoopFile), bomInitial);
+
+    const bomEditRes = await runApplyEdits({
+      cwd: tmpDir,
+      edits: [
+        {
+          path: "bom-noop.ts",
+          hunks: [{ target: "bomVal = 1", replacement: "bomVal = 2" }],
+        },
+      ],
+    });
+    assert.equal(bomEditRes.isError, false);
+    assert.match(bomEditRes.text, /Applied edits to 1 file\(s\):/);
+    assert.deepEqual(
+      await fs.readFile(bomNoopFile),
+      Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from("export const bomVal = 2;\n", "utf8"),
+      ]),
+    );
+  });
 });
