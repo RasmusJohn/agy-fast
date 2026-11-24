@@ -7,7 +7,14 @@ import {
   type CorruptedItem,
 } from "../utils/arg-validation.js";
 import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.js";
-import { hasUtf8Bom, isLikelyBinary, readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
+import {
+  detectUtf16Bom,
+  hasUtf8Bom,
+  isLikelyBinary,
+  readTextFile,
+  resolvePath,
+  toPosixPath,
+} from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
@@ -510,6 +517,56 @@ function countLines(text: string): number {
     if (text[i] === "\n") count++;
   }
   return count;
+}
+
+const OVERWRITE_HEADER_PEEK_BYTES = 8192;
+
+async function readFileHeaderBytes(
+  filePath: string,
+  maxBytes = OVERWRITE_HEADER_PEEK_BYTES,
+): Promise<Buffer> {
+  const fh = await fs.open(filePath, "r");
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+function classifyNonTextOverwriteBuffer(
+  buf: Buffer,
+  relPath: string,
+): string | null {
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    return `${relPath}: UTF-16 encoded file is not supported (convert to UTF-8 first) [${utf16Bom}]`;
+  }
+  if (isLikelyBinary(buf)) {
+    return `${relPath}: Cannot overwrite binary file with text content`;
+  }
+  return null;
+}
+
+async function readOverwriteOriginal(
+  writeTargetPath: string,
+  size: number,
+  relPath: string,
+): Promise<{ ok: true; buffer: Buffer } | { ok: false; error: string }> {
+  if (size > OVERWRITE_HEADER_PEEK_BYTES) {
+    const header = await readFileHeaderBytes(writeTargetPath, OVERWRITE_HEADER_PEEK_BYTES);
+    const nonTextErr = classifyNonTextOverwriteBuffer(header, relPath);
+    if (nonTextErr) {
+      return { ok: false, error: nonTextErr };
+    }
+  }
+  const buffer = await fs.readFile(writeTargetPath);
+  const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
+  if (nonTextErr) {
+    return { ok: false, error: nonTextErr };
+  }
+  return { ok: true, buffer };
 }
 
 /**
@@ -1057,7 +1114,16 @@ export async function runApplyEdits(
               continue;
             }
             originalMode = st.mode & 0o7777;
-            originalBuffer = await fs.readFile(item.writeTargetPath);
+            const origRes = await readOverwriteOriginal(
+              item.writeTargetPath,
+              st.size,
+              item.relPath,
+            );
+            if (!origRes.ok) {
+              errors.push(origRes.error);
+              continue;
+            }
+            originalBuffer = origRes.buffer;
           } catch (statErr) {
             if ((statErr as NodeJS.ErrnoException)?.code === "ENOENT") {
               // Dangling symlink: never clobber without overwrite: true, and preserve target for rollback
@@ -1090,7 +1156,16 @@ export async function runApplyEdits(
             continue;
           }
           originalMode = st.mode & 0o7777;
-          originalBuffer = await fs.readFile(item.writeTargetPath);
+          const origRes = await readOverwriteOriginal(
+            item.writeTargetPath,
+            st.size,
+            item.relPath,
+          );
+          if (!origRes.ok) {
+            errors.push(origRes.error);
+            continue;
+          }
+          originalBuffer = origRes.buffer;
         }
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
@@ -1105,11 +1180,6 @@ export async function runApplyEdits(
         }
       }
 
-      if (originalBuffer && isLikelyBinary(originalBuffer)) {
-        errors.push(`${item.relPath}: Cannot overwrite binary file with text content`);
-        continue;
-      }
-
       const originalHadBom = originalBuffer ? hasUtf8Bom(originalBuffer) : false;
       const oldLines = originalBuffer
         ? countLines((originalHadBom ? originalBuffer.subarray(3) : originalBuffer).toString("utf8"))
@@ -1118,7 +1188,8 @@ export async function runApplyEdits(
         originalHadBom && !item.create.startsWith("\uFEFF")
           ? `\uFEFF${item.create}`
           : item.create;
-      const newLines = countLines(item.create);
+      const createBody = item.create.startsWith("\uFEFF") ? item.create.slice(1) : item.create;
+      const newLines = countLines(createBody);
       plans.push({
         absPath: item.absPath,
         writeTargetPath: item.writeTargetPath,

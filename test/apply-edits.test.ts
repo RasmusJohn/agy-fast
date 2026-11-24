@@ -1502,5 +1502,68 @@ describe("apply_edits", () => {
     assert.equal(utf16Res.isError, true);
     assert.match(utf16Res.text, /UTF-16 encoded file is not supported \(convert to UTF-8 first\): .*\[UTF-16 LE\]/);
     assert.deepEqual(await fs.readFile(utf16Path), utf16Bytes);
+
+    // 6. create + overwrite: true also rejects UTF-16 LE/BE (including zero-NUL CJK UTF-16) and peeks >8KB binaries without full readFile
+    const cjkUtf16Le = Buffer.concat([
+      Buffer.from([0xff, 0xfe]),
+      Buffer.from("中文配置测试", "utf16le"),
+    ]);
+    assert.equal(cjkUtf16Le.includes(0x00), false, "CJK UTF-16 LE fixture must contain zero NUL bytes");
+    const cjkUtf16Path = path.join(subDir, "cjk-utf16le.txt");
+    await fs.writeFile(cjkUtf16Path, cjkUtf16Le);
+
+    const utf16BePayload = Buffer.from("中文配置", "utf16le");
+    utf16BePayload.swap16();
+    const cjkUtf16Be = Buffer.concat([Buffer.from([0xfe, 0xff]), utf16BePayload]);
+    assert.equal(cjkUtf16Be.includes(0x00), false, "CJK UTF-16 BE fixture must contain zero NUL bytes");
+    const cjkUtf16BePath = path.join(subDir, "cjk-utf16be.txt");
+    await fs.writeFile(cjkUtf16BePath, cjkUtf16Be);
+
+    const overwriteUtf16Res = await runApplyEdits({
+      cwd: subDir,
+      bestEffort: true,
+      edits: [
+        { path: "settings.reg", create: "clobbered\n", overwrite: true },
+        { path: "cjk-utf16le.txt", create: "clobbered\n", overwrite: true },
+        { path: "cjk-utf16be.txt", create: "clobbered\n", overwrite: true },
+        { path: "plain.ts", hunks: [{ target: "plain = 2;", replacement: "plain = 3;" }] },
+      ],
+    });
+    assert.equal(overwriteUtf16Res.isError, true);
+    assert.match(overwriteUtf16Res.text, /Partial edit applied \(1\/4 file\(s\) written/);
+    assert.match(overwriteUtf16Res.text, /settings\.reg: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 LE\]/);
+    assert.match(overwriteUtf16Res.text, /cjk-utf16le\.txt: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 LE\]/);
+    assert.match(overwriteUtf16Res.text, /cjk-utf16be\.txt: UTF-16 encoded file is not supported \(convert to UTF-8 first\) \[UTF-16 BE\]/);
+    assert.deepEqual(await fs.readFile(utf16Path), utf16Bytes);
+    assert.deepEqual(await fs.readFile(cjkUtf16Path), cjkUtf16Le);
+    assert.deepEqual(await fs.readFile(cjkUtf16BePath), cjkUtf16Be);
+    assert.equal(await fs.readFile(plainPath, "utf8"), "export const plain = 3;\n");
+
+    // >8KB binary file is rejected via header peek without invoking full fs.readFile on the target
+    const largeBinPath = path.join(subDir, "large.bin");
+    const largeBinBytes = Buffer.alloc(16 * 1024, 0x41);
+    largeBinBytes[12] = 0x00;
+    await fs.writeFile(largeBinPath, largeBinBytes);
+
+    const origReadFile = fs.readFile;
+    let fullReadAttempted = false;
+    fs.readFile = (async (...args: Parameters<typeof origReadFile>) => {
+      if (path.resolve(String(args[0])) === path.resolve(largeBinPath)) {
+        fullReadAttempted = true;
+      }
+      return origReadFile(...args);
+    }) as typeof fs.readFile;
+    try {
+      const largeBinRes = await runApplyEdits({
+        cwd: subDir,
+        edits: [{ path: "large.bin", create: "text\n", overwrite: true }],
+      });
+      assert.equal(largeBinRes.isError, true);
+      assert.match(largeBinRes.text, /large\.bin: Cannot overwrite binary file with text content/);
+      assert.equal(fullReadAttempted, false, "Expected >8KB binary overwrite rejection via header peek without full fs.readFile");
+    } finally {
+      fs.readFile = origReadFile;
+    }
+    assert.deepEqual(await fs.readFile(largeBinPath), largeBinBytes);
   });
 });

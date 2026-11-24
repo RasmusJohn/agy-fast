@@ -3104,6 +3104,42 @@ function countLines(text) {
   }
   return count;
 }
+var OVERWRITE_HEADER_PEEK_BYTES = 8192;
+async function readFileHeaderBytes(filePath, maxBytes = OVERWRITE_HEADER_PEEK_BYTES) {
+  const fh = await fs3.open(filePath, "r");
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const { bytesRead } = await fh.read(buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+function classifyNonTextOverwriteBuffer(buf, relPath) {
+  const utf16Bom = detectUtf16Bom(buf);
+  if (utf16Bom) {
+    return `${relPath}: UTF-16 encoded file is not supported (convert to UTF-8 first) [${utf16Bom}]`;
+  }
+  if (isLikelyBinary(buf)) {
+    return `${relPath}: Cannot overwrite binary file with text content`;
+  }
+  return null;
+}
+async function readOverwriteOriginal(writeTargetPath, size, relPath) {
+  if (size > OVERWRITE_HEADER_PEEK_BYTES) {
+    const header = await readFileHeaderBytes(writeTargetPath, OVERWRITE_HEADER_PEEK_BYTES);
+    const nonTextErr2 = classifyNonTextOverwriteBuffer(header, relPath);
+    if (nonTextErr2) {
+      return { ok: false, error: nonTextErr2 };
+    }
+  }
+  const buffer = await fs3.readFile(writeTargetPath);
+  const nonTextErr = classifyNonTextOverwriteBuffer(buffer, relPath);
+  if (nonTextErr) {
+    return { ok: false, error: nonTextErr };
+  }
+  return { ok: true, buffer };
+}
 function isGitInternalPath(filePath, platform = process.platform) {
   const segments = filePath.split(/[\\/]+/);
   for (const rawSeg of segments) {
@@ -3535,7 +3571,16 @@ async function runApplyEdits(input) {
               continue;
             }
             originalMode = st.mode & 4095;
-            originalBuffer = await fs3.readFile(item.writeTargetPath);
+            const origRes = await readOverwriteOriginal(
+              item.writeTargetPath,
+              st.size,
+              item.relPath
+            );
+            if (!origRes.ok) {
+              errors.push(origRes.error);
+              continue;
+            }
+            originalBuffer = origRes.buffer;
           } catch (statErr) {
             if (statErr?.code === "ENOENT") {
               exists = true;
@@ -3567,7 +3612,16 @@ async function runApplyEdits(input) {
             continue;
           }
           originalMode = st.mode & 4095;
-          originalBuffer = await fs3.readFile(item.writeTargetPath);
+          const origRes = await readOverwriteOriginal(
+            item.writeTargetPath,
+            st.size,
+            item.relPath
+          );
+          if (!origRes.ok) {
+            errors.push(origRes.error);
+            continue;
+          }
+          originalBuffer = origRes.buffer;
         }
       } catch (err) {
         if (err?.code === "ENOENT") {
@@ -3581,14 +3635,11 @@ async function runApplyEdits(input) {
           continue;
         }
       }
-      if (originalBuffer && isLikelyBinary(originalBuffer)) {
-        errors.push(`${item.relPath}: Cannot overwrite binary file with text content`);
-        continue;
-      }
       const originalHadBom = originalBuffer ? hasUtf8Bom(originalBuffer) : false;
       const oldLines = originalBuffer ? countLines((originalHadBom ? originalBuffer.subarray(3) : originalBuffer).toString("utf8")) : 0;
       const newContent2 = originalHadBom && !item.create.startsWith("\uFEFF") ? `\uFEFF${item.create}` : item.create;
-      const newLines = countLines(item.create);
+      const createBody = item.create.startsWith("\uFEFF") ? item.create.slice(1) : item.create;
+      const newLines = countLines(createBody);
       plans.push({
         absPath: item.absPath,
         writeTargetPath: item.writeTargetPath,
