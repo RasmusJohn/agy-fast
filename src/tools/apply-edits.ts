@@ -623,15 +623,48 @@ async function canonicalizeTargetPath(absPath: string): Promise<string> {
   }
 }
 
+async function findMissingAncestorDirs(dir: string): Promise<string[]> {
+  const missing: string[] = [];
+  let current = path.resolve(dir);
+  while (true) {
+    try {
+      await fs.lstat(current);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        break;
+      }
+      missing.push(current);
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return missing;
+}
+
 async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
   const written: PlannedWrite[] = [];
+  const createdDirs: string[] = [];
+  const createdDirSet = new Set<string>();
 
   try {
     for (const plan of plans) {
       const target = plan.writeTargetPath;
       const dir = path.dirname(target);
+      const missingDirs = await findMissingAncestorDirs(dir);
+      for (let i = missingDirs.length - 1; i >= 0; i--) {
+        const d = missingDirs[i]!;
+        if (!createdDirSet.has(d)) {
+          createdDirSet.add(d);
+          createdDirs.push(d);
+        }
+      }
       await fs.mkdir(dir, { recursive: true });
-      const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const tmpPath = path.join(
+        dir,
+        `.agy-tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      );
       try {
         await fs.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
@@ -695,6 +728,14 @@ async function commitPlannedWrites(plans: PlannedWrite[]): Promise<void> {
         }
       } catch {
         // Best-effort rollback
+      }
+    }
+    // Best-effort remove newly created parent directories deepest-first (rmdir never removes non-empty dirs)
+    for (let i = createdDirs.length - 1; i >= 0; i--) {
+      try {
+        await fs.rmdir(createdDirs[i]!);
+      } catch {
+        // Ignore ENOENT / ENOTEMPTY / permission errors
       }
     }
     throw err;
