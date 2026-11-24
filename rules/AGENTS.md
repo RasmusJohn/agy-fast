@@ -21,6 +21,8 @@ Use `agy-fast_fast` MCP tools where batching amortizes the fixed per-call remote
 
 ## Quick Schemas (`ServerName: "agy-fast_fast"`)
 
+> Under Antigravity eager loading, the host injects a required `toolSummary` argument into every `mcp_agy-fast_fast_*` call alongside the parameters below — include it (a short summary of what the call does) or the first call fails with `missing property 'toolSummary'`.
+
 - **`batch_search`**: `{ cwd?, queries: [{ type: "text"|"regex"|"glob"|"fuzzy"|"git", pattern, path?, glob?, fileType?, multiline?, outputMode?: "content"|"files_with_matches"|"count", sortBy?: "path"|"mtime", caseSensitive?, contextLines?: 0..5, maxResults?: 1..200 }], maxChars?: 500..8800 }` (1-20 queries; glob uses `*`/`{a,b}`, not regex `|`; `path` relative or absolute; read-only git only).
 - **`apply_edits`**: `{ cwd?, edits: [{ path, hunks?: [{ target, replacement, startLine?, endLine?, replaceAll? }], create?: string, overwrite?: boolean }], dryRun?, bestEffort?, verify?: string, verifyTimeoutSec?, maxVerifyChars?: 300..7500 }` (1-50 files; `create` is mutually exclusive with `hunks`; when called lazily via `call_mcp_tool`, `edits` also accepts a JSON array string—follow the SessionStart `[agy-fast compat]` notice if present).
 - **`quick_outline`**: `{ cwd?, paths: string[], maxChars?: 1000..8800 }` (flat outline-only schema; prefer 10-20 files/batch, max 40).
