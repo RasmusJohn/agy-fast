@@ -9150,6 +9150,7 @@ function formatCliUsage() {
     "  outline | quick_outline <file...> [--cwd <dir>] [--max-chars <N>]",
     "  slice   | read_slices   <path:start-end,...> [--outline <file>] [--cwd <dir>]",
     "  search  | batch_search  [--text <p>] [--regex <p>] [--glob <p>] [--fuzzy <p>] [--git <cmd>]",
+    "                          [--pattern <p>] [--type text|regex|glob|fuzzy|git]",
     "                          [--path <dir>] [--file-type <t>] [--glob-filter <g>]",
     "                          [--output-mode content|files_with_matches|count] [--sort-by path|mtime]",
     "                          [--context <0..5>] [--max-results <N>] [-i|--ignore-case] [--multiline]",
@@ -9294,6 +9295,13 @@ function applySearchModifiers(q, mods) {
     ...mods.multiline !== void 0 && q.multiline === void 0 ? { multiline: mods.multiline } : {}
   };
 }
+var SEARCH_QUERY_TYPES = /* @__PURE__ */ new Set([
+  "text",
+  "regex",
+  "glob",
+  "fuzzy",
+  "git"
+]);
 var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--cwd",
   "--max-chars",
@@ -9303,6 +9311,8 @@ var VALUE_LONG_FLAGS = /* @__PURE__ */ new Set([
   "--glob",
   "--fuzzy",
   "--git",
+  "--pattern",
+  "--type",
   "--path",
   "--file-type",
   "--glob-filter",
@@ -9323,19 +9333,31 @@ function parseToolFlags(tool, rawArgs) {
     explicitStdin: false,
     positionals: [],
     searchQueries: [],
+    implicitTypeQueryIndices: /* @__PURE__ */ new Set(),
     trailingSearchMods: {},
     outlineFiles: []
   };
   let pendingMods = {};
-  const pushScopedQuery = (base) => {
+  let pendingType;
+  const pushScopedQuery = (base, explicitType) => {
+    const idx = opts.searchQueries.length;
     opts.searchQueries.push(applySearchModifiers(base, pendingMods));
+    if (!explicitType) {
+      opts.implicitTypeQueryIndices.add(idx);
+    }
     pendingMods = {};
+    pendingType = void 0;
   };
   let afterDoubleDash = false;
   for (let i = 0; i < rawArgs.length; i++) {
     const rawArg = rawArgs[i];
     if (afterDoubleDash) {
-      opts.positionals.push(rawArg);
+      if (tool === "batch_search") {
+        const explicit = pendingType !== void 0;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
+      } else {
+        opts.positionals.push(rawArg);
+      }
       continue;
     }
     if (rawArg === "--") {
@@ -9387,23 +9409,38 @@ function parseToolFlags(tool, rawArgs) {
     }
     if (tool === "batch_search") {
       if (arg === "--text" || arg === "-t") {
-        pushScopedQuery({ type: "text", pattern: consumeValue() });
+        pushScopedQuery({ type: "text", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--regex" || arg === "-r") {
-        pushScopedQuery({ type: "regex", pattern: consumeValue() });
+        pushScopedQuery({ type: "regex", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--glob" || arg === "-g") {
-        pushScopedQuery({ type: "glob", pattern: consumeValue() });
+        pushScopedQuery({ type: "glob", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--fuzzy" || arg === "-f") {
-        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() });
+        pushScopedQuery({ type: "fuzzy", pattern: consumeValue() }, true);
         continue;
       }
       if (arg === "--git") {
-        pushScopedQuery({ type: "git", pattern: consumeValue() });
+        pushScopedQuery({ type: "git", pattern: consumeValue() }, true);
+        continue;
+      }
+      if (arg === "--type") {
+        const rawType = consumeValue().trim().toLowerCase();
+        if (!SEARCH_QUERY_TYPES.has(rawType)) {
+          throw new Error(
+            `Invalid --type: ${rawType} (expected text, regex, glob, fuzzy, or git)`
+          );
+        }
+        pendingType = rawType;
+        continue;
+      }
+      if (arg === "--pattern") {
+        const explicit = pendingType !== void 0;
+        pushScopedQuery({ type: pendingType ?? "text", pattern: consumeValue() }, explicit);
         continue;
       }
       if (arg === "--path" || arg === "-p") {
@@ -9506,11 +9543,13 @@ function parseToolFlags(tool, rawArgs) {
       throw new Error(`Unknown option '${rawArg}' for '${tool}'. Run with '--cli --help' for usage.`);
     }
     if (tool === "batch_search") {
-      pushScopedQuery({ type: "text", pattern: rawArg });
+      const explicit = pendingType !== void 0;
+      pushScopedQuery({ type: pendingType ?? "text", pattern: rawArg }, explicit);
     } else {
       opts.positionals.push(rawArg);
     }
   }
+  opts.trailingSearchType = pendingType;
   opts.trailingSearchMods = pendingMods;
   return opts;
 }
@@ -9575,12 +9614,16 @@ async function runAgyFastCli(argv, io = {}) {
       };
     } else {
       const queries = [
-        ...opts.searchQueries,
-        ...opts.positionals.map((pattern) => ({ type: "text", pattern }))
+        ...opts.searchQueries.map(
+          (q, idx) => opts.trailingSearchType !== void 0 && opts.implicitTypeQueryIndices.has(idx) ? { ...q, type: opts.trailingSearchType } : q
+        ),
+        ...opts.positionals.map(
+          (pattern) => ({ type: opts.trailingSearchType ?? "text", pattern })
+        )
       ].map((q) => applySearchModifiers(q, opts.trailingSearchMods));
       if (queries.length === 0) {
         stderr.write(
-          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git, --json, or JSON on stdin).\n"
+          "Error: 'search' requires at least one query (--text/--regex/--glob/--fuzzy/--git/--pattern, --json, or JSON on stdin).\n"
         );
         return 1;
       }

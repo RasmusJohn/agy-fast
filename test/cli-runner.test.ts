@@ -333,4 +333,65 @@ describe("agy-fast --cli direct runner", () => {
     assert.equal(badFlagRes.code, 1);
     assert.match(badFlagRes.stderr, /Unknown option '--text=foo' for 'quick_outline'/);
   });
+
+  it("supports --pattern and --type (preceding, trailing, and inline) for --cli search", async () => {
+    // 1. --pattern defaults to text search and inherits trailing modifiers
+    const defaultPat = await runCliSubprocess(
+      ["search", "--pattern", "multiply", "--path", "src"],
+      { cwd: tmpDir },
+    );
+    assert.equal(defaultPat.code, 0, defaultPat.stderr);
+    assert.match(defaultPat.stdout, /Query 1 \[text\] multiply \(in src\)/);
+    assert.match(defaultPat.stdout, /src\/math\.ts/);
+
+    // 2. Preceding --type scopes only to the next --pattern; subsequent --pattern defaults to text
+    const preTyped = await runCliSubprocess(
+      ["search", "--type", "regex", "--pattern", "add|multiply", "--pattern=greet", "--path=src"],
+      { cwd: tmpDir },
+    );
+    assert.equal(preTyped.code, 0, preTyped.stderr);
+    assert.match(preTyped.stdout, /Query 1 \[regex\] add\|multiply \(in src\)/);
+    assert.match(preTyped.stdout, /Query 2 \[text\] greet \(in src\)/);
+    assert.match(preTyped.stdout, /src\/greet\.ts/);
+
+    // 3. Trailing --type applies to implicit --pattern queries without overwriting explicit --glob
+    const trailTyped = await runCliSubprocess(
+      ["search", "--pattern=add|multiply", "--glob", "src/*.ts", "--type=regex"],
+      { cwd: tmpDir },
+    );
+    assert.equal(trailTyped.code, 0, trailTyped.stderr);
+    assert.match(trailTyped.stdout, /Query 1 \[regex\] add\|multiply/);
+    assert.match(trailTyped.stdout, /Query 2 \[glob\] src\/\*\.ts/);
+
+    // 4. Literal --help value after --pattern must search, NOT print usage
+    const litHelpPat = await runCliSubprocess(
+      ["search", "--pattern", "--help", "--path", "pkg-a"],
+      { cwd: tmpDir },
+    );
+    assert.equal(litHelpPat.code, 0, litHelpPat.stderr);
+    assert.doesNotMatch(litHelpPat.stdout, /agy-fast direct CLI mode/);
+    assert.match(litHelpPat.stdout, /flag = '--help'/);
+
+    // 5. '--type' before '--' scopes only to the post-'--' query without retroactively retyping earlier '--pattern' queries
+    const dashDashTyped = await runCliSubprocess(
+      ["search", "--path=src", "--pattern", "add", "--path=pkg-a", "--type", "regex", "--", "--help|ONLY_IN_A"],
+      { cwd: tmpDir },
+    );
+    assert.equal(dashDashTyped.code, 0, dashDashTyped.stderr);
+    assert.match(dashDashTyped.stdout, /Query 1 \[text\] add \(in src\)/);
+    assert.match(dashDashTyped.stdout, /Query 2 \[regex\] --help\|ONLY_IN_A \(in pkg-a\)/);
+    assert.match(dashDashTyped.stdout, /flag = '--help'/);
+
+    // 6. Invalid --type and --pattern on non-search subcommand fail cleanly
+    const badType = await runCliSubprocess(
+      ["search", "--type", "bogus", "--pattern", "add"],
+      { cwd: tmpDir },
+    );
+    assert.equal(badType.code, 1);
+    assert.match(badType.stderr, /Invalid --type: bogus/);
+
+    const badOutlineFlag = await runCliSubprocess(["outline", "--pattern=foo"], { cwd: tmpDir });
+    assert.equal(badOutlineFlag.code, 1);
+    assert.match(badOutlineFlag.stderr, /Unknown option '--pattern=foo' for 'quick_outline'/);
+  });
 });
