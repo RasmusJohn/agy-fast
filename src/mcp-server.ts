@@ -81,13 +81,25 @@ function detectNonWorkspaceCwd(
   if (path.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const homes = [env.HOME, env.USERPROFILE]
+  const isFullAbsPath = (p: string): boolean =>
+    process.platform === "win32"
+      ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p)
+      : path.isAbsolute(p);
+  const driveHome =
+    process.platform === "win32" &&
+    typeof env.HOMEDRIVE === "string" &&
+    typeof env.HOMEPATH === "string" &&
+    env.HOMEDRIVE.trim() &&
+    env.HOMEPATH.trim()
+      ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}`
+      : "";
+  const homes = [env.HOME, env.USERPROFILE, driveHome]
     .map((h) => (typeof h === "string" ? h.trim() : ""))
-    .filter((h) => h && path.isAbsolute(h));
+    .filter((h) => h && isFullAbsPath(h));
   if (homes.length === 0 && env === process.env) {
     try {
       const osHome = os.homedir();
-      if (path.isAbsolute(osHome)) homes.push(osHome);
+      if (isFullAbsPath(osHome)) homes.push(osHome);
     } catch {
       // No home directory to compare against
     }

@@ -9883,11 +9883,13 @@ function detectNonWorkspaceCwd(env, currentCwd) {
   if (path7.parse(canonCwd).root === canonCwd) {
     return { dir: canonCwd, place: "the filesystem root" };
   }
-  const homes = [env.HOME, env.USERPROFILE].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && path7.isAbsolute(h));
+  const isFullAbsPath = (p) => process.platform === "win32" ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\])/.test(p) : path7.isAbsolute(p);
+  const driveHome = process.platform === "win32" && typeof env.HOMEDRIVE === "string" && typeof env.HOMEPATH === "string" && env.HOMEDRIVE.trim() && env.HOMEPATH.trim() ? `${env.HOMEDRIVE.trim()}${env.HOMEPATH.trim()}` : "";
+  const homes = [env.HOME, env.USERPROFILE, driveHome].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && isFullAbsPath(h));
   if (homes.length === 0 && env === process.env) {
     try {
       const osHome = os4.homedir();
-      if (path7.isAbsolute(osHome)) homes.push(osHome);
+      if (isFullAbsPath(osHome)) homes.push(osHome);
     } catch {
     }
   }

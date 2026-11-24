@@ -1105,6 +1105,8 @@ describe("MCP Stdio Server end-to-end", () => {
         { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "project", paths: ["app.ts"] } } },
         { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: project, paths: ["app.ts"] } } },
         { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "read_slices", arguments: { outlines: ["project/app.ts"] } } },
+        { jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: "~", paths: ["project/app.ts"] } } },
+        { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "quick_outline", arguments: { cwd: fakeHome, paths: ["project/app.ts"] } } },
       ]);
       assert.equal(homeRes.code, 0);
       assert.equal(homeRes.stderr, "");
@@ -1118,9 +1120,11 @@ describe("MCP Stdio Server end-to-end", () => {
       assert.equal(relResp?.result?.isError, true);
       assert.match(relResp?.result?.content?.[0]?.text ?? "", /'cwd' must be an absolute workspace path.*home directory/i);
       await assert.rejects(fs.access(path.join(fakeHome, "rogue.txt")));
-      const explicitResp = homeLines.find((l) => l.id === 6);
-      assert.equal(explicitResp?.result?.isError, false);
-      assert.match(explicitResp?.result?.content?.[0]?.text ?? "", /homeApp/);
+      for (const id of [6, 8, 9]) {
+        const explicitResp = homeLines.find((l) => l.id === id);
+        assert.equal(explicitResp?.result?.isError, false, `Expected explicit cwd call id=${id} to succeed`);
+        assert.match(explicitResp?.result?.content?.[0]?.text ?? "", /homeApp/);
+      }
 
       // 2. Started inside a project under the home directory: the process cwd is still used.
       const projectRes = await runIn(project, [

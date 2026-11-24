@@ -57,6 +57,7 @@ export function isLikelyBinary(buf: Buffer): boolean {
 
 export interface TextFileContent {
   content: string;
+  /** UTF-8 BOM-stripped text (same coordinate space as `content`) retaining original line endings. */
   rawContent: string;
   eol: "\r\n" | "\n";
   mixedEol: boolean;
