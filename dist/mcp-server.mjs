@@ -3,6 +3,7 @@
 
 // src/mcp-server.ts
 import fs6 from "node:fs";
+import os4 from "node:os";
 import path7 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -9765,6 +9766,30 @@ function isInstalledPluginPath(dirPath) {
     posix
   );
 }
+function isSameDir(a, b) {
+  const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+  return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+function detectNonWorkspaceCwd(env, currentCwd) {
+  const canonCwd = canonicalizeDir(currentCwd);
+  if (path7.parse(canonCwd).root === canonCwd) {
+    return { dir: canonCwd, place: "the filesystem root" };
+  }
+  const homes = [env.HOME, env.USERPROFILE].map((h) => typeof h === "string" ? h.trim() : "").filter((h) => h && path7.isAbsolute(h));
+  if (homes.length === 0 && env === process.env) {
+    try {
+      const osHome = os4.homedir();
+      if (path7.isAbsolute(osHome)) homes.push(osHome);
+    } catch {
+    }
+  }
+  for (const home of homes) {
+    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+      return { dir: canonCwd, place: "the home directory" };
+    }
+  }
+  return null;
+}
 function detectPluginInstallCwd(env, currentCwd, scriptPluginRoot) {
   const canonCwd = canonicalizeDir(currentCwd);
   for (const envRoot of [env.PLUGIN_ROOT, env.AGY_PLUGIN_ROOT]) {
@@ -9881,6 +9906,13 @@ function createAgyFastServer(options = {}) {
           error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Pass the active workspace root explicitly in 'cwd'.`
         };
       }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Pass the active workspace root explicitly in 'cwd'.`
+        };
+      }
       return {
         ok: true,
         value: { ...args, cwd: void 0 }
@@ -9902,6 +9934,13 @@ function createAgyFastServer(options = {}) {
         return {
           ok: false,
           error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Received relative cwd: ${JSON.stringify(rawCwd)}.`
+        };
+      }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Received relative cwd: ${JSON.stringify(rawCwd)}.`
         };
       }
     }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpStdioServer, type McpToolDefinition } from "./protocol/mcp.js";
@@ -61,6 +62,42 @@ function isInstalledPluginPath(dirPath: string): boolean {
   return /(?:^|\/)(?:\.gemini\/(?:config\/|antigravity[^/]*\/)?plugins|\.agents\/plugins)\/[^/]+(?:\/|$)/i.test(
     posix,
   );
+}
+
+function isSameDir(a: string, b: string): boolean {
+  const caseInsensitive =
+    process.platform === "win32" || process.platform === "darwin";
+  return caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+// A host that reports no MCP roots may start the server somewhere that is never a workspace:
+// the filesystem root or the user's home directory itself. Resolving an omitted or relative
+// `cwd` there writes files and runs commands outside any project, so ask for `cwd` instead.
+function detectNonWorkspaceCwd(
+  env: NodeJS.ProcessEnv,
+  currentCwd: string,
+): { dir: string; place: string } | null {
+  const canonCwd = canonicalizeDir(currentCwd);
+  if (path.parse(canonCwd).root === canonCwd) {
+    return { dir: canonCwd, place: "the filesystem root" };
+  }
+  const homes = [env.HOME, env.USERPROFILE]
+    .map((h) => (typeof h === "string" ? h.trim() : ""))
+    .filter((h) => h && path.isAbsolute(h));
+  if (homes.length === 0 && env === process.env) {
+    try {
+      const osHome = os.homedir();
+      if (path.isAbsolute(osHome)) homes.push(osHome);
+    } catch {
+      // No home directory to compare against
+    }
+  }
+  for (const home of homes) {
+    if (home && isSameDir(canonCwd, canonicalizeDir(home))) {
+      return { dir: canonCwd, place: "the home directory" };
+    }
+  }
+  return null;
 }
 
 function detectPluginInstallCwd(
@@ -177,7 +214,8 @@ export function createAgyFastServer(
 
   // agy starts plugin servers in the plugin directory; resolve omitted or relative
   // tool `cwd` values against the first valid workspace root without mutating process.cwd().
-  // Never silently fall back to the installed plugin directory when roots/list is unavailable.
+  // Never silently fall back to the installed plugin directory, the filesystem root or the
+  // home directory when roots/list is unavailable.
   let defaultCwd: string | undefined;
 
   const resolveToolArgs = <T extends { cwd?: string }>(
@@ -210,6 +248,13 @@ export function createAgyFastServer(
           error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Pass the active workspace root explicitly in 'cwd'.`,
         };
       }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' is required because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Pass the active workspace root explicitly in 'cwd'.`,
+        };
+      }
       return {
         ok: true,
         value: { ...args, cwd: undefined } as unknown as T,
@@ -231,6 +276,13 @@ export function createAgyFastServer(
         return {
           ok: false,
           error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started inside the plugin directory (${pluginFallbackDir}). Received relative cwd: ${JSON.stringify(rawCwd)}.`,
+        };
+      }
+      const nonWorkspace = detectNonWorkspaceCwd(env, getProcessCwd());
+      if (nonWorkspace) {
+        return {
+          ok: false,
+          error: `Error: 'cwd' must be an absolute workspace path because this host did not report a workspace root via MCP roots/list and the MCP server started in ${nonWorkspace.place} (${nonWorkspace.dir}), which is not a workspace. Received relative cwd: ${JSON.stringify(rawCwd)}.`,
         };
       }
     }
