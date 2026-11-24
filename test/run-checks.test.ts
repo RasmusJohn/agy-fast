@@ -821,4 +821,45 @@ describe("run_checks", () => {
       else process.env.GCM_INTERACTIVE = prevGcm;
     }
   });
+
+  it("surfaces OOM/fatal exit codes and POSIX signal names in run_checks output", async () => {
+    const compactRes = await runChecks({
+      outputMode: "compact",
+      commands: [
+        {
+          name: "oom-exit-137",
+          command: `${nodeBin} -e "process.exit(137)"`,
+        },
+      ],
+    });
+    assert.equal(compactRes.isError, false);
+    assert.match(compactRes.text, /FAIL \(exit 137 \/ SIGKILL - possible OOM\)/);
+    assert.match(compactRes.text, /Terminated \(exit 137 \/ SIGKILL - possible OOM\)/);
+
+    const fullRes = await runChecks({
+      outputMode: "full",
+      commands: [
+        {
+          name: "segv-exit-139",
+          command: `${nodeBin} -e "process.exit(139)"`,
+        },
+      ],
+    });
+    assert.equal(fullRes.isError, false);
+    assert.match(fullRes.text, /\[FAIL \(exit 139 \/ SIGSEGV\)\]/);
+
+    if (process.platform !== "win32") {
+      const sigRes = await runChecks({
+        outputMode: "compact",
+        commands: [
+          {
+            name: "direct-sigabrt",
+            command: `exec ${nodeBin} -e "process.kill(process.pid, 'SIGABRT')"`,
+          },
+        ],
+      });
+      assert.equal(sigRes.isError, false);
+      assert.match(sigRes.text, /FAIL \(SIGABRT - process aborted\)/);
+    }
+  });
 });

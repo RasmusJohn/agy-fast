@@ -2055,6 +2055,26 @@ ${formatOmittedLinesMarker(omitted, true)}
   }
   return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
 }
+function formatExitFailureLabel(exitCode, signal) {
+  if (signal) {
+    switch (signal) {
+      case "SIGKILL":
+        return "SIGKILL - possible OOM";
+      case "SIGSEGV":
+        return "SIGSEGV - segmentation fault";
+      case "SIGABRT":
+        return "SIGABRT - process aborted";
+      case "SIGTERM":
+        return "SIGTERM";
+      default:
+        return String(signal);
+    }
+  }
+  if (exitCode === 137) return "exit 137 / SIGKILL - possible OOM";
+  if (exitCode === 139) return "exit 139 / SIGSEGV";
+  if (exitCode === 134) return "exit 134 / SIGABRT";
+  return `exit ${exitCode ?? "err"}`;
+}
 function prepareCompactCommandOutput(params) {
   const out = normalizeTerminalOutput(params.stdout);
   const err = normalizeTerminalOutput(params.stderr);
@@ -2103,9 +2123,10 @@ ${tail}` : "TIMED OUT (no output)",
     };
   }
   if (!combined) {
+    const bodyText = params.signal ? `Terminated by ${formatExitFailureLabel(params.exitCode, params.signal)}` : params.exitCode === 137 || params.exitCode === 139 || params.exitCode === 134 ? `Terminated (${formatExitFailureLabel(params.exitCode, null)})` : `Exited with code ${params.exitCode ?? "unknown"}`;
     return {
       kind: "fail-empty",
-      bodyText: `Exited with code ${params.exitCode ?? "unknown"}`,
+      bodyText,
       collapsedLines: 0,
       rawLines: 0,
       rawChars: 0
@@ -3949,7 +3970,7 @@ ${summaryLines.join("\n")}`;
       cwd: verifyCwd,
       timeoutMs
     });
-    const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
+    const status = res.timedOut ? "TIMEOUT" : res.error ? "ERROR" : res.exitCode === 0 ? "PASS" : `FAIL (${formatExitFailureLabel(res.exitCode, res.signal)})`;
     const verifyPrefix = `
 
 Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
@@ -3958,6 +3979,7 @@ Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
+      signal: res.signal,
       timedOut: res.timedOut,
       error: res.error
     });
@@ -8931,7 +8953,7 @@ $ ${displayCmd}
           byteSize: Buffer.byteLength(block, "utf8")
         };
       }
-      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const headerLine = `## [${badge}] ${spec.name} (${result.durationMs}ms)`;
       const fullPrefix = `${headerLine}
 $ ${spec.command}
@@ -9022,7 +9044,7 @@ $ ${spec.command}
         passEntries.push({ index: i, compactHeader, body, fullBlock });
         continue;
       }
-      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (${formatExitFailureLabel(result.exitCode, result.signal)})`;
       const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}`;
       const header = `${badgeLine}
 $ ${spec.command}
@@ -9031,6 +9053,7 @@ $ ${spec.command}
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
+        signal: result.signal,
         timedOut: result.timedOut,
         error: result.error
       });

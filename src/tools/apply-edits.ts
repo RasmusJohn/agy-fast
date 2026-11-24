@@ -18,6 +18,7 @@ import {
 import {
   DEFAULT_INLINE_MAX_BYTES,
   fitSectionsToByteBudget,
+  formatExitFailureLabel,
   prepareCompactCommandOutput,
   renderPreparedCompactCommandOutput,
   sliceSafeChars,
@@ -1458,12 +1459,13 @@ export async function runApplyEdits(
         ? "ERROR"
         : res.exitCode === 0
           ? "PASS"
-          : `FAIL (exit ${res.exitCode ?? "err"})`;
+          : `FAIL (${formatExitFailureLabel(res.exitCode, res.signal)})`;
     const verifyPrefix = `\n\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
     const preparedVerify = prepareCompactCommandOutput({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
+      signal: res.signal,
       timedOut: res.timedOut,
       error: res.error,
     });
