@@ -21,6 +21,8 @@ const HARDENED_GIT_BASE_ARGS = [
   "-c",
   "core.fsmonitor=false",
   "-c",
+  "core.quotePath=false",
+  "-c",
   "diff.external=",
   "-c",
   "gpg.program=false",
